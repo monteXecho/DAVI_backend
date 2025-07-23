@@ -1,0 +1,1 @@
+curl -X GET "http://localhost:9200/haystack_test/_search?pretty" >es-output.json

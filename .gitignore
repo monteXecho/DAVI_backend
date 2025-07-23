@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual Environments
+venv/
+.env/
+.env.*
+
+# Environment files
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Byte-compiled files
+*.pyo
+*.pyd
+*.pyc
+
+# VSCode
+.vscode/
+
+# Mac/Linux
+.DS_Store
+Thumbs.db
+
+# Pytest
+.pytest_cache/
+
+# FastAPI reload artifacts
+*.reload
+
+# Output folders
+output/
+documenten-output/
+output/highlighted/
+
+# Pipenv
+Pipfile.lock
+
+# mypy / coverage / test artifacts
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Docker
+*.pid
+*.pid.lock
+docker-compose.override.yml
+
