@@ -45,7 +45,9 @@ indexing_pipeline.connect("doc_embedder", "writer")
 
 # Use glob to list all .pdf files in the folder "documenten-import"
 # Please note that only .pdf files are supported by the PyPDFToDocument converter
-file_paths = glob.glob("documenten-import/*.pdf")
+# file_paths = glob.glob("documenten-import/*.pdf")
+file_paths = glob.glob(os.path.join(os.path.dirname(__file__), '..', 'documenten-import', '*.pdf'))
+
 print(f"Found {len(file_paths)} files to index.")
 print(file_paths)
 if file_paths:

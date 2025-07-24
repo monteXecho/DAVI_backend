@@ -95,6 +95,7 @@ def get_pipeline(model_name: str) -> Pipeline:
             api_key=Secret.from_token(os.getenv("GROQ_API_KEY")),
             generation_kwargs={"temperature": 0, "max_tokens": 1024},
         )
+
         # generator = OpenAIGenerator(
         #     model=model_name,
         #     api_base_url=LLM_API_URL,

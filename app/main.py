@@ -1,4 +1,7 @@
+import os
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from app.api.ask import ask_router
 
 app = FastAPI(
@@ -7,9 +10,23 @@ app = FastAPI(
     version="1.0.0"
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],  
+    allow_headers=["*"],
+)
+
+app.mount(
+    "/output/highlighted",
+    StaticFiles(directory=os.path.abspath("output/highlighted")),
+    name="highlighted"
+)
+
 @app.get("/")
 def root():
-    return {"message": "Welcome to the MijnDavi RAG API. Use /ask endpoint to query."}
+    return {"message": "Welcome to the MijnDavi RAG API. Use /ask endpoint to querdy."}
 
 app.include_router(ask_router)
 

@@ -9,6 +9,8 @@ ELASTIC_PASSWORD = os.getenv("ELASTIC_PASSWORD", "elastic")
 ELASTIC_INDEX = os.getenv("ELASTIC_INDEX", "haystack_test")
 OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1024"))
+LLM_API_URL = os.getenv("LLM_API_URL", "http://localhost:11434")
+KEYCLOAK_PUBLIC_KEY = os.getenv("KEYCLOAK_PUBLIC_KEY ", "")
 
 AVAILABLE_MODELS = [
     'granite-3.2-8b-instruct@q8_0',
