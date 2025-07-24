@@ -6,7 +6,6 @@ import tempfile
 import shutil
 
 
-
 def split_snippet(snippet_text):
     """
     Smartly splits a snippet into meaningful segments:
