@@ -89,21 +89,21 @@ def get_pipeline(model_name: str) -> Pipeline:
         )
     else:
         # This if for the test.
-        # generator = OpenAIGenerator(
-        #     model="llama-3.3-70b-versatile",
-        #     api_base_url="https://api.groq.com/openai/v1",
-        #     api_key=Secret.from_token(os.getenv("GROQ_API_KEY")),
-        #     generation_kwargs={"temperature": 0, "max_tokens": 1024},
-        # )
-
         generator = OpenAIGenerator(
-            model=model_name,
-            api_base_url=LLM_API_URL,
-            generation_kwargs={
-                "temperature": 0,
-                "max_tokens": MAX_TOKENS # Use configured max_tokens
-            }
+            model="llama-3.3-70b-versatile",
+            api_base_url="https://api.groq.com/openai/v1",
+            api_key=Secret.from_token(os.getenv("GROQ_API_KEY")),
+            generation_kwargs={"temperature": 0, "max_tokens": 1024},
         )
+
+        # generator = OpenAIGenerator(
+        #     model=model_name,
+        #     api_base_url=LLM_API_URL,
+        #     generation_kwargs={
+        #         "temperature": 0,
+        #         "max_tokens": MAX_TOKENS # Use configured max_tokens
+        #     }
+        # )
 
     answer_builder = AnswerBuilder()
 

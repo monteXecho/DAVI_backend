@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.ask import ask_router
+from app.api.upload import upload_router
 
 app = FastAPI(
     title="MijnDAVI API",
@@ -29,5 +30,6 @@ def root():
     return {"message": "Welcome to the MijnDavi RAG API. Use /ask endpoint to querdy."}
 
 app.include_router(ask_router)
+app.include_router(upload_router)
 
 ##  uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
