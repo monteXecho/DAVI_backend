@@ -70,7 +70,7 @@ async def upload_document(upload_type: str, file: UploadFile = File(...), curren
 
         logger.info(f"File uploaded successfully: {file.filename} to {upload_type} folder")
         
-        return {"success": False, "file": file.filename, "upload_type": upload_type}
+        return {"success": True, "file": file.filename, "upload_type": upload_type}
 
     except Exception as e:
         logger.exception("Unhandled exception during file upload")
