@@ -4,7 +4,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, File, UploadFile, Depends, status
 from fastapi.concurrency import run_in_threadpool
-from app.deps.auth import get_current_user  # Assuming you have a `get_current_user` function
+from app.deps.auth import get_current_user  
 
 logger = logging.getLogger(__name__)
 

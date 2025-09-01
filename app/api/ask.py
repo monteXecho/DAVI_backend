@@ -34,7 +34,7 @@ def highlight_documents(documents, output_dir: str):
 )
 async def ask_question(
     request: QuestionRequest,
-    current_user: dict = Depends(get_current_user)  # 🔐 Auth handled here
+    current_user: dict = Depends(get_current_user)  # Auth handled here
 ):
     try:
         logger.info(f"Received question from user: {current_user.get('preferred_username', 'unknown')}")
