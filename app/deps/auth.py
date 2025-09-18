@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2AuthorizationCodeBearer
 from typing import Annotated
 import jwt
@@ -36,7 +36,7 @@ async def get_current_user(token: Annotated[str, Depends(oauth_2_scheme)]):
             public_key,
             algorithms=["RS256"],
             options={"verify_exp": True},
-            audience="account",  # update as needed
+            audience="account", 
         )
         return payload
 
@@ -44,3 +44,14 @@ async def get_current_user(token: Annotated[str, Depends(oauth_2_scheme)]):
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+def require_role(required_role: str):
+    def role_checker(user=Depends(get_current_user)):
+        roles = user.get("realm_access", {}).get("roles", [])
+        if required_role not in roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Missing required role: {required_role}"
+            )
+        return user
+    return role_checker

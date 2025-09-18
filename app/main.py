@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.ask import ask_router
 from app.api.upload import upload_router
+from app.api.super_admin import super_admin_router
 
 app = FastAPI(
     title="MijnDAVI API",
@@ -31,5 +32,6 @@ def root():
 
 app.include_router(ask_router)
 app.include_router(upload_router)
+app.include_router(super_admin_router)
 
 ##  uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
