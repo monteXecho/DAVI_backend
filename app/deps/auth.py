@@ -3,17 +3,21 @@ from fastapi.security import OAuth2AuthorizationCodeBearer
 from typing import Annotated
 import jwt
 import requests
+import os
 
 from jwt import algorithms
 
 app = FastAPI()
 
-oauth_2_scheme = OAuth2AuthorizationCodeBearer(
-    tokenUrl="http://localhost:8080/realms/DAVI/protocol/openid-connect/token",
-    authorizationUrl="http://localhost:8080/realms/DAVI/protocol/openid-connect/auth",
-)
+KEYCLOAK_HOST = os.getenv("KEYCLOAK_HOST", "host.docker.internal")
+REALM = "DAVI"
 
-JWKS_URL = "http://localhost:8080/realms/DAVI/protocol/openid-connect/certs"
+JWKS_URL = f"http://{KEYCLOAK_HOST}:8080/realms/{REALM}/protocol/openid-connect/certs"
+
+oauth_2_scheme = OAuth2AuthorizationCodeBearer(
+    tokenUrl=f"http://{KEYCLOAK_HOST}:8080/realms/{REALM}/protocol/openid-connect/token",
+    authorizationUrl=f"http://{KEYCLOAK_HOST}:8080/realms/{REALM}/protocol/openid-connect/auth",
+)
 
 def get_signing_key(token: str):
     jwks = requests.get(JWKS_URL).json()

@@ -1,12 +1,44 @@
+# services:
+#   elasticsearch:
+#     image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+#     ports:
+#       - "9200:9200"
+#       - "9300:9300"
+#     environment:
+#       - discovery.type=single-node
+#       - xpack.security.enabled=false
+#       - ELASTIC_USERNAME=elastic
+#       - ELASTIC_PASSWORD=elastic
+#       - HAYSTACK_TELEMETRY_ENABLED=False
+
+
 services:
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+  app:
+    build: .
+    container_name: fastapi_app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
-      - "9200:9200"
-      - "9300:9300"
+      - "8000:8000"
+    volumes:
+      - ./app:/code/app    # only mount source code, not whole backend
+      - ./requirements.txt:/code/requirements.txt
+    depends_on:
+      - mongodb
     environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ELASTIC_USERNAME=elastic
-      - ELASTIC_PASSWORD=elastic
-      - HAYSTACK_TELEMETRY_ENABLED=False
+      - MONGO_URI=mongodb://mongodb:27017/davi_db
+      - KEYCLOAK_HOST=host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  mongodb:
+    image: mongo:6.0
+    container_name: davi_mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:
+

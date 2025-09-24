@@ -2,7 +2,7 @@ import os
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.ask import ask_router
+# from app.api.ask import ask_router
 from app.api.upload import upload_router
 from app.api.super_admin import super_admin_router
 
@@ -20,17 +20,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount(
-    "/output/highlighted",
-    StaticFiles(directory=os.path.abspath("output/highlighted")),
-    name="highlighted"
-)
+# app.mount(
+#     "/output/highlighted",
+#     StaticFiles(directory=os.path.abspath("output/highlighted")),
+#     name="highlighted"
+# )
 
 @app.get("/")
 def root():
     return {"message": "Welcome to the MijnDavi RAG API. Use /ask endpoint to querdy."}
 
-app.include_router(ask_router)
+# app.include_router(ask_router)
 app.include_router(upload_router)
 app.include_router(super_admin_router)
 
