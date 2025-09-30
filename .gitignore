@@ -41,7 +41,7 @@ Thumbs.db
 output/
 documenten-output/
 output/highlighted/
-
+s
 # Pipenv
 Pipfile.lock
 
@@ -56,3 +56,6 @@ coverage.xml
 *.pid.lock
 docker-compose.override.yml
 
+
+# Ignore MongoDB data
+mongo-data/
