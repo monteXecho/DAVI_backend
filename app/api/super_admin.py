@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.deps.auth import require_role
+from app.deps.auth import require_role, keycloak_admin, ensure_role_exists
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.models.company_admin_schema import CompanyCreate, CompanyAddAdmin, CompanyAdminModules
+import traceback
 
 super_admin_router = APIRouter(prefix="/super-admin", tags=["Super Admin"])
 
@@ -24,6 +25,7 @@ async def add_company(
     repo = CompanyRepository(db)
     return await repo.create_company(payload.name)
 
+
 @super_admin_router.post("/companies/{company_id}/admins")
 async def add_company_admin(
     company_id: str,
@@ -31,14 +33,17 @@ async def add_company_admin(
     user=Depends(require_role("super_admin")),
     db=Depends(get_db),
 ):
-    repo = CompanyRepository(db)
-    modules = {m.name: m.dict() for m in payload.modules}
-    result = await repo.add_admin(company_id, payload.name, payload.email, modules)
-    if not result:
-        raise HTTPException(404, "Company not found")
+    try:
+        repo = CompanyRepository(db)
+        modules = {m.name: m.dict() for m in payload.modules}
+        result = await repo.add_admin(company_id, payload.name, payload.email, modules)
+        if not result:
+            raise HTTPException(404, "Company not found")
 
-    # TODO: Assign role in Keycloak (company_admin)
-    return result
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"{str(e)}")
+    
 
 @super_admin_router.post("/companies/{company_id}/admins/{admin_id}/modules")
 async def assign_modules(

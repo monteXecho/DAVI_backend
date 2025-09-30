@@ -5,6 +5,7 @@ email-validator==2.2.0
 PyJWT[crypto]==2.10.1
 PyMuPDF==1.26.3
 python-dotenv==1.1.1
+python-keycloak==5.8.1
 python-multipart==0.0.12
 rapidfuzz==3.14.1
 requests==2.32.5

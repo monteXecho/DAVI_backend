@@ -1,6 +1,7 @@
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Optional
+import uuid
 
 DEFAULT_MODULES = {
     "Documenten chat": {"desc": "AI-zoek & Q&A over geuploade documenten.", "enabled": False},
@@ -52,6 +53,7 @@ class CompanyRepository:
                 "admins": [
                     {
                         "id": admin.get("admin_id"),
+                        "user_id": admin["user_id"],
                         "name": admin["name"],
                         "email": admin["email"],
                         "modules": [
@@ -69,7 +71,7 @@ class CompanyRepository:
         now = datetime.utcnow()
         doc = {
             "name": name,
-            "company_id": None,  # filled in reindex
+            "company_id": None, 
             "admins": [],
             "created_at": now,
             "updated_at": now,
@@ -80,6 +82,14 @@ class CompanyRepository:
 
 
     async def add_admin(self, company_id: str, name: str, email: str, modules: Optional[dict]) -> dict:
+        company = await self.collection.find_one({"company_id": company_id})
+        if not company:
+            return None
+
+        for admin in company.get("admins", []):
+            if admin["email"].lower() == email.lower():
+                raise ValueError("Admin with this email already exists in the company")
+
         admin_modules = DEFAULT_MODULES.copy()
         if modules:
             for k, v in modules.items():
@@ -87,7 +97,8 @@ class CompanyRepository:
                     admin_modules[k]["enabled"] = v.get("enabled", False)
 
         admin_doc = {
-            "admin_id": None,  # filled in reindex
+            "admin_id": None, 
+            "user_id": str(uuid.uuid4()),  
             "name": name,
             "email": email,
             "modules": admin_modules,
@@ -97,15 +108,15 @@ class CompanyRepository:
             {"company_id": company_id},
             {"$push": {"admins": admin_doc}, "$set": {"updated_at": datetime.utcnow()}}
         )
+
         if result.matched_count == 0:
             return None
 
         admins = await self._reindex_admins(company_id)
         return {"company_id": company_id, "admins": admins}
-    
+
 
     async def assign_modules(self, company_id: str, admin_id: str, modules: dict) -> Optional[dict]:
-        """Update module enabled flags for a specific admin."""
         company = await self.collection.find_one({"company_id": company_id})
         if not company:
             return None
@@ -113,13 +124,12 @@ class CompanyRepository:
         admins = company.get("admins", [])
         for admin in admins:
             if admin.get("admin_id") == admin_id:
-                # update only provided modules, keep desc intact
                 for k, v in modules.items():
                     if k in admin["modules"]:
                         admin["modules"][k]["enabled"] = v.get("enabled", False)
                 break
         else:
-            return None  # admin not found
+            return None 
 
         await self.collection.update_one(
             {"company_id": company_id},
@@ -145,3 +155,18 @@ class CompanyRepository:
             await self._reindex_admins(company_id)
             return True
         return False
+
+    async def find_admin_by_email(self, email: str):
+        company = await self.collection.find_one(
+            {"admins.email": email},
+            {"admins.$": 1}
+        )
+        if not company or "admins" not in company or not company["admins"]:
+            return None
+
+        return {
+            "email": company["admins"][0]["email"],
+            "role": "company_admin"
+        }
+
+    

@@ -1,6 +1,6 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
-
+import uuid
 
 class ModuleConfig(BaseModel):
     name: str
@@ -8,8 +8,16 @@ class ModuleConfig(BaseModel):
     enabled: bool = False
 
 
+class RegisterRequest(BaseModel):
+    fullName: str
+    email: EmailStr
+    username: str
+    password: str
+    
+
 class CompanyAdmin(BaseModel):
     id: Optional[str] = None  # a1, a2…
+    user_id: uuid.UUID = Field(default_factory=uuid.uuid4)  # auto-generated UUID
     name: str
     email: EmailStr
     modules: List[ModuleConfig]
