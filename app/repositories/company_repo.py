@@ -1,3 +1,7 @@
+from bson.json_util import dumps
+import json
+import os
+
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Optional
@@ -43,6 +47,7 @@ class CompanyRepository:
         return admins
 
 
+
     async def get_all_companies(self):
         cursor = self.collection.find().sort("company_id", 1)
         companies = []
@@ -59,12 +64,21 @@ class CompanyRepository:
                         "modules": [
                             {"name": k, "desc": v["desc"], "enabled": v["enabled"]}
                             for k, v in admin["modules"].items()
+                        ],
+                        "documents": [
+                            {
+                                "user_id": doc.get("user_id"),
+                                "file_name": doc.get("file_name"),
+                                "uploaded_at": doc.get("uploaded_at")
+                            }
+                            for doc in admin.get("documents", [])
                         ]
                     }
                     for admin in company.get("admins", [])
                 ]
             })
         return {"companies": companies}
+
 
 
     async def create_company(self, name: str) -> dict:
@@ -170,3 +184,89 @@ class CompanyRepository:
         }
 
     
+    async def find_admin_full_by_email(self, email: str) -> Optional[dict]:
+        company = await self.collection.find_one(
+            {"admins.email": email},
+            {"admins.$": 1}
+        )
+        if not company or "admins" not in company or not company["admins"]:
+            return None
+
+        return company["admins"][0]  # full admin document (with user_id, modules, etc.)
+
+
+    async def add_admin_document(self, user_id: str, file_name: str):
+        existing = await self.collection.find_one({
+            "admins.user_id": user_id,
+            "admins.documents.file_name": file_name,
+        })
+        if existing:
+            return None  # duplicate
+        
+        result = await self.collection.update_one(
+            {"admins.user_id": user_id},
+            {
+                "$push": {
+                    "admins.$.documents": {
+                        "user_id": user_id,
+                        "file_name": file_name,
+                        "uploaded_at": datetime.utcnow(),
+                    }
+                }
+            },
+        )
+        return result.modified_count > 0
+    
+
+    async def find_company_by_user_email(self, email: str):
+        """
+        Search for a company where either an admin or a user has the given email.
+        """
+        return await self.collection.find_one({
+            "$or": [
+                {"admins.email": email},
+                {"users.email": email}
+            ]
+        })
+
+    async def get_user_with_documents(self, email: str):
+        """
+        Look up a user (admin or company user) by email and
+        return their documents with resolved paths.
+        """
+        company = await self.find_company_by_user_email(email)
+        if not company:
+            return None
+
+        # check admins
+        matched_user = next(
+            (admin for admin in company.get("admins", []) if admin.get("email") == email),
+            None
+        )
+
+        # check users if not found in admins
+        if not matched_user:
+            matched_user = next(
+                (user for user in company.get("users", []) if user.get("email") == email),
+                None
+            )
+
+        if not matched_user:
+            return None
+
+        # resolve document file paths
+        docs = matched_user.get("documents", [])
+        doc_list = [
+            {
+                "file_path": os.path.join("/app/uploads/document", doc["user_id"], doc["file_name"]),
+                "file_name": doc["file_name"],
+            }
+            for doc in docs
+        ]
+
+        return {
+            "user_id": matched_user.get("user_id"),
+            "email": matched_user.get("email"),
+            "documents": doc_list,
+        }
+
