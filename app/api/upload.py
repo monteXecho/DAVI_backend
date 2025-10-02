@@ -3,9 +3,9 @@ import shutil
 import logging
 from fastapi import APIRouter, HTTPException, File, UploadFile, Depends, status
 from fastapi.concurrency import run_in_threadpool
-from app.deps.auth import get_current_user  
-from app.deps.db import get_db
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from app.deps.auth import get_current_user
+from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.repositories.document_repo import DocumentRepository
 
@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 upload_router = APIRouter(prefix="/upload", tags=["Upload"])
 
-# Force uploads to the container-mounted path
 UPLOAD_ROOT = "/app/uploads"
 
 UPLOAD_FOLDERS = {
@@ -30,8 +29,8 @@ for folder in UPLOAD_FOLDERS.values():
 def save_uploaded_file(file: UploadFile, save_path: str):
     """Save file from UploadFile to disk."""
     try:
-        file.file.seek(0)  # rewind to start
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)  # ensure user folder exists
+        file.file.seek(0)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
@@ -61,14 +60,15 @@ async def upload_document(
         company_repo = CompanyRepository(db)
         document_repo = DocumentRepository(db)
 
-        # 🔎 Look up admin by email
-        admin = await company_repo.find_admin_full_by_email(email)
-        if not admin:
+        # 🔎 Look up user (admin OR company_user)
+        user = await company_repo.get_user_with_documents(email)
+        if not user:
             raise HTTPException(status_code=404, detail="User not found in DB")
 
-        user_id = admin.get("user_id")
-        if not user_id:
-            raise HTTPException(status_code=404, detail="Admin record missing user_id")
+        user_id = user.get("user_id")
+        company_id = user.get("company_id")
+        if not user_id or not company_id:
+            raise HTTPException(status_code=400, detail="User record missing user_id or company_id")
 
         # Build path: uploads/{upload_type}/{user_id}/{file_name}
         upload_folder = os.path.join(UPLOAD_FOLDERS[upload_type], user_id)
@@ -88,8 +88,9 @@ async def upload_document(
             logger.error(f"File not found after save attempt: {file_path}")
             raise HTTPException(status_code=500, detail="File save failed (not found or empty)")
 
-        # 📝 Insert metadata in `documents` (prevent duplicates)
+        # 📝 Insert metadata in `documents`
         doc_record = await document_repo.add_document(
+            company_id=company_id,
             user_id=user_id,
             file_name=file.filename,
             upload_type=upload_type,
@@ -102,24 +103,19 @@ async def upload_document(
                 detail=f"Document '{file.filename}' already exists for this user and type."
             )
 
-        # Add to company admin sub-documents list
-        added = await company_repo.add_admin_document(user_id, file.filename)
-        if not added:
-            logger.warning(f"Failed to update company admin with new document for user_id={user_id}")
-
-        logger.info(f"File {file.filename} uploaded by {email} (user_id={user_id})")
+        logger.info(f"File {file.filename} uploaded by {email} (user_id={user_id}, company_id={company_id})")
 
         return {
             "success": True,
             "file": file.filename,
             "upload_type": upload_type,
             "user_id": user_id,
-            "document_id": str(doc_record["_id"]),
+            "company_id": company_id,
             "path": file_path,
         }
 
     except HTTPException:
-        raise  # already handled above
+        raise
     except Exception as e:
         logger.exception("Unhandled exception during file upload")
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")

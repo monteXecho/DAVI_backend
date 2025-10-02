@@ -33,6 +33,19 @@ keycloak_admin = KeycloakAdmin(
     verify=True,
 )
 
+_kc_admin = None
+
+def get_keycloak_admin():
+    global _kc_admin
+    if _kc_admin is None:
+        _kc_admin = KeycloakAdmin(
+        server_url=f"http://{KEYCLOAK_HOST}:8080/",
+        realm_name="DAVI",  
+        client_id="DAVI_client",
+        client_secret_key="b5WpZUjTp4K8cvqn16TAtJtxhSZ66sA6",
+        verify=True,
+        )
+    return _kc_admin
 
 # --- Helpers for JWT validation ---
 def get_signing_key(token: str):
