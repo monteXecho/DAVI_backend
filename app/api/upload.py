@@ -8,6 +8,7 @@ from app.deps.auth import get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.repositories.document_repo import DocumentRepository
+from app.api.rag import rag_index_files
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,8 @@ async def upload_document(
             )
 
         logger.info(f"File {file.filename} uploaded by {email} (user_id={user_id}, company_id={company_id})")
+
+        await rag_index_files(user_id, [file_path])
 
         return {
             "success": True,

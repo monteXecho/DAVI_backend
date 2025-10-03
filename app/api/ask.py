@@ -1,7 +1,6 @@
 import os
 import shutil
 import logging
-import httpx
 
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.concurrency import run_in_threadpool
@@ -11,6 +10,7 @@ from app.models.schema import QuestionRequest, AnswerResponse, DocumentResponse,
 from app.deps.auth import get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
+from app.api.rag import rag_query
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +63,8 @@ async def ask_question(
         payload = {"query": request.question, "document_list": user_documents}
         logger.info(f"Payload to RAG: {payload}")
 
-
-        async with httpx.AsyncClient(timeout=60) as client:
-            rag_response = await client.post(RAG_API_URL, json=payload)
-            rag_response.raise_for_status()
-            rag_result = rag_response.json()
+        file_names = [doc["file_name"] for doc in user_documents]
+        rag_result = await rag_query(user_id=user_data["user_id"], question=request.question, file_names=file_names)
 
         # Highlight flow
         output_dir = os.path.join("output", "highlighted")
