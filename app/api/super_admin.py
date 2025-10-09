@@ -226,13 +226,13 @@ async def delete_company_admin(
         logger.exception("File delete failed for user_id=%s", user_id)
 
     # finally delete admin record
-    res = await db.company_admins.delete_one({"company_id": company_id, "admin_id": admin_id})
+    res = await db.company_admins.delete_one({"company_id": company_id, "user_id": admin_id})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Admin not found (race?)")
 
     return {
         "status": "admin_removed",
-        "admin_id": admin_id,
+        "user_id": admin_id,
         "company_id": company_id,
         "keycloak_deleted": kc_deleted,
         "documents_deleted": docs_deleted,

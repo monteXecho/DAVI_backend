@@ -6,6 +6,7 @@ from app.api.ask import ask_router
 from app.api.upload import upload_router
 from app.api.super_admin import super_admin_router
 from app.api.auth import auth_router
+from app.api.company_admin import company_admin_router
 
 app = FastAPI(
     title="MijnDAVI API",
@@ -35,5 +36,6 @@ app.include_router(ask_router)
 app.include_router(upload_router)
 app.include_router(super_admin_router)
 app.include_router(auth_router)
+app.include_router(company_admin_router)
 
 ##  uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

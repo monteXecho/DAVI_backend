@@ -39,11 +39,11 @@ class CompanyRepository:
     async def get_admins_by_company(self, company_id: str):
         return await self.admins.find({"company_id": company_id}).to_list(None)
 
-    async def get_users_by_company(self, company_id: str):
-        return await self.users.find({"company_id": company_id}).to_list(None)
+    async def get_users_by_company_admin(self, admin_id: str):
+        return await self.users.find({"added_by_admin_id": admin_id}, {"_id": 0}).to_list(None)
 
-    async def get_admin_by_id(self, company_id: str, admin_id: str):
-        return await self.admins.find_one({"company_id": company_id, "admin_id": admin_id})
+    async def get_admin_by_id(self, company_id: str, user_id: str):
+        return await self.admins.find_one({"company_id": company_id, "user_id": user_id})
 
 
     # ---------------- Companies ---------------- #
@@ -84,7 +84,7 @@ class CompanyRepository:
                     async for d in docs_cursor
                 ]
                 admins.append({
-                    "id": admin["admin_id"],
+                    "id": admin["user_id"],
                     "user_id": admin["user_id"],
                     "name": admin["name"],
                     "email": admin["email"],
@@ -139,7 +139,6 @@ class CompanyRepository:
                     admin_modules[k]["enabled"] = v.get("enabled", False)
 
         admin_doc = {
-            "admin_id": str(uuid.uuid4()),
             "company_id": company_id,
             "user_id": str(uuid.uuid4()),
             "name": name,
@@ -151,7 +150,6 @@ class CompanyRepository:
         await self.admins.insert_one(admin_doc)
 
         return {
-            "id": admin_doc["admin_id"],
             "user_id": admin_doc["user_id"],
             "company_id": admin_doc["company_id"],
             "name": admin_doc["name"],
@@ -160,19 +158,19 @@ class CompanyRepository:
             "documents": [],  # empty until uploaded
         }
 
-    async def delete_admin(self, company_id: str, admin_id: str) -> bool:
-        admin = await self.admins.find_one({"company_id": company_id, "admin_id": admin_id})
+    async def delete_admin(self, company_id: str, user_id: str) -> bool:
+        admin = await self.admins.find_one({"company_id": company_id, "user_id": user_id})
         if not admin:
             return False
 
-        result = await self.admins.delete_one({"company_id": company_id, "admin_id": admin_id})
+        result = await self.admins.delete_one({"company_id": company_id, "user_id": user_id})
         if result.deleted_count > 0:
             await self.documents.delete_many({"user_id": admin["user_id"]})
             return True
         return False
 
-    async def assign_modules(self, company_id: str, admin_id: str, modules: dict) -> Optional[dict]:
-        admin = await self.admins.find_one({"company_id": company_id, "admin_id": admin_id})
+    async def assign_modules(self, company_id: str, user_id: str, modules: dict) -> Optional[dict]:
+        admin = await self.admins.find_one({"company_id": company_id, "user_id": user_id})
         if not admin:
             return None
 
@@ -181,13 +179,13 @@ class CompanyRepository:
                 admin["modules"][k]["enabled"] = v.get("enabled", False)
 
         await self.admins.update_one(
-            {"company_id": company_id, "admin_id": admin_id},
+            {"company_id": company_id, "user_id": user_id},
             {"$set": {"modules": admin["modules"], "updated_at": datetime.utcnow()}},
         )
 
         # return clean version
         return {
-            "id": admin["admin_id"],
+            "id": admin["user_id"],
             "user_id": admin["user_id"],
             "company_id": admin["company_id"],
             "name": admin["name"],
@@ -250,7 +248,7 @@ class CompanyRepository:
         ]
 
         return {
-            "id": user.get("admin_id", user.get("user_id")),
+            "id": user.get("user_id", user.get("user_id")),
             "user_id": user["user_id"],
             "company_id": user["company_id"],
             "name": user["name"],
@@ -259,3 +257,161 @@ class CompanyRepository:
             "modules": serialize_modules(user["modules"]) if "modules" in user else [],
             "documents": documents,
         }
+
+    async def add_user_by_admin(self, company_id: str, added_by_admin_id: str, email: str, company_role: str):
+        """Company admin creates a user under their company."""
+        # Prevent duplicates
+        if await self.users.find_one({"company_id": company_id, "email": email}):
+            raise ValueError("User with this email already exists in this company")
+
+        user_doc = {
+            "user_id": str(uuid.uuid4()),
+            "company_id": company_id,
+            "added_by_admin_id": added_by_admin_id,  # tracking who added
+            "email": email,
+            "company_role": company_role,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+            "name": None,  # filled later by user
+        }
+        await self.users.insert_one(user_doc)
+
+        return {
+            "user_id": user_doc["user_id"],
+            "company_id": company_id,
+            "email": email,
+            "company_role": company_role,
+            "added_by_admin_id": added_by_admin_id,
+            "name": None,
+            "documents": [],
+        }
+
+    async def update_user(self, company_id: str, user_id: str, name: str, email: str, company_role: str) -> bool:
+        now = datetime.utcnow()
+        target_is_admin = company_role == "company_admin"
+
+        # Fetch existing docs (could exist in either collection)
+        admin_doc = await self.admins.find_one({"company_id": company_id, "user_id": user_id})
+        user_doc = await self.users.find_one({"company_id": company_id, "user_id": user_id})
+
+        # --- Target: admin ---
+        if target_is_admin:
+            # 1) Already an admin -> update fields, remove stray user doc if exists
+            if admin_doc:
+                await self.admins.update_one(
+                    {"company_id": company_id, "user_id": user_id},
+                    {"$set": {"name": name, "email": email, "updated_at": now}}
+                )
+                if user_doc:
+                    await self.users.delete_one({"company_id": company_id, "user_id": user_id})
+                return True
+
+            # 2) Exists as user -> move user -> admin (preserve created_at if present)
+            if user_doc:
+                created_at = user_doc.get("created_at", now)
+                new_admin = {
+                    "company_id": company_id,
+                    "user_id": user_id,
+                    "name": name,
+                    "email": email,
+                    "modules": copy.deepcopy(DEFAULT_MODULES),
+                    "created_at": created_at,
+                    "updated_at": now,
+                }
+                # Insert admin, then remove user doc
+                await self.admins.insert_one(new_admin)
+                await self.users.delete_one({"company_id": company_id, "user_id": user_id})
+                return True
+
+            # 3) Not found anywhere -> create admin record (preserve user_id)
+            new_admin = {
+                "company_id": company_id,
+                "user_id": user_id,
+                "name": name,
+                "email": email,
+                "modules": copy.deepcopy(DEFAULT_MODULES),
+                "created_at": now,
+                "updated_at": now,
+            }
+            await self.admins.insert_one(new_admin)
+            return True
+
+        # --- Target: company_user ---
+        else:
+            # 1) Already a user -> update fields, remove stray admin doc if exists
+            if user_doc:
+                await self.users.update_one(
+                    {"company_id": company_id, "user_id": user_id},
+                    {"$set": {"name": name, "email": email, "company_role": company_role, "updated_at": now}}
+                )
+                if admin_doc:
+                    await self.admins.delete_one({"company_id": company_id, "user_id": user_id})
+                return True
+
+            # 2) Exists as admin -> move admin -> user (preserve created_at if present)
+            if admin_doc:
+                created_at = admin_doc.get("created_at", now)
+                # If admin has info about who added them, preserve if meaningful.
+                added_by_admin_id = admin_doc.get("user_id")  # fallback (could be None)
+                new_user = {
+                    "company_id": company_id,
+                    "user_id": user_id,
+                    "name": name,
+                    "email": email,
+                    "company_role": company_role,
+                    "added_by_admin_id": added_by_admin_id,
+                    "created_at": created_at,
+                    "updated_at": now,
+                }
+                await self.users.insert_one(new_user)
+                await self.admins.delete_one({"company_id": company_id, "user_id": user_id})
+                return True
+
+            # 3) Not found anywhere -> create user record
+            new_user = {
+                "company_id": company_id,
+                "user_id": user_id,
+                "name": name,
+                "email": email,
+                "company_role": company_role,
+                "added_by_admin_id": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            await self.users.insert_one(new_user)
+            return True
+
+
+    # ---------------- Debug / Inspection ---------------- #
+    async def get_all_collections_data(self) -> dict:
+        """Return all documents from companies, admins, users, and documents collections."""
+        companies = await self.companies.find().to_list(None)
+        admins = await self.admins.find().to_list(None)
+        users = await self.users.find().to_list(None)
+        documents = await self.documents.find().to_list(None)
+
+        # Convert ObjectId and datetime objects to strings for JSON safety
+        def serialize(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            if isinstance(obj, dict):
+                return {k: serialize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [serialize(v) for v in obj]
+            return str(obj)
+
+        return {
+            "companies": serialize(companies),
+            "company_admins": serialize(admins),
+            "company_users": serialize(users),
+            "documents": serialize(documents),
+        }
+
+    async def clear_all_data(self) -> dict:
+        """⚠️ DANGER: Delete all data in all collections."""
+        await self.companies.delete_many({})
+        await self.admins.delete_many({})
+        await self.users.delete_many({})
+        await self.documents.delete_many({})
+        return {"status": "All collections cleared"}
+
