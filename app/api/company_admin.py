@@ -210,7 +210,22 @@ async def get_company_stats(
 # -------------------------------------------------------------
 # GET Company stats
 # -------------------------------------------------------------
-@company_admin_router.post("/role")
+@company_admin_router.post("/roles")
+async def add_or_update_role(
+    payload: CompanyRoleCreate,
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+
+    try:
+        result = await repo.add_or_update_role(company_id, payload.role_name, payload.folders)
+        return result
+    except Exception as e:
+        logger.exception("Failed to add or update role")
+        raise HTTPException(status_code=500, detail=str(e))
+    
 
 @company_admin_router.get("/debug/all-data")
 async def get_all_data(db=Depends(get_db)):
