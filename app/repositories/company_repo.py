@@ -1,10 +1,18 @@
 import uuid
 import copy
+import os
+from pathlib import Path
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Optional
 
 BASE_DOC_URL = "https://your-backend.com/documents/download"
+
+# Base path for all uploads
+UPLOAD_ROOT = "/app/uploads/documents"
+
+# Ensure root folder exists at startup
+os.makedirs(UPLOAD_ROOT, exist_ok=True)
 
 DEFAULT_MODULES = {
     "Documenten chat": {"desc": "AI-zoek & Q&A over geuploade documenten.", "enabled": False},
@@ -235,11 +243,9 @@ class CompanyRepository:
     # ---------------- Company Roles ---------------- #
     async def add_or_update_role(self, company_id: str, role_name: str, folders: list[str]) -> dict:
         """
-        Create or update a role with given folders.
-        If the role exists, append new folders (no duplicates).
-        Also ensures folder directories exist on disk.
+        Create or update a company role with given subfolders.
+        Ensures folders exist on disk under /app/uploads/documents/roleBased/{company_id}/.
         """
-        # Normalize folder paths (e.g., remove leading/trailing slashes)
         folders = [f.strip("/") for f in folders if f.strip()]
 
         existing_role = await self.roles.find_one({
@@ -247,41 +253,40 @@ class CompanyRepository:
             "name": role_name
         })
 
-        # --- Create new role if not found ---
-        if not existing_role:
-            role_doc = {
+        if existing_role:
+            # Merge without duplicates
+            current_folders = set(existing_role.get("folders", []))
+            updated_folders = sorted(current_folders.union(folders))
+            await self.roles.update_one(
+                {"_id": existing_role["_id"]},
+                {"$set": {"folders": updated_folders, "updated_at": datetime.utcnow()}}
+            )
+            status = "role_updated"
+        else:
+            await self.roles.insert_one({
                 "company_id": company_id,
                 "name": role_name,
                 "folders": folders,
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
-            }
-            await self.roles.insert_one(role_doc)
-            created = True
-        else:
-            # Merge folders (avoid duplicates)
-            current_folders = set(existing_role.get("folders", []))
-            new_folders = list(current_folders.union(set(folders)))
-            await self.roles.update_one(
-                {"_id": existing_role["_id"]},
-                {"$set": {"folders": new_folders, "updated_at": datetime.utcnow()}}
-            )
-            role_doc = existing_role
-            role_doc["folders"] = new_folders
-            created = False
+            })
+            updated_folders = folders
+            status = "role_created"
 
-        # --- Create directories on disk ---
-        for folder in folders:
-            folder_path = UPLOAD_BASE_PATH / company_id / folder
-            os.makedirs(folder_path, exist_ok=True)
+        # Ensure folders exist on disk
+        base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id)
+        for folder in updated_folders:
+            full_path = os.path.join(base_path, folder)
+            os.makedirs(full_path, exist_ok=True)
 
         return {
-            "status": "role_created" if created else "role_updated",
+            "status": status,
             "company_id": company_id,
             "role_name": role_name,
-            "folders": folders,
+            "folders": updated_folders,
         }
-
+    
+    
     # ---------------- Shared ---------------- #
     async def get_user_with_documents(self, email: str):
         user = await self.admins.find_one({"email": email})

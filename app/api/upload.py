@@ -19,9 +19,6 @@ UPLOAD_ROOT = "/app/uploads"
 
 UPLOAD_FOLDERS = {
     "document": os.path.join(UPLOAD_ROOT, "documents"),
-    "bkr": os.path.join(UPLOAD_ROOT, "bkr"),
-    "vgc": os.path.join(UPLOAD_ROOT, "vgc"),
-    "3-uurs": os.path.join(UPLOAD_ROOT, "3-uurs"),
 }
 
 # Ensure all folders exist on startup
