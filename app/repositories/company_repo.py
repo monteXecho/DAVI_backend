@@ -1,7 +1,7 @@
 import uuid
 import copy
 import os
-from pathlib import Path
+from fastapi import HTTPException
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Optional
@@ -139,6 +139,7 @@ class CompanyRepository:
         result = await self.companies.delete_one({"company_id": company_id})
         return result.deleted_count > 0
 
+
     # ---------------- Admins ---------------- #
     async def add_admin(self, company_id: str, name: str, email: str, modules: Optional[dict] = None):
         if await self.admins.find_one({"company_id": company_id, "email": email}):
@@ -211,6 +212,7 @@ class CompanyRepository:
             return None
         return {"email": admin["email"], "role": "company_admin"}
 
+
     # ---------------- Users ---------------- #
     async def add_user(self, company_id: str, name: str, email: str):
         if await self.users.find_one({"company_id": company_id, "email": email}):
@@ -239,6 +241,7 @@ class CompanyRepository:
             await self.documents.delete_many({"user_id": user_id})
             return True
         return False
+
 
     # ---------------- Company Roles ---------------- #
     async def add_or_update_role(self, company_id: str, role_name: str, folders: list[str]) -> dict:
@@ -286,7 +289,40 @@ class CompanyRepository:
             "folders": updated_folders,
         }
     
+    async def list_roles(self, company_id: str) -> list[dict]:
+        """List all roles for a given company."""
+        cursor = self.roles.find({"company_id": company_id})
+        roles = await cursor.to_list(length=None)
+        return [
+            {
+                "name": r.get("name"),
+                "folders": r.get("folders", []),
+            }
+            for r in roles
+        ]
+
+    async def delete_role(self, company_id: str, role_name: str) -> dict:
+        """Delete a role by name; optionally remove its folders from disk."""
+        role = await self.roles.find_one({"company_id": company_id, "name": role_name})
+        if not role:
+            raise HTTPException(status_code=404, detail="Role not found")
+
+        for folder in role.get("folders", []):
+            base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id)
+            folder_path = os.path.join(base_path, folder)
+            if os.path.exists(folder_path):
+                try:
+                    os.rmdir(folder_path)
+                except OSError:
+                    # Directory not empty or inaccessible
+                    pass
+
+        # Remove role from database
+        await self.roles.delete_one({"_id": role["_id"]})
+
+        return {"status": "deleted", "role_name": role_name}
     
+
     # ---------------- Shared ---------------- #
     async def get_user_with_documents(self, email: str):
         user = await self.admins.find_one({"email": email})

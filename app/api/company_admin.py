@@ -207,8 +207,9 @@ async def get_company_stats(
         "documents_for_users": docs_for_users,
     }
 
+
 # -------------------------------------------------------------
-# GET Company stats
+# ADD or UPDAT a company role and document folders for the role
 # -------------------------------------------------------------
 @company_admin_router.post("/roles")
 async def add_or_update_role(
@@ -225,6 +226,40 @@ async def add_or_update_role(
     except Exception as e:
         logger.exception("Failed to add or update role")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@company_admin_router.get("/roles")
+async def list_roles(
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    """List all roles for the authenticated user's company."""
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    try:
+        roles = await repo.list_roles(company_id)
+        return {"roles": roles}
+    except Exception as e:
+        print("Failed to list roles:", e)
+        raise HTTPException(status_code=500, detail="Failed to list roles")
+
+
+@company_admin_router.delete("/roles/{role_name}")
+async def delete_role(
+    role_name: str,
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    """Delete a role and optionally its folders."""
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    try:
+        result = await repo.delete_role(company_id, role_name,)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("Failed to delete role:", e)
+        raise HTTPException(status_code=500, detail="Failed to delete role")
     
 
 @company_admin_router.get("/debug/all-data")
