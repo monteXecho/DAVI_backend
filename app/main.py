@@ -22,11 +22,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# app.mount(
-#     "/output/highlighted",
-#     StaticFiles(directory=os.path.abspath("output/highlighted")),
-#     name="highlighted"
-# )
+# HIGHLIGHTED_DIR = os.path.join("/var/opt/DAVI_backend/output/highlighted")
+# app.mount("/highlighted", StaticFiles(directory=HIGHLIGHTED_DIR), name="highlighted")
+
+
+HIGHLIGHTED_DIR = os.path.join(os.getcwd(), "output", "highlighted")
+app.mount("/highlighted", StaticFiles(directory=HIGHLIGHTED_DIR), name="highlighted")
+
+
 
 @app.get("/")
 def root():

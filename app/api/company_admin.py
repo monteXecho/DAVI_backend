@@ -163,6 +163,54 @@ async def delete_user(
     }
 
 
+# -------------------------------------------------------------
+# GET Company stats
+# -------------------------------------------------------------
+@company_admin_router.get("/stats")
+async def get_company_stats(
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    """
+    Returns summary statistics for a company:
+    - Number of company admins
+    - Number of company users
+    - Total documents uploaded by admins
+    - Total documents uploaded by users
+    """
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+
+    # --- Count admins and users ---
+    admin_count = await db.company_admins.count_documents({"company_id": company_id})
+    user_count = await db.company_users.count_documents({"company_id": company_id})
+
+    # --- Get all admin & user IDs for this company ---
+    admin_ids = [
+        a["user_id"]
+        async for a in db.company_admins.find({"company_id": company_id}, {"user_id": 1})
+    ]
+    user_ids = [
+        u["user_id"]
+        async for u in db.company_users.find({"company_id": company_id}, {"user_id": 1})
+    ]
+
+    # --- Count documents for each group ---
+    docs_for_admins = await db.documents.count_documents({"user_id": {"$in": admin_ids}})
+    docs_for_users = await db.documents.count_documents({"user_id": {"$in": user_ids}})
+
+    return {
+        "company_id": company_id,
+        "company_admin_count": admin_count,
+        "company_user_count": user_count,
+        "documents_for_admins": docs_for_admins,
+        "documents_for_users": docs_for_users,
+    }
+
+# -------------------------------------------------------------
+# GET Company stats
+# -------------------------------------------------------------
+
 
 @company_admin_router.get("/debug/all-data")
 async def get_all_data(db=Depends(get_db)):

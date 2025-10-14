@@ -200,12 +200,6 @@ def find_and_highlight(pdf_filename, snippet_text, target_page, output_path):
         doc.close()
 
 
-    print(f"✅ Saved highlighted PDF to: {output_path}")
-    print(f"📄 Best page: {best_page_index}")
-    print(f"🧠 Best match score: {round(best_score, 4)}")
-    print(f"🧩 Matched segments: {matched}")
-    print(f"🔲 Highlighting from segment {highlight_start} to {highlight_end}")
-
 
 # --- Usage ---
 # if __name__ == "__main__":

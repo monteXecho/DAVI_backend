@@ -4,7 +4,6 @@ from app.core.config import AVAILABLE_MODELS
 
 class QuestionRequest(BaseModel):
     question: str = Field(..., min_length=3)
-    model: str = Field(default=AVAILABLE_MODELS[0])
 
 class DocumentResponse(BaseModel):
     content: str
@@ -13,7 +12,6 @@ class DocumentResponse(BaseModel):
 
 class AnswerResponse(BaseModel):
     answer: str
-    model_used: str
     documents: List[DocumentResponse]
 
 class ErrorResponse(BaseModel):

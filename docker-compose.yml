@@ -9,6 +9,10 @@ services:
       - ./app:/code/app
       - ./requirements.txt:/code/requirements.txt
       - ./uploads:/app/uploads
+      - /var/opt/DAVI_backend/uploads:/var/opt/DAVI_backend/uploads
+      - ./output:/code/output
+      - /var/opt/DAVI_backend/output/highlighted:/code/output/highlighted
+
     depends_on:
       - mongodb
     environment:

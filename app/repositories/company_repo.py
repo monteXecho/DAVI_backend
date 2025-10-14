@@ -34,10 +34,14 @@ class CompanyRepository:
         self.companies = db.companies
         self.admins = db.company_admins
         self.users = db.company_users
+        self.roles = db.company_roles
         self.documents = db.documents
 
     async def get_admins_by_company(self, company_id: str):
         return await self.admins.find({"company_id": company_id}).to_list(None)
+
+    async def get_users_by_company(self, company_id: str):
+        return await self.users.find({"company_id": company_id}).to_list(None)
 
     async def get_users_by_company_admin(self, admin_id: str):
         return await self.users.find({"added_by_admin_id": admin_id}, {"_id": 0}).to_list(None)
@@ -227,6 +231,25 @@ class CompanyRepository:
             await self.documents.delete_many({"user_id": user_id})
             return True
         return False
+
+    # ---------------- Company Roles ---------------- #
+    async def add_role(self, company_id: str, name: str, folders: str):
+        if await self.roles.find_one({"company_id": company_id, "name": name}):
+            raise ValueError("Role with this name already exists")
+
+        role_doc = {
+            "company_id": company_id,
+            "name": name,
+            "folders": folders,
+            "created_at": datetime.utcnow(),
+        }
+        await self.roles.insert_one(role_doc)
+
+        return {
+            "company_id": role_doc["company_id"],
+            "name": role_doc["name"],
+            "folders": role_doc["folders"]
+        }
 
     # ---------------- Shared ---------------- #
     async def get_user_with_documents(self, email: str):
