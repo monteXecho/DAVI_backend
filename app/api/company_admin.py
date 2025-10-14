@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.deps.auth import require_role
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
-from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate
+from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +210,7 @@ async def get_company_stats(
 # -------------------------------------------------------------
 # GET Company stats
 # -------------------------------------------------------------
-
+@company_admin_router.post("/role")
 
 @company_admin_router.get("/debug/all-data")
 async def get_all_data(db=Depends(get_db)):

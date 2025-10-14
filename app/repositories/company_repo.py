@@ -233,22 +233,53 @@ class CompanyRepository:
         return False
 
     # ---------------- Company Roles ---------------- #
-    async def add_role(self, company_id: str, name: str, folders: str):
-        if await self.roles.find_one({"company_id": company_id, "name": name}):
-            raise ValueError("Role with this name already exists")
+    async def add_or_update_role(self, company_id: str, role_name: str, folders: list[str]) -> dict:
+        """
+        Create or update a role with given folders.
+        If the role exists, append new folders (no duplicates).
+        Also ensures folder directories exist on disk.
+        """
+        # Normalize folder paths (e.g., remove leading/trailing slashes)
+        folders = [f.strip("/") for f in folders if f.strip()]
 
-        role_doc = {
+        existing_role = await self.roles.find_one({
             "company_id": company_id,
-            "name": name,
-            "folders": folders,
-            "created_at": datetime.utcnow(),
-        }
-        await self.roles.insert_one(role_doc)
+            "name": role_name
+        })
+
+        # --- Create new role if not found ---
+        if not existing_role:
+            role_doc = {
+                "company_id": company_id,
+                "name": role_name,
+                "folders": folders,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+            await self.roles.insert_one(role_doc)
+            created = True
+        else:
+            # Merge folders (avoid duplicates)
+            current_folders = set(existing_role.get("folders", []))
+            new_folders = list(current_folders.union(set(folders)))
+            await self.roles.update_one(
+                {"_id": existing_role["_id"]},
+                {"$set": {"folders": new_folders, "updated_at": datetime.utcnow()}}
+            )
+            role_doc = existing_role
+            role_doc["folders"] = new_folders
+            created = False
+
+        # --- Create directories on disk ---
+        for folder in folders:
+            folder_path = UPLOAD_BASE_PATH / company_id / folder
+            os.makedirs(folder_path, exist_ok=True)
 
         return {
-            "company_id": role_doc["company_id"],
-            "name": role_doc["name"],
-            "folders": role_doc["folders"]
+            "status": "role_created" if created else "role_updated",
+            "company_id": company_id,
+            "role_name": role_name,
+            "folders": folders,
         }
 
     # ---------------- Shared ---------------- #
