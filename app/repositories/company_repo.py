@@ -270,6 +270,8 @@ class CompanyRepository:
                 "company_id": company_id,
                 "name": role_name,
                 "folders": folders,
+                "assigned_user_count": 0,
+                "document_count": 0,
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             })
@@ -297,6 +299,8 @@ class CompanyRepository:
             {
                 "name": r.get("name"),
                 "folders": r.get("folders", []),
+                "user_count": r.get("assigned_user_count", 0),
+                "document_count": r.get("document_count", 0)
             }
             for r in roles
         ]
@@ -322,6 +326,56 @@ class CompanyRepository:
 
         return {"status": "deleted", "role_name": role_name}
     
+    async def assign_role_to_user(self, company_id: str, user_id: str, role_name: str) -> dict:
+        """
+        Assign a role to a company user (by user_id).
+        Adds the role to 'assigned_roles' array (no duplicates)
+        and increments the role's assigned_user_count.
+        """
+
+        # --- Verify role exists ---
+        role = await self.roles.find_one({"company_id": company_id, "name": role_name})
+        if not role:
+            raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found")
+
+        # --- Verify company user exists ---
+        user = await self.users.find_one({"user_id": user_id, "company_id": company_id})
+        if not user:
+            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found in this company")
+
+        # --- Prepare assigned roles ---
+        assigned_roles = user.get("assigned_roles", [])
+        if role_name not in assigned_roles:
+            assigned_roles.append(role_name)
+
+            # Update user with the new role list
+            await self.users.update_one(
+                {"user_id": user_id, "company_id": company_id},
+                {
+                    "$set": {
+                        "assigned_roles": assigned_roles,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+
+            # Increment the count for the role
+            await self.roles.update_one(
+                {"_id": role["_id"]},
+                {"$inc": {"assigned_user_count": 1}}
+            )
+
+            status = "role_assigned"
+        else:
+            status = "role_already_assigned"
+
+        return {
+            "status": status,
+            "company_id": company_id,
+            "user_id": user_id,
+            "assigned_roles": assigned_roles
+        }
+
 
     # ---------------- Shared ---------------- #
     async def get_user_with_documents(self, email: str):
@@ -381,101 +435,27 @@ class CompanyRepository:
             "documents": [],
         }
 
-    async def update_user(self, company_id: str, user_id: str, name: str, email: str, company_role: str) -> bool:
+    async def update_user(self, company_id: str, user_id: str, name: str, email: str, assigned_roles: list[str]) -> bool:
         now = datetime.utcnow()
-        target_is_admin = company_role == "company_admin"
 
-        # Fetch existing docs (could exist in either collection)
-        admin_doc = await self.admins.find_one({"company_id": company_id, "user_id": user_id})
         user_doc = await self.users.find_one({"company_id": company_id, "user_id": user_id})
 
-        # --- Target: admin ---
-        if target_is_admin:
-            # 1) Already an admin -> update fields, remove stray user doc if exists
-            if admin_doc:
-                await self.admins.update_one(
-                    {"company_id": company_id, "user_id": user_id},
-                    {"$set": {"name": name, "email": email, "updated_at": now}}
-                )
-                if user_doc:
-                    await self.users.delete_one({"company_id": company_id, "user_id": user_id})
-                return True
+        # 1️⃣ If user already exists, update all fields
+        if user_doc:
+            result = await self.users.update_one(
+                {"company_id": company_id, "user_id": user_id},
+                {
+                    "$set": {
+                        "name": name,
+                        "email": email,
+                        "assigned_roles": assigned_roles,
+                        "updated_at": now,
+                    }
+                },
+            )
+            return result.modified_count > 0
 
-            # 2) Exists as user -> move user -> admin (preserve created_at if present)
-            if user_doc:
-                created_at = user_doc.get("created_at", now)
-                new_admin = {
-                    "company_id": company_id,
-                    "user_id": user_id,
-                    "name": name,
-                    "email": email,
-                    "modules": copy.deepcopy(DEFAULT_MODULES),
-                    "created_at": created_at,
-                    "updated_at": now,
-                }
-                # Insert admin, then remove user doc
-                await self.admins.insert_one(new_admin)
-                await self.users.delete_one({"company_id": company_id, "user_id": user_id})
-                return True
-
-            # 3) Not found anywhere -> create admin record (preserve user_id)
-            new_admin = {
-                "company_id": company_id,
-                "user_id": user_id,
-                "name": name,
-                "email": email,
-                "modules": copy.deepcopy(DEFAULT_MODULES),
-                "created_at": now,
-                "updated_at": now,
-            }
-            await self.admins.insert_one(new_admin)
-            return True
-
-        # --- Target: company_user ---
-        else:
-            # 1) Already a user -> update fields, remove stray admin doc if exists
-            if user_doc:
-                await self.users.update_one(
-                    {"company_id": company_id, "user_id": user_id},
-                    {"$set": {"name": name, "email": email, "company_role": company_role, "updated_at": now}}
-                )
-                if admin_doc:
-                    await self.admins.delete_one({"company_id": company_id, "user_id": user_id})
-                return True
-
-            # 2) Exists as admin -> move admin -> user (preserve created_at if present)
-            if admin_doc:
-                created_at = admin_doc.get("created_at", now)
-                # If admin has info about who added them, preserve if meaningful.
-                added_by_admin_id = admin_doc.get("user_id")  # fallback (could be None)
-                new_user = {
-                    "company_id": company_id,
-                    "user_id": user_id,
-                    "name": name,
-                    "email": email,
-                    "company_role": company_role,
-                    "added_by_admin_id": added_by_admin_id,
-                    "created_at": created_at,
-                    "updated_at": now,
-                }
-                await self.users.insert_one(new_user)
-                await self.admins.delete_one({"company_id": company_id, "user_id": user_id})
-                return True
-
-            # 3) Not found anywhere -> create user record
-            new_user = {
-                "company_id": company_id,
-                "user_id": user_id,
-                "name": name,
-                "email": email,
-                "company_role": company_role,
-                "added_by_admin_id": None,
-                "created_at": now,
-                "updated_at": now,
-            }
-            await self.users.insert_one(new_user)
-            return True
-
+        return True
 
     # ---------------- Debug / Inspection ---------------- #
     async def get_all_collections_data(self) -> dict:
@@ -509,4 +489,3 @@ class CompanyRepository:
         await self.users.delete_many({})
         await self.documents.delete_many({})
         return {"status": "All collections cleared"}
-

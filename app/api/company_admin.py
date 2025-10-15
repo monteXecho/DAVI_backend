@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.deps.auth import require_role
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
-from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate
+from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ async def get_admin_company_id(
         "admin_email": admin_email
     }
 
+
 # -------------------------------------------------------------
 # GET all users belonging to the same company
 # -------------------------------------------------------------
@@ -54,18 +55,7 @@ async def get_all_users(
 
     company_id = admin_context["company_id"]
 
-    # Step 4: Fetch all admins and users in the same company
-    admins_cursor = db.company_admins.find({"company_id": company_id})
     users_cursor = db.company_users.find({"company_id": company_id})
-
-    admins = []
-    async for adm in admins_cursor:
-        admins.append({
-            "id": adm.get("user_id"),
-            "name": adm.get("name"),
-            "email": adm.get("email"),
-            "role": "company_admin"
-        })
 
     users = []
     async for usr in users_cursor:
@@ -73,14 +63,13 @@ async def get_all_users(
             "id": usr.get("user_id"),
             "name": usr.get("name"),
             "email": usr.get("email"),
-            "role": usr.get("company_role", "company_user")
+            "roles": usr.get("assigned_roles")
         })
 
     # Combine both lists
-    combined = admins + users
+    combined = users
 
     return {"company_id": company_id, "members": combined}
-
 
 # -------------------------------------------------------------
 # ADD new user (with email + company_role)
@@ -115,7 +104,6 @@ async def add_user(
         logger.exception("Failed to add company user/admin")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # -------------------------------------------------------------
 # UPDATE user (when the user registers and sets their name)
 # -------------------------------------------------------------
@@ -129,12 +117,11 @@ async def update_user(
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
 
-    updated = await repo.update_user(company_id, user_id, payload.name, payload.email, payload.company_role)
+    updated = await repo.update_user(company_id, user_id, payload.name, payload.email, payload.assigned_roles)
     if not updated:
         raise HTTPException(status_code=404, detail="User not found or not in your company")
 
-    return {"status": "user_updated", "user_id": user_id, "new_name": payload.name}
-
+    return {"status": "user_updated", "user_id": user_id, "new_name": payload.name, "assigned_roles": payload.assigned_roles,}
 
 # -------------------------------------------------------------
 # DELETE user
@@ -260,6 +247,25 @@ async def delete_role(
     except Exception as e:
         print("Failed to delete role:", e)
         raise HTTPException(status_code=500, detail="Failed to delete role")
+    
+@company_admin_router.post("/roles/assign")
+async def assign_role_to_user(
+    payload: AssignRolePayload,
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+
+    try:
+        result = await repo.assign_role_to_user(company_id, payload.user_id, payload.role_name)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("Failed to assign role:", e)
+        raise HTTPException(status_code=500, detail="Failed to assign role")
     
 
 @company_admin_router.get("/debug/all-data")
