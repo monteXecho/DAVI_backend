@@ -306,11 +306,13 @@ class CompanyRepository:
         ]
 
     async def delete_role(self, company_id: str, role_name: str) -> dict:
-        """Delete a role by name; optionally remove its folders from disk."""
+        """Delete a role by name and remove it from users' assigned_roles."""
+        # --- Verify role exists ---
         role = await self.roles.find_one({"company_id": company_id, "name": role_name})
         if not role:
             raise HTTPException(status_code=404, detail="Role not found")
 
+        # --- Remove related folders (as before) ---
         for folder in role.get("folders", []):
             base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id)
             folder_path = os.path.join(base_path, folder)
@@ -321,10 +323,21 @@ class CompanyRepository:
                     # Directory not empty or inaccessible
                     pass
 
-        # Remove role from database
+        # --- Remove this role from all users' assigned_roles ---
+        update_result = await self.users.update_many(
+            {"company_id": company_id, "assigned_roles": role_name},
+            {"$pull": {"assigned_roles": role_name}}
+        )
+
+        # --- Delete the role itself ---
         await self.roles.delete_one({"_id": role["_id"]})
 
-        return {"status": "deleted", "role_name": role_name}
+        # --- Return cleanup result ---
+        return {
+            "status": "deleted",
+            "role_name": role_name,
+            "users_updated": update_result.modified_count
+        }
     
     async def assign_role_to_user(self, company_id: str, user_id: str, role_name: str) -> dict:
         """
@@ -436,24 +449,51 @@ class CompanyRepository:
         }
 
     async def update_user(self, company_id: str, user_id: str, name: str, email: str, assigned_roles: list[str]) -> bool:
+        """
+        Update user info and adjust assigned_user_count for affected roles.
+        If roles were added or removed, increment/decrement counts accordingly.
+        """
         now = datetime.utcnow()
 
+        # Fetch the existing user
         user_doc = await self.users.find_one({"company_id": company_id, "user_id": user_id})
+        if not user_doc:
+            raise HTTPException(status_code=404, detail="User not found")
 
-        # 1️⃣ If user already exists, update all fields
-        if user_doc:
-            result = await self.users.update_one(
-                {"company_id": company_id, "user_id": user_id},
-                {
-                    "$set": {
-                        "name": name,
-                        "email": email,
-                        "assigned_roles": assigned_roles,
-                        "updated_at": now,
-                    }
-                },
+        old_roles = set(user_doc.get("assigned_roles", []))
+        new_roles = set(assigned_roles)
+
+        # --- Detect role changes ---
+        added_roles = new_roles - old_roles
+        removed_roles = old_roles - new_roles
+
+        # --- Update user document ---
+        await self.users.update_one(
+            {"company_id": company_id, "user_id": user_id},
+            {
+                "$set": {
+                    "name": name,
+                    "email": email,
+                    "assigned_roles": list(new_roles),
+                    "updated_at": now,
+                }
+            },
+        )
+
+        # --- Update assigned_user_count for roles ---
+        # Increment count for newly added roles
+        if added_roles:
+            await self.roles.update_many(
+                {"company_id": company_id, "name": {"$in": list(added_roles)}},
+                {"$inc": {"assigned_user_count": 1}},
             )
-            return result.modified_count > 0
+
+        # Decrement count for removed roles
+        if removed_roles:
+            await self.roles.update_many(
+                {"company_id": company_id, "name": {"$in": list(removed_roles)}},
+                {"$inc": {"assigned_user_count": -1}},
+            )
 
         return True
 
