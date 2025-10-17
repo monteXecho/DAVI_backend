@@ -7,7 +7,7 @@ from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Optional
 from pymongo.errors import DuplicateKeyError
-
+from collections import defaultdict
 
 BASE_DOC_URL = "https://your-backend.com/documents/download"
 
@@ -215,6 +215,70 @@ class CompanyRepository:
             return None
         return {"email": admin["email"], "role": "company_admin"}
 
+    async def get_admin_documents(self, company_id: str, admin_id: str):
+        """
+        Get all documents uploaded by the admin, grouped by role and folder,
+        including which users (by role) have access.
+        """
+        # --- Step 1: Get all documents uploaded by this admin ---
+        docs_cursor = self.documents.find({
+            "company_id": company_id,
+            "user_id": admin_id
+        })
+        docs = await docs_cursor.to_list(None)
+
+        if not docs:
+            raise HTTPException(status_code=404, detail="No documents found for this admin.")
+
+        # --- Step 2: Prepare structure ---
+        result = defaultdict(lambda: {"folders": []})
+
+        for doc in docs:
+            upload_type = doc.get("upload_type")
+            if not upload_type or not upload_type.startswith("role_"):
+                continue
+
+            # Extract folder path relative to role folder
+            relative_path = doc.get("path", "")
+            folder_name = ""
+            try:
+                parts = relative_path.split(f"/{upload_type}/")[1].split("/")
+                if len(parts) > 1:
+                    folder_name = os.path.join(*parts[:-1])
+            except Exception:
+                folder_name = "Uncategorized"
+
+            # Add document to the corresponding folder
+            folder_entry = next((f for f in result[upload_type]["folders"] if f["name"] == folder_name), None)
+            if not folder_entry:
+                folder_entry = {"name": folder_name, "documents": []}
+                result[upload_type]["folders"].append(folder_entry)
+
+            folder_entry["documents"].append({
+                "file_name": doc.get("file_name"),
+                "path": doc.get("path"),
+                "uploaded_at": doc.get("uploaded_at"),
+                "assigned_to": []
+            })
+
+        # --- Step 3: Find users assigned to each role ---
+        roles = list(result.keys())
+        users_cursor = self.users.find({
+            "company_id": company_id,
+            "assigned_roles": {"$in": roles}
+        })
+        users = await users_cursor.to_list(None)
+
+        # Map users by their assigned roles
+        for user in users:
+            for role in user.get("assigned_roles", []):
+                if role in result:
+                    for folder in result[role]["folders"]:
+                        for doc_entry in folder["documents"]:
+                            doc_entry["assigned_to"].append(user["user_id"])
+
+        # --- Step 4: Return structured result ---
+        return result
 
     # ---------------- Users ---------------- #
     async def add_user(self, company_id: str, name: str, email: str):
@@ -475,7 +539,6 @@ class CompanyRepository:
         }
 
     # ---------------- Shared ---------------- #
-# ---------------- Shared ---------------- #
     async def get_user_with_documents(self, email: str):
         # 1️⃣ Find the user (from either collection)
         user = await self.admins.find_one({"email": email})

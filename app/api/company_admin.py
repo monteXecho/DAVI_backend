@@ -73,6 +73,37 @@ async def get_all_users(
     return {"company_id": company_id, "members": combined}
 
 # -------------------------------------------------------------
+# Get all documents uploaded by the admin (grouped by role/folder)
+# -------------------------------------------------------------
+@company_admin_router.get("/documents", summary="Get all uploaded documents by admin")
+async def get_admin_uploaded_documents(
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    """
+    Retrieve all documents uploaded by the current admin, grouped by role and folder.
+    
+    This endpoint returns a structured view showing:
+      - Roles (e.g., role_A, role_B)
+      - Folders under each role
+      - Documents within each folder
+      - Users (by role) that the documents are assigned to
+    """
+    company_id: str = admin_context["company_id"]
+    admin_id: str = admin_context["admin_id"]
+
+    repo = CompanyRepository(db)
+
+    result = await repo.get_admin_documents(company_id, admin_id)
+
+    return {
+        "status": "success",
+        "company_id": company_id,
+        "admin_id": admin_id,
+        "data": result
+    }
+
+# -------------------------------------------------------------
 # ADD new user (with email + company_role)
 # -------------------------------------------------------------
 @company_admin_router.post("/users")
