@@ -97,7 +97,7 @@ async def get_admin_uploaded_documents(
     result = await repo.get_admin_documents(company_id, admin_id)
 
     return {
-        "status": "success",
+        "success": True,
         "company_id": company_id,
         "admin_id": admin_id,
         "data": result

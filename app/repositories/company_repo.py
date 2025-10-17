@@ -220,7 +220,7 @@ class CompanyRepository:
         Get all documents uploaded by the admin, grouped by role and folder,
         including which users (by role) have access.
         """
-        # --- Step 1: Get all documents uploaded by this admin ---
+        # --- Step 1: Fetch all admin documents ---
         docs_cursor = self.documents.find({
             "company_id": company_id,
             "user_id": admin_id
@@ -230,55 +230,64 @@ class CompanyRepository:
         if not docs:
             raise HTTPException(status_code=404, detail="No documents found for this admin.")
 
-        # --- Step 2: Prepare structure ---
         result = defaultdict(lambda: {"folders": []})
 
+        # --- Step 2: Group documents by upload_type (role name) ---
         for doc in docs:
             upload_type = doc.get("upload_type")
-            if not upload_type or not upload_type.startswith("role_"):
+            path = doc.get("path", "")
+            file_name = doc.get("file_name")
+
+            # Skip invalid documents
+            if not upload_type or upload_type == "document":
                 continue
 
-            # Extract folder path relative to role folder
-            relative_path = doc.get("path", "")
-            folder_name = ""
+            # Try to extract folder name relative to the upload_type
+            folder_name = "Uncategorized"
             try:
-                parts = relative_path.split(f"/{upload_type}/")[1].split("/")
+                parts = path.split(f"/{upload_type}/")[1].split("/")
                 if len(parts) > 1:
                     folder_name = os.path.join(*parts[:-1])
             except Exception:
-                folder_name = "Uncategorized"
+                pass
 
-            # Add document to the corresponding folder
-            folder_entry = next((f for f in result[upload_type]["folders"] if f["name"] == folder_name), None)
+            # Find or create folder entry
+            folder_entry = next(
+                (f for f in result[upload_type]["folders"] if f["name"] == folder_name),
+                None
+            )
             if not folder_entry:
                 folder_entry = {"name": folder_name, "documents": []}
                 result[upload_type]["folders"].append(folder_entry)
 
             folder_entry["documents"].append({
-                "file_name": doc.get("file_name"),
-                "path": doc.get("path"),
-                "uploaded_at": doc.get("uploaded_at"),
+                "file_name": file_name,
+                "path": path,
+                "uploaded_at": doc.get("uploaded_at") or doc.get("created_at"),
                 "assigned_to": []
             })
 
-        # --- Step 3: Find users assigned to each role ---
-        roles = list(result.keys())
+        # --- Step 3: Find all users who belong to any of these roles ---
+        role_names = list(result.keys())
         users_cursor = self.users.find({
             "company_id": company_id,
-            "assigned_roles": {"$in": roles}
+            "assigned_roles": {"$in": role_names}
         })
         users = await users_cursor.to_list(None)
 
-        # Map users by their assigned roles
+        # --- Step 4: Map users to roles ---
         for user in users:
+            user_id = user.get("user_id")
+            user_name = user.get("name")
+            user_email = user.get('email')
             for role in user.get("assigned_roles", []):
                 if role in result:
                     for folder in result[role]["folders"]:
                         for doc_entry in folder["documents"]:
-                            doc_entry["assigned_to"].append(user["user_id"])
+                            doc_entry["assigned_to"].append({"name": user_name, "email": user_email})
 
-        # --- Step 4: Return structured result ---
-        return result
+        # --- Step 5: Return structured response ---
+        return dict(result)
 
     # ---------------- Users ---------------- #
     async def add_user(self, company_id: str, name: str, email: str):
@@ -483,15 +492,19 @@ class CompanyRepository:
         file: UploadFile
     ) -> dict:
         """
-        Save uploaded document to disk and record it in MongoDB.
+        Upload a document under a specific role and folder for the given company admin.
+
+        - Ensures files are stored under: /uploads/documents/roleBased/{company_id}/{admin_id}/{role}/{folder}/
+        - Prevents duplicate uploads (same file name under same role/folder).
         """
-        # ✅ Sanitize and prepare paths
+        # ✅ Validate and sanitize inputs
+        file_name = (file.filename or "").strip()
         safe_folder = folder_name.strip("/ ")
-        file_name = file.filename
 
         if not file_name:
             raise HTTPException(status_code=400, detail="Missing file name")
 
+        # ✅ Build target directory
         base_path = os.path.join(
             UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name, safe_folder
         )
@@ -499,7 +512,21 @@ class CompanyRepository:
 
         file_path = os.path.join(base_path, file_name)
 
-        # ✅ Save file to disk asynchronously
+        # ✅ Check for duplicate before uploading
+        existing_doc = await self.documents.find_one({
+            "company_id": company_id,
+            "user_id": admin_id,
+            "upload_type": role_name,
+            "path": file_path
+        })
+
+        if existing_doc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A document named '{file_name}' already exists in folder '{safe_folder}' for role '{role_name}'."
+            )
+
+        # ✅ Save file asynchronously
         try:
             async with aiofiles.open(file_path, "wb") as f:
                 content = await file.read()
@@ -507,7 +534,7 @@ class CompanyRepository:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"File save failed: {str(e)}")
 
-        # ✅ Create document metadata
+        # ✅ Prepare metadata for DB
         doc_record = {
             "company_id": company_id,
             "user_id": admin_id,
@@ -517,13 +544,10 @@ class CompanyRepository:
             "uploaded_at": datetime.utcnow(),
         }
 
-        # ✅ Save metadata to DB
-        try:
-            await self.documents.insert_one(doc_record)
-        except DuplicateKeyError:
-            raise HTTPException(status_code=409, detail="A document with this name already exists.")
+        # ✅ Insert metadata
+        await self.documents.insert_one(doc_record)
 
-        # ✅ Update document count for that role
+        # ✅ Increment document count for this role
         await self.roles.update_one(
             {"company_id": company_id, "name": role_name},
             {"$inc": {"document_count": 1}}
