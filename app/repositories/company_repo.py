@@ -272,6 +272,7 @@ class CompanyRepository:
             await self.roles.insert_one({
                 "company_id": company_id,
                 "name": role_name,
+                "added_by_admin_id": admin_id,
                 "folders": folders,
                 "assigned_user_count": 0,
                 "document_count": 0,
@@ -294,9 +295,9 @@ class CompanyRepository:
             "folders": updated_folders,
         }
     
-    async def list_roles(self, company_id: str) -> list[dict]:
+    async def list_roles(self, company_id: str, admin_id: str) -> list[dict]:
         """List all roles for a given company."""
-        cursor = self.roles.find({"company_id": company_id})
+        cursor = self.roles.find({"company_id": company_id, "added_by_admin_id": admin_id})
         roles = await cursor.to_list(length=None)
         return [
             {
@@ -308,7 +309,7 @@ class CompanyRepository:
             for r in roles
         ]
 
-    async def delete_role(self, company_id: str, role_name: str) -> dict:
+    async def delete_role(self, company_id: str, role_name: str, admin_id: str) -> dict:
         """Delete a role by name and remove it from users' assigned_roles."""
         # --- Verify role exists ---
         role = await self.roles.find_one({"company_id": company_id, "name": role_name})
@@ -317,7 +318,7 @@ class CompanyRepository:
 
         # --- Remove related folders (as before) ---
         for folder in role.get("folders", []):
-            base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id)
+            base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
             folder_path = os.path.join(base_path, folder)
             if os.path.exists(folder_path):
                 try:
@@ -457,33 +458,73 @@ class CompanyRepository:
         }
 
     # ---------------- Shared ---------------- #
+# ---------------- Shared ---------------- #
     async def get_user_with_documents(self, email: str):
+        # 1️⃣ Find the user (from either collection)
         user = await self.admins.find_one({"email": email})
-        role = "company_admin"
+        user_type = "admin"
         if not user:
             user = await self.users.find_one({"email": email})
-            role = "company_user"
+            user_type = "company_user"
+
         if not user:
             return None
 
-        docs_cursor = self.documents.find({"user_id": user["user_id"]})
-        documents = [
+        user_id = user["user_id"]
+        company_id = user["company_id"]
+
+        # 2️⃣ Base query — all documents directly owned by the user
+        query = {"user_id": user_id}
+        owned_docs_cursor = self.documents.find(query)
+        owned_docs = [d async for d in owned_docs_cursor]
+
+        # 3️⃣ If company user → also include role-based documents from the admin
+        role_based_docs = []
+        if user_type == "company_user":
+            assigned_roles = user.get("assigned_roles", [])
+            added_by_admin_id = user.get("added_by_admin_id")
+
+            if assigned_roles and added_by_admin_id:
+                # Fetch documents uploaded by that admin and matching role types
+                role_query = {
+                    "user_id": added_by_admin_id,
+                    "company_id": company_id,
+                    "upload_type": {"$in": assigned_roles},
+                }
+                role_cursor = self.documents.find(role_query)
+                role_based_docs = [d async for d in role_cursor]
+
+        # 4️⃣ Merge and format results
+        all_docs = owned_docs + role_based_docs
+        formatted_docs = [
             {
-                "file_name": d["file_name"],
-                "file_url": f"{BASE_DOC_URL}/{d['user_id']}/{d['file_name']}",
+                "file_name": doc["file_name"],
+                "upload_type": doc.get("upload_type", "document"),
+                "path": doc.get("path", ""),
             }
-            async for d in docs_cursor
+            for doc in all_docs
         ]
 
+        # 5️⃣ Generate pass_ids
+        pass_ids = []
+        for doc in formatted_docs:
+            fn = doc["file_name"]
+            upload_type = doc.get("upload_type", "document")
+
+            # If upload_type is "document" → private
+            # Otherwise → role-based (shared)
+            if upload_type == "document":
+                pid = f"{user_id}--{fn}"
+            else:
+                pid = f"{company_id}-{user.get('added_by_admin_id', user_id)}--{fn}"
+            pass_ids.append(pid)
+
         return {
-            "id": user.get("user_id", user.get("user_id")),
-            "user_id": user["user_id"],
-            "company_id": user["company_id"],
-            "name": user["name"],
-            "email": user["email"],
-            "role": role,
-            "modules": serialize_modules(user["modules"]) if "modules" in user else [],
-            "documents": documents,
+            "user_id": user_id,
+            "company_id": company_id,
+            "user_type": user_type,
+            "documents": formatted_docs,
+            "pass_ids": pass_ids,
         }
 
     async def add_user_by_admin(self, company_id: str, added_by_admin_id: str, email: str, company_role: str):

@@ -121,7 +121,7 @@ async def ask_question(
 
         file_names = [doc["file_name"] for doc in user_documents]
         rag_result = await rag_query(
-            user_id=user_data["user_id"],
+            pass_ids=user_data["pass_ids"],
             question=request.question,
             file_names=file_names,
             company_id=company_id

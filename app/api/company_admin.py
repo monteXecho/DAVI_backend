@@ -224,8 +224,9 @@ async def list_roles(
     """List all roles for the authenticated user's company."""
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
     try:
-        roles = await repo.list_roles(company_id)
+        roles = await repo.list_roles(company_id, admin_id)
         return {"roles": roles}
     except Exception as e:
         print("Failed to list roles:", e)
@@ -241,8 +242,9 @@ async def delete_role(
     """Delete a role and optionally its folders."""
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
     try:
-        result = await repo.delete_role(company_id, role_name,)
+        result = await repo.delete_role(company_id, role_name, admin_id)
         return result
     except HTTPException:
         raise

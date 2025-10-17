@@ -108,11 +108,10 @@ async def rag_index_files(user_id: str, file_paths: List[str], company_id: str):
 # ------------------------------------------------------------
 # 🔹 QUERY ENDPOINT (ALWAYS ASYNC)
 # ------------------------------------------------------------
-async def rag_query(user_id: str, question: str, file_names: List[str], company_id: str):
+async def rag_query(pass_ids: str, question: str, file_names: List[str], company_id: str):
     """
     Query RAG API — async only.
     """
-    file_ids = [f"{user_id}--{fn}" for fn in file_names]
 
     payload = {
         "query": question,
@@ -120,7 +119,7 @@ async def rag_query(user_id: str, question: str, file_names: List[str], company_
         "filters": {
             "field": "file_id",
             "operator": "in",
-            "value": file_ids,
+            "value": pass_ids,
         },
     }
 
