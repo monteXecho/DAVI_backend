@@ -430,7 +430,7 @@ class CompanyRepository:
             "company_id": company_id,
             "user_id": admin_id,
             "file_name": file_name,
-            "upload_type": "document",
+            "upload_type": role_name,
             "path": file_path,
             "uploaded_at": datetime.utcnow(),
         }
@@ -570,6 +570,7 @@ class CompanyRepository:
         admins = await self.admins.find().to_list(None)
         users = await self.users.find().to_list(None)
         documents = await self.documents.find().to_list(None)
+        roles = await self.roles.find().to_list(None)
 
         # Convert ObjectId and datetime objects to strings for JSON safety
         def serialize(obj):
@@ -586,6 +587,7 @@ class CompanyRepository:
             "company_admins": serialize(admins),
             "company_users": serialize(users),
             "documents": serialize(documents),
+            "roles": serialize(roles)
         }
 
     async def clear_all_data(self) -> dict:

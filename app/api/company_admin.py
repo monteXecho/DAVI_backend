@@ -4,6 +4,7 @@ from app.deps.auth import require_role
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload
+from app.api.rag import rag_index_files
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +294,16 @@ async def upload_document_for_role(
             folder_name=folder_name,
             file=file
         )
+
+        file_path = result["path"]
+        file_id = company_id + '-' + admin_id
+
+        try:
+            await rag_index_files(file_id, [file_path], company_id)
+            logger.info(f"RAG indexing triggered for '{file.filename}'")
+        except Exception as e:
+            logger.error(f"RAG indexing failed for '{file.filename}': {e}")
+        
         return result
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Target folder not found for this role")
