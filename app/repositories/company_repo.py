@@ -1,10 +1,13 @@
 import uuid
 import copy
 import os
-from fastapi import HTTPException
+import aiofiles
+from fastapi import HTTPException, UploadFile
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Optional
+from pymongo.errors import DuplicateKeyError
+
 
 BASE_DOC_URL = "https://your-backend.com/documents/download"
 
@@ -244,7 +247,7 @@ class CompanyRepository:
 
 
     # ---------------- Company Roles ---------------- #
-    async def add_or_update_role(self, company_id: str, role_name: str, folders: list[str]) -> dict:
+    async def add_or_update_role(self, company_id: str, admin_id: str, role_name: str, folders: list[str]) -> dict:
         """
         Create or update a company role with given subfolders.
         Ensures folders exist on disk under /app/uploads/documents/roleBased/{company_id}/.
@@ -279,7 +282,7 @@ class CompanyRepository:
             status = "role_created"
 
         # Ensure folders exist on disk
-        base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id)
+        base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
         for folder in updated_folders:
             full_path = os.path.join(base_path, folder)
             os.makedirs(full_path, exist_ok=True)
@@ -389,6 +392,69 @@ class CompanyRepository:
             "assigned_roles": assigned_roles
         }
 
+    async def upload_document_for_role(
+        self,
+        company_id: str,
+        admin_id: str,
+        role_name: str,
+        folder_name: str,
+        file: UploadFile
+    ) -> dict:
+        """
+        Save uploaded document to disk and record it in MongoDB.
+        """
+        # ✅ Sanitize and prepare paths
+        safe_folder = folder_name.strip("/ ")
+        file_name = file.filename
+
+        if not file_name:
+            raise HTTPException(status_code=400, detail="Missing file name")
+
+        base_path = os.path.join(
+            UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name, safe_folder
+        )
+        os.makedirs(base_path, exist_ok=True)
+
+        file_path = os.path.join(base_path, file_name)
+
+        # ✅ Save file to disk asynchronously
+        try:
+            async with aiofiles.open(file_path, "wb") as f:
+                content = await file.read()
+                await f.write(content)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"File save failed: {str(e)}")
+
+        # ✅ Create document metadata
+        doc_record = {
+            "company_id": company_id,
+            "user_id": admin_id,
+            "file_name": file_name,
+            "upload_type": "document",
+            "path": file_path,
+            "uploaded_at": datetime.utcnow(),
+        }
+
+        # ✅ Save metadata to DB
+        try:
+            await self.documents.insert_one(doc_record)
+        except DuplicateKeyError:
+            raise HTTPException(status_code=409, detail="A document with this name already exists.")
+
+        # ✅ Update document count for that role
+        await self.roles.update_one(
+            {"company_id": company_id, "name": role_name},
+            {"$inc": {"document_count": 1}}
+        )
+
+        return {
+            "success": True,
+            "status": "uploaded",
+            "role": role_name,
+            "folder": safe_folder,
+            "file_name": file_name,
+            "path": file_path,
+        }
 
     # ---------------- Shared ---------------- #
     async def get_user_with_documents(self, email: str):

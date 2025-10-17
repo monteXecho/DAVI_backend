@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
 from app.deps.auth import require_role
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
@@ -206,9 +206,10 @@ async def add_or_update_role(
 ):
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
 
     try:
-        result = await repo.add_or_update_role(company_id, payload.role_name, payload.folders)
+        result = await repo.add_or_update_role(company_id, admin_id, payload.role_name, payload.folders)
         return result
     except Exception as e:
         logger.exception("Failed to add or update role")
@@ -267,6 +268,38 @@ async def assign_role_to_user(
         print("Failed to assign role:", e)
         raise HTTPException(status_code=500, detail="Failed to assign role")
     
+@company_admin_router.post("/roles/upload/{role_name}/{folder_name}")
+async def upload_document_for_role(
+    role_name: str,
+    folder_name: str,
+    file: UploadFile = File(...),
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    """
+    Upload a document for a given company role and folder.
+    Stores the file under /app/uploads/documents/roleBased/{company_id}/{admin_id}/{role_name}/{folder_name}/.
+    Also registers it in the DB.
+    """
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    try:
+        result = await repo.upload_document_for_role(
+            company_id=company_id,
+            admin_id=admin_id,
+            role_name=role_name,
+            folder_name=folder_name,
+            file=file
+        )
+        return result
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Target folder not found for this role")
+    except Exception as e:
+        logger.exception("Failed to upload document for role")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @company_admin_router.get("/debug/all-data")
 async def get_all_data(db=Depends(get_db)):
