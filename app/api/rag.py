@@ -123,6 +123,8 @@ async def rag_query(pass_ids: str, question: str, file_names: List[str], company
         },
     }
 
+    logger.info(f"📤 Sending RAG request payload is:  {payload}")
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
             response = await client.post(RAG_QUERY_URL, json=payload)

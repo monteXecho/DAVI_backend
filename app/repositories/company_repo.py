@@ -310,22 +310,38 @@ class CompanyRepository:
         ]
 
     async def delete_role(self, company_id: str, role_name: str, admin_id: str) -> dict:
-        """Delete a role by name and remove it from users' assigned_roles."""
+        """Delete a role by name, remove it from users' assigned_roles, and delete related documents/folders."""
+
         # --- Verify role exists ---
         role = await self.roles.find_one({"company_id": company_id, "name": role_name})
         if not role:
             raise HTTPException(status_code=404, detail="Role not found")
 
-        # --- Remove related folders (as before) ---
-        for folder in role.get("folders", []):
-            base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
-            folder_path = os.path.join(base_path, folder)
-            if os.path.exists(folder_path):
-                try:
-                    os.rmdir(folder_path)
-                except OSError:
-                    # Directory not empty or inaccessible
-                    pass
+        # --- Delete all documents uploaded by admin for this role ---
+        delete_docs_result = await self.documents.delete_many({
+            "company_id": company_id,
+            "user_id": admin_id,
+            "upload_type": role_name
+        })
+
+        # --- Remove related folders ---
+        base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
+        if os.path.exists(base_path):
+            for root, dirs, files in os.walk(base_path, topdown=False):
+                for f in files:
+                    try:
+                        os.remove(os.path.join(root, f))
+                    except Exception:
+                        pass
+                for d in dirs:
+                    try:
+                        os.rmdir(os.path.join(root, d))
+                    except Exception:
+                        pass
+            try:
+                os.rmdir(base_path)
+            except Exception:
+                pass
 
         # --- Remove this role from all users' assigned_roles ---
         update_result = await self.users.update_many(
@@ -340,9 +356,10 @@ class CompanyRepository:
         return {
             "status": "deleted",
             "role_name": role_name,
-            "users_updated": update_result.modified_count
+            "users_updated": update_result.modified_count,
+            "documents_deleted": delete_docs_result.deleted_count
         }
-    
+
     async def assign_role_to_user(self, company_id: str, user_id: str, role_name: str) -> dict:
         """
         Assign a role to a company user (by user_id).
