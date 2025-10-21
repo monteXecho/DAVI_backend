@@ -41,6 +41,7 @@ Thumbs.db
 output/
 documenten-output/
 output/highlighted/
+uploads/
 s
 # Pipenv
 Pipfile.lock

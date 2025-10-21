@@ -340,9 +340,13 @@ async def upload_document_for_role(
         return result
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Target folder not found for this role")
+    except HTTPException:
+        # Allow intentional HTTP errors (like 409 Conflict) to pass through
+        raise
     except Exception as e:
         logger.exception("Failed to upload document for role")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to upload document")
+
 
 
 @company_admin_router.get("/debug/all-data")
