@@ -18,3 +18,12 @@ class CompanyRoleCreate(BaseModel):
 class AssignRolePayload(BaseModel):
     user_id: str
     role_name: str
+
+class DeleteDocumentsPayload(BaseModel):
+    documents: List[dict] 
+
+class DeleteRolesPayload(BaseModel):
+    role_names: List[str]
+
+class ResetPasswordPayload(BaseModel):
+    email: str

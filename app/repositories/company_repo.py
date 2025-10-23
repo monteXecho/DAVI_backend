@@ -1,13 +1,20 @@
+import logging
 import uuid
 import copy
 import os
+import re
+import io
 import aiofiles
+import pandas as pd
 from fastapi import HTTPException, UploadFile
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Optional
 from pymongo.errors import DuplicateKeyError
 from collections import defaultdict
+from typing import List
+
+logger = logging.getLogger(__name__)
 
 BASE_DOC_URL = "https://your-backend.com/documents/download"
 
@@ -215,6 +222,12 @@ class CompanyRepository:
             return None
         return {"email": admin["email"], "role": "company_admin"}
 
+    async def find_user_by_email(self, email: str):
+        user = await self.users.find_one({"email": email})
+        if not user:
+            return None
+        return {"email": user["email"], "role": "company_user"}
+
     async def get_admin_documents(self, company_id: str, admin_id: str):
         """
         Get all documents uploaded by the admin, grouped by role and folder,
@@ -289,6 +302,226 @@ class CompanyRepository:
         # --- Step 5: Return structured response ---
         return dict(result)
 
+    async def delete_documents(
+        self,
+        company_id: str,
+        admin_id: str,
+        documents_to_delete: List[dict]
+    ) -> int:
+        """
+        Delete multiple documents by file name and role.
+        
+        Args:
+            company_id: The company ID
+            admin_id: The admin ID who uploaded the documents
+            documents_to_delete: List of dicts with 'fileName' and 'role' keys
+        
+        Returns:
+            Number of documents successfully deleted
+        """
+        deleted_count = 0
+
+        for doc_info in documents_to_delete:
+            file_name = doc_info.get("fileName")
+            role_name = doc_info.get("role")
+            path = doc_info.get("path")
+
+            if not file_name or not role_name:
+                continue  # Skip invalid entries
+
+            try:
+                # Build query to find the document
+                query = {
+                    "company_id": company_id,
+                    "user_id": admin_id,
+                    "file_name": file_name,
+                    "upload_type": role_name
+                }
+
+                # If path is provided, use it for more precise matching
+                if path:
+                    query["path"] = path
+
+                # Find the document to get its path for file deletion
+                document = await self.documents.find_one(query)
+                if not document:
+                    continue
+
+                file_path = document.get("path")
+
+                # Delete the physical file
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Deleted physical file: {file_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete physical file {file_path}: {str(e)}")
+
+                # Delete the database record
+                delete_result = await self.documents.delete_one({"_id": document["_id"]})
+                if delete_result.deleted_count > 0:
+                    deleted_count += 1
+
+                    # Decrement document count for the role
+                    await self.roles.update_one(
+                        {"company_id": company_id, "name": role_name},
+                        {"$inc": {"document_count": -1}}
+                    )
+
+            except Exception as e:
+                logger.error(f"Error deleting document {file_name} for role {role_name}: {str(e)}")
+                continue
+
+        return deleted_count
+
+    async def add_users_from_email_file(
+        self,
+        company_id: str,
+        admin_id: str,
+        file_content: bytes,
+        file_extension: str
+    ) -> dict:
+        """
+        Add multiple users from CSV/Excel file containing email addresses.
+        Handles emails in column headers, data cells, or anywhere in the file.
+        """
+        try:
+            emails = []
+            
+            print(f"DEBUG: Processing file with extension: {file_extension}")
+            print(f"DEBUG: File size: {len(file_content)} bytes")
+
+            # Read the file
+            try:
+                if file_extension == '.csv':
+                    df = pd.read_csv(io.BytesIO(file_content))
+                else:
+                    df = pd.read_excel(io.BytesIO(file_content))
+                
+                print(f"DEBUG: DataFrame shape: {df.shape}")
+                print(f"DEBUG: DataFrame columns: {df.columns.tolist()}")
+                
+                # Strategy 1: Check if emails are in COLUMN HEADERS (your case!)
+                column_emails = []
+                for col_name in df.columns:
+                    col_str = str(col_name).strip()
+                    if re.match(r'^[a-zA-Z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}$', col_str):
+                        column_emails.append(col_str)
+                
+                if column_emails:
+                    print(f"DEBUG: Found {len(column_emails)} emails in column headers: {column_emails}")
+                    emails.extend(column_emails)
+                
+                # Strategy 2: Check data cells (normal case)
+                all_cell_emails = []
+                for col in df.columns:
+                    # Get non-null values from this column
+                    col_data = df[col].dropna()
+                    if not col_data.empty:
+                        for value in col_data:
+                            value_str = str(value).strip()
+                            if re.match(r'^[a-zA-Z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}$', value_str):
+                                all_cell_emails.append(value_str)
+                
+                if all_cell_emails:
+                    print(f"DEBUG: Found {len(all_cell_emails)} emails in data cells: {all_cell_emails}")
+                    emails.extend(all_cell_emails)
+                
+                # Strategy 3: If no emails found in structured data, try text extraction
+                if not emails:
+                    print("DEBUG: No emails found in structured data, trying text extraction...")
+                    # Convert entire DataFrame to string and extract emails
+                    df_text = df.to_string()
+                    text_emails = self._extract_emails_from_text(df_text)
+                    if text_emails:
+                        print(f"DEBUG: Found {len(text_emails)} emails via text extraction: {text_emails}")
+                        emails.extend(text_emails)
+                
+            except Exception as file_error:
+                print(f"DEBUG: File read failed: {file_error}")
+                # Fallback to raw text parsing
+                text_content = file_content.decode('utf-8', errors='ignore')
+                emails = self._extract_emails_from_text(text_content)
+
+            print(f"DEBUG: Total found emails: {len(emails)} - {emails}")
+
+            if not emails:
+                raise ValueError("No valid email addresses found in the file.")
+
+            # Process the emails
+            results = {
+                "successful": [],
+                "failed": [],
+                "duplicates": []
+            }
+
+            for email in emails:
+                try:
+                    # Check for existing user
+                    existing_user = await self.users.find_one({
+                        "company_id": company_id,
+                        "email": email
+                    })
+
+                    if existing_user:
+                        results["duplicates"].append({
+                            "email": email,
+                            "user_id": existing_user.get("user_id")
+                        })
+                        continue
+
+                    # Use email prefix as name
+                    name = email.split('@')[0]
+
+                    # Create user document
+                    user_doc = {
+                        "user_id": str(uuid.uuid4()),
+                        "company_id": company_id,
+                        "added_by_admin_id": admin_id,
+                        "email": email,
+                        "name": name,
+                        "company_role": "company_user",
+                        "assigned_roles": [],
+                        "created_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    }
+
+                    await self.users.insert_one(user_doc)
+
+                    results["successful"].append({
+                        "email": email,
+                        "name": name,
+                        "user_id": user_doc["user_id"]
+                    })
+
+                except Exception as e:
+                    results["failed"].append({
+                        "email": email,
+                        "error": str(e)
+                    })
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Error processing user upload file: {str(e)}")
+            raise
+
+    def _extract_emails_from_text(self, text_content):
+        """Extract emails from plain text content"""
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        emails = re.findall(email_pattern, text_content)
+        
+        # Remove duplicates
+        seen = set()
+        unique_emails = []
+        for email in emails:
+            if email not in seen:
+                seen.add(email)
+                unique_emails.append(email)
+        
+        return unique_emails
+
+
     # ---------------- Users ---------------- #
     async def add_user(self, company_id: str, name: str, email: str):
         if await self.users.find_one({"company_id": company_id, "email": email}):
@@ -311,19 +544,24 @@ class CompanyRepository:
             "documents": [],
         }
 
-    async def delete_user(self, company_id: str, user_id: str) -> bool:
-        result = await self.users.delete_one({"company_id": company_id, "user_id": user_id})
-        if result.deleted_count > 0:
-            await self.documents.delete_many({"user_id": user_id})
-            return True
-        return False
+    async def delete_users(self, company_id: str, user_ids: list[str]) -> int:
+        result = await self.users.delete_many({
+            "company_id": company_id,
+            "user_id": {"$in": user_ids}
+        })
 
+        if result.deleted_count > 0:
+            await self.documents.delete_many({"user_id": {"$in": user_ids}})
+
+        return result.deleted_count
+    
 
     # ---------------- Company Roles ---------------- #
     async def add_or_update_role(self, company_id: str, admin_id: str, role_name: str, folders: list[str]) -> dict:
         """
         Create or update a company role with given subfolders.
         Ensures folders exist on disk under /app/uploads/documents/roleBased/{company_id}/.
+        Also removes deleted folders and their documents.
         """
         folders = [f.strip("/") for f in folders if f.strip()]
 
@@ -333,14 +571,58 @@ class CompanyRepository:
         })
 
         if existing_role:
-            # Merge without duplicates
+            # Get current folders to identify which ones were removed
             current_folders = set(existing_role.get("folders", []))
-            updated_folders = sorted(current_folders.union(folders))
+            new_folders = set(folders)
+            
+            # Find folders that were removed
+            removed_folders = current_folders - new_folders
+            
+            # Delete documents and folders that were removed
+            for removed_folder in removed_folders:
+                # Delete documents associated with the removed folder
+                folder_path_pattern = os.path.join(
+                    UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name, removed_folder
+                )
+                
+                # Delete database records for documents in the removed folder
+                delete_docs_result = await self.documents.delete_many({
+                    "company_id": company_id,
+                    "user_id": admin_id,
+                    "upload_type": role_name,
+                    "path": {"$regex": f".*{re.escape(removed_folder)}.*"}
+                })
+                
+                # Delete the physical folder and its contents
+                folder_full_path = os.path.join(
+                    UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name, removed_folder
+                )
+                if os.path.exists(folder_full_path):
+                    for root, dirs, files in os.walk(folder_full_path, topdown=False):
+                        for file in files:
+                            try:
+                                os.remove(os.path.join(root, file))
+                            except Exception as e:
+                                logger.warning(f"Failed to delete file {file}: {str(e)}")
+                        for dir in dirs:
+                            try:
+                                os.rmdir(os.path.join(root, dir))
+                            except Exception as e:
+                                logger.warning(f"Failed to delete directory {dir}: {str(e)}")
+                    try:
+                        os.rmdir(folder_full_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete folder {folder_full_path}: {str(e)}")
+                
+                logger.info(f"Removed folder '{removed_folder}' and deleted {delete_docs_result.deleted_count} documents")
+
+            # Update the role with the new folder list (complete replacement)
             await self.roles.update_one(
                 {"_id": existing_role["_id"]},
-                {"$set": {"folders": updated_folders, "updated_at": datetime.utcnow()}}
+                {"$set": {"folders": folders, "updated_at": datetime.utcnow()}}
             )
             status = "role_updated"
+            updated_folders = folders
         else:
             await self.roles.insert_one({
                 "company_id": company_id,
@@ -355,7 +637,7 @@ class CompanyRepository:
             updated_folders = folders
             status = "role_created"
 
-        # Ensure folders exist on disk
+        # Ensure new folders exist on disk
         base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
         for folder in updated_folders:
             full_path = os.path.join(base_path, folder)
@@ -367,7 +649,7 @@ class CompanyRepository:
             "role_name": role_name,
             "folders": updated_folders,
         }
-    
+
     async def list_roles(self, company_id: str, admin_id: str) -> list[dict]:
         """List all roles for a given company."""
         cursor = self.roles.find({"company_id": company_id, "added_by_admin_id": admin_id})
@@ -382,55 +664,69 @@ class CompanyRepository:
             for r in roles
         ]
 
-    async def delete_role(self, company_id: str, role_name: str, admin_id: str) -> dict:
-        """Delete a role by name, remove it from users' assigned_roles, and delete related documents/folders."""
+    async def delete_roles(self, company_id: str, role_names: List[str], admin_id: str) -> dict:
+        """Delete one or multiple roles by name, remove them from users' assigned_roles, and delete related documents/folders."""
 
-        # --- Verify role exists ---
-        role = await self.roles.find_one({"company_id": company_id, "name": role_name})
-        if not role:
-            raise HTTPException(status_code=404, detail="Role not found")
+        deleted_roles = []
+        total_users_updated = 0
+        total_documents_deleted = 0
 
-        # --- Delete all documents uploaded by admin for this role ---
-        delete_docs_result = await self.documents.delete_many({
-            "company_id": company_id,
-            "user_id": admin_id,
-            "upload_type": role_name
-        })
+        for role_name in role_names:
+            # --- Verify role exists ---
+            role = await self.roles.find_one({"company_id": company_id, "name": role_name})
+            if not role:
+                # Skip if role doesn't exist, but continue with others
+                continue
 
-        # --- Remove related folders ---
-        base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
-        if os.path.exists(base_path):
-            for root, dirs, files in os.walk(base_path, topdown=False):
-                for f in files:
-                    try:
-                        os.remove(os.path.join(root, f))
-                    except Exception:
-                        pass
-                for d in dirs:
-                    try:
-                        os.rmdir(os.path.join(root, d))
-                    except Exception:
-                        pass
-            try:
-                os.rmdir(base_path)
-            except Exception:
-                pass
+            # --- Delete all documents uploaded by admin for this role ---
+            delete_docs_result = await self.documents.delete_many({
+                "company_id": company_id,
+                "user_id": admin_id,
+                "upload_type": role_name
+            })
 
-        # --- Remove this role from all users' assigned_roles ---
-        update_result = await self.users.update_many(
-            {"company_id": company_id, "assigned_roles": role_name},
-            {"$pull": {"assigned_roles": role_name}}
-        )
+            # --- Remove related folders ---
+            base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
+            if os.path.exists(base_path):
+                for root, dirs, files in os.walk(base_path, topdown=False):
+                    for f in files:
+                        try:
+                            os.remove(os.path.join(root, f))
+                        except Exception:
+                            pass
+                    for d in dirs:
+                        try:
+                            os.rmdir(os.path.join(root, d))
+                        except Exception:
+                            pass
+                try:
+                    os.rmdir(base_path)
+                except Exception:
+                    pass
 
-        # --- Delete the role itself ---
-        await self.roles.delete_one({"_id": role["_id"]})
+            # --- Remove this role from all users' assigned_roles ---
+            update_result = await self.users.update_many(
+                {"company_id": company_id, "assigned_roles": role_name},
+                {"$pull": {"assigned_roles": role_name}}
+            )
+
+            # --- Delete the role itself ---
+            await self.roles.delete_one({"_id": role["_id"]})
+
+            # --- Track results for this role ---
+            deleted_roles.append(role_name)
+            total_users_updated += update_result.modified_count
+            total_documents_deleted += delete_docs_result.deleted_count
+
+        if not deleted_roles:
+            raise HTTPException(status_code=404, detail="No valid roles found to delete")
 
         # --- Return cleanup result ---
         return {
             "status": "deleted",
-            "role_name": role_name,
-            "users_updated": update_result.modified_count,
-            "documents_deleted": delete_docs_result.deleted_count
+            "deleted_roles": deleted_roles,
+            "total_users_updated": total_users_updated,
+            "total_documents_deleted": total_documents_deleted
         }
 
     async def assign_role_to_user(self, company_id: str, user_id: str, role_name: str) -> dict:

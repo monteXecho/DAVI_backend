@@ -1,13 +1,15 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
-from app.deps.auth import require_role
+import pandas as pd
+import os, json
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query
+from app.deps.auth import require_role, get_keycloak_admin
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
-from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload
+from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload, DeleteDocumentsPayload, DeleteRolesPayload, ResetPasswordPayload
 from app.api.rag import rag_index_files
 
-logger = logging.getLogger(__name__)
-
+logger = logging.getLogger("uvicorn")
+KEYCLOAK_HOST = os.getenv("KEYCLOAK_HOST", "host.docker.internal")
 
 company_admin_router = APIRouter(prefix="/company-admin", tags=["Company Admin"])
 
@@ -44,9 +46,7 @@ async def get_admin_company_id(
     }
 
 
-# -------------------------------------------------------------
 # GET all users belonging to the same company
-# -------------------------------------------------------------
 @company_admin_router.get("/users")
 async def get_all_users(
     admin_context=Depends(get_admin_company_id),
@@ -55,8 +55,9 @@ async def get_all_users(
     repo = CompanyRepository(db)
 
     company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
 
-    users_cursor = db.company_users.find({"company_id": company_id})
+    users_cursor = db.company_users.find({"company_id": company_id, "added_by_admin_id": admin_id})
 
     users = []
     async for usr in users_cursor:
@@ -72,9 +73,7 @@ async def get_all_users(
 
     return {"company_id": company_id, "members": combined}
 
-# -------------------------------------------------------------
 # Get all documents uploaded by the admin (grouped by role/folder)
-# -------------------------------------------------------------
 @company_admin_router.get("/documents", summary="Get all uploaded documents by admin")
 async def get_admin_uploaded_documents(
     admin_context=Depends(get_admin_company_id),
@@ -103,9 +102,7 @@ async def get_admin_uploaded_documents(
         "data": result
     }
 
-# -------------------------------------------------------------
 # ADD new user (with email + company_role)
-# -------------------------------------------------------------
 @company_admin_router.post("/users")
 async def add_user(
     payload: CompanyUserCreate,
@@ -136,9 +133,129 @@ async def add_user(
         logger.exception("Failed to add company user/admin")
         raise HTTPException(status_code=500, detail=str(e))
 
-# -------------------------------------------------------------
+@company_admin_router.post("/users/upload")
+async def upload_users_from_file(
+    file: UploadFile = File(...),
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    """
+    Upload a CSV or Excel file containing email addresses to add as company users.
+    File can have:
+    - Just email addresses (no headers)
+    - Email addresses with 'email' column header
+    - Email addresses in first column (with or without header)
+    Names will be automatically generated from email prefixes.
+    """
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    # Validate file type
+    allowed_extensions = {'.csv', '.xlsx', '.xls'}
+    file_extension = os.path.splitext(file.filename.lower())[1]
+    
+    if file_extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid file type. Only CSV and Excel files are allowed."
+        )
+
+    try:
+        # Read file content
+        content = await file.read()
+        
+        # Process file using repository
+        results = await repo.add_users_from_email_file(
+            company_id=company_id,
+            admin_id=admin_id,
+            file_content=content,
+            file_extension=file_extension
+        )
+
+        return {
+            "success": True,
+            "summary": {
+                "total_processed": len(results["successful"]) + len(results["failed"]) + len(results["duplicates"]),
+                "successful": len(results["successful"]),
+                "duplicates": len(results["duplicates"]),
+                "failed": len(results["failed"])
+            },
+            "details": results
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except pd.errors.EmptyDataError:
+        raise HTTPException(status_code=400, detail="The file is empty.")
+    except pd.errors.ParserError:
+        raise HTTPException(status_code=400, detail="Error parsing the file. Please check the file format.")
+    except Exception as e:
+        logger.exception("Failed to process user upload file")
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
+
+@company_admin_router.post("/users/reset-password")
+async def reset_user_password(
+    payload: ResetPasswordPayload,
+    admin_context = Depends(get_admin_company_id)
+):
+    kc = get_keycloak_admin()
+    email = payload.email
+    logger.info(f"Password reset requested for {email}")
+
+    try:
+        # Find user in Keycloak
+        users = kc.get_users(query={"email": email})
+        if not users:
+            raise HTTPException(status_code=404, detail="User not found in Keycloak")
+
+        user = users[0]
+        keycloak_id = user["id"]
+        username = user.get("username", email)
+
+        logger.info(f"Found user: {username} with Keycloak ID: {keycloak_id}")
+
+        # Correct API endpoint for password reset
+        reset_url = f"{kc.connection.server_url}/admin/realms/{kc.connection.realm_name}/users/{keycloak_id}/execute-actions-email"
+        
+        # Headers with proper authentication
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {kc.connection.token.get('access_token')}"
+        }
+        
+        # Send the request
+        response = kc.connection.raw_put(
+            reset_url,
+            data=json.dumps(["UPDATE_PASSWORD"]),
+            headers=headers
+        )
+        
+        if response.status_code == 204:
+            logger.info(f"Password reset email sent successfully to {email}")
+            return {
+                "success": True, 
+                "message": f"Password reset email sent to {email}",
+                "user_id": keycloak_id
+            }
+        else:
+            logger.error(f"Keycloak API error: {response.status_code} - {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Keycloak API error: {response.text}"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Password reset error for {email}: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to send password reset email: {str(e)}"
+        )
+
+
 # UPDATE user (when the user registers and sets their name)
-# -------------------------------------------------------------
 @company_admin_router.put("/users/{user_id}")
 async def update_user(
     user_id: str,
@@ -155,36 +272,32 @@ async def update_user(
 
     return {"status": "user_updated", "user_id": user_id, "new_name": payload.name, "assigned_roles": payload.assigned_roles,}
 
-# -------------------------------------------------------------
 # DELETE user
-# -------------------------------------------------------------
-@company_admin_router.delete("/users/{user_id}")
+@company_admin_router.delete("/users")
 async def delete_user(
-    user_id: str,
+    user_ids: str = Query(..., description="Comma-separated list of user IDs"),
     admin_context=Depends(get_admin_company_id),
     db=Depends(get_db)
 ):
+    user_ids_list = user_ids.split(',')
 
     repo = CompanyRepository(db)
 
     company_id = admin_context["company_id"]
 
-    user_deleted = await repo.delete_user(company_id, user_id)
-    admin_deleted = await repo.delete_admin(company_id, user_id)
+    deleted_count = await repo.delete_users(company_id, user_ids_list)
 
-    if not (user_deleted or admin_deleted):
-        raise HTTPException(status_code=404, detail="User not found or already deleted")
+    if deleted_count == 0:
+        raise HTTPException(status_code=404, detail="No users deleted")
 
     return {
-        "status": "user_deleted",
-        "user_id": user_id,
-        "deleted_from": "company_users" if user_deleted else "company_admins"
+        "success": True,
+        "deleted_count": deleted_count,
+        "deleted_user_ids": user_ids_list
     }
 
 
-# -------------------------------------------------------------
 # GET Company stats
-# -------------------------------------------------------------
 @company_admin_router.get("/stats")
 async def get_company_stats(
     admin_context=Depends(get_admin_company_id),
@@ -227,9 +340,48 @@ async def get_company_stats(
     }
 
 
-# -------------------------------------------------------------
+# DELETE documents
+@company_admin_router.post("/documents/delete")
+async def delete_documents(
+    payload: DeleteDocumentsPayload,
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    """
+    Delete multiple documents by file name and role.
+    Each document in the payload should have:
+    - fileName: The name of the file
+    - role: The role that the file belongs to
+    - path: Optional file path (if available)
+    """
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    try:
+        deleted_count = await repo.delete_documents(
+            company_id=company_id,
+            admin_id=admin_id,
+            documents_to_delete=payload.documents
+        )
+
+        if deleted_count == 0:
+            raise HTTPException(status_code=404, detail="No documents found to delete")
+
+        return {
+            "success": True,
+            "deleted_count": deleted_count,
+            "deleted_documents": payload.documents
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to delete documents")
+        raise HTTPException(status_code=500, detail=f"Failed to delete documents: {str(e)}")
+    
+
 # ADD or UPDAT a company role and document folders for the role
-# -------------------------------------------------------------
 @company_admin_router.post("/roles")
 async def add_or_update_role(
     payload: CompanyRoleCreate,
@@ -264,25 +416,25 @@ async def list_roles(
         raise HTTPException(status_code=500, detail="Failed to list roles")
 
 
-@company_admin_router.delete("/roles/{role_name}")
-async def delete_role(
-    role_name: str,
+@company_admin_router.post("/roles/delete")
+async def delete_roles(
+    payload: DeleteRolesPayload,
     admin_context=Depends(get_admin_company_id),
     db=Depends(get_db)
 ):
-    """Delete a role and optionally its folders."""
+    """Delete one or multiple roles and their associated data."""
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
     try:
-        result = await repo.delete_role(company_id, role_name, admin_id)
+        result = await repo.delete_roles(company_id, payload.role_names, admin_id)
         return result
     except HTTPException:
         raise
     except Exception as e:
-        print("Failed to delete role:", e)
-        raise HTTPException(status_code=500, detail="Failed to delete role")
-    
+        print("Failed to delete roles:", e)
+        raise HTTPException(status_code=500, detail="Failed to delete roles")
+
 @company_admin_router.post("/roles/assign")
 async def assign_role_to_user(
     payload: AssignRolePayload,

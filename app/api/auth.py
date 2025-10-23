@@ -18,10 +18,14 @@ async def register_user(
 
         # 1. Check if user email exists in Mongo (invited by Super Admin)
         existing_admin = await repo.find_admin_by_email(payload.email)
-        if not existing_admin:
+        existing_user = await repo.find_user_by_email(payload.email)
+
+        invited_user = existing_admin or existing_user  # ✅ THIS enables both
+
+        if not invited_user:
             raise HTTPException(
                 status_code=400,
-                detail="Email not found. Please ask your Super Admin to invite you first."
+                detail="Email not found. Please ask your Admin to invite you first."
             )
 
         # 2. Check if already in Keycloak
@@ -49,7 +53,7 @@ async def register_user(
         })
 
         # 5. Assign role from Mongo
-        role_name = existing_admin["role"]
+        role_name = invited_user["role"]
         if not role_name:
             raise HTTPException(status_code=400, detail="Role missing in Mongo for this user")
 
