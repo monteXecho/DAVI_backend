@@ -280,12 +280,35 @@ async def delete_user(
     db=Depends(get_db)
 ):
     user_ids_list = user_ids.split(',')
-
     repo = CompanyRepository(db)
-
     company_id = admin_context["company_id"]
+    kc = get_keycloak_admin()
 
-    deleted_count = await repo.delete_users(company_id, user_ids_list)
+    deleted_count = 0
+    for user_id in user_ids_list:
+        # 1) Get user from MongoDB to retrieve email
+        user = await db.company_users.find_one({
+            "company_id": company_id,
+            "user_id": user_id
+        })
+
+        logger.info(f"USER EMAIL TO DELETE: {user}")
+
+        if user and user.get("email"):
+            email = user["email"]
+            try:
+                # 2) Find user in Keycloak (by email)
+                kc_users = kc.get_users(query={"email": email})
+                if kc_users:
+                    keycloak_user_id = kc_users[0]["id"]
+                    kc.delete_user(keycloak_user_id)
+                    logger.info(f"Deleted Keycloak user: {email}")
+            except Exception as e:
+                logger.error(f"Failed Keycloak deletion for {email}: {str(e)}")
+
+        # 3) Delete user from MongoDB
+        result = await repo.delete_users(company_id, [user_id])
+        deleted_count += result
 
     if deleted_count == 0:
         raise HTTPException(status_code=404, detail="No users deleted")
