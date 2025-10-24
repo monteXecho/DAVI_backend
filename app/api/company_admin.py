@@ -270,7 +270,7 @@ async def update_user(
     if not updated:
         raise HTTPException(status_code=404, detail="User not found or not in your company")
 
-    return {"status": "user_updated", "user_id": user_id, "new_name": payload.name, "assigned_roles": payload.assigned_roles,}
+    return {"success": True, "user_id": user_id, "new_name": payload.name, "assigned_roles": payload.assigned_roles,}
 
 # DELETE user
 @company_admin_router.delete("/users")
@@ -438,7 +438,6 @@ async def list_roles(
         print("Failed to list roles:", e)
         raise HTTPException(status_code=500, detail="Failed to list roles")
 
-
 @company_admin_router.post("/roles/delete")
 async def delete_roles(
     payload: DeleteRolesPayload,
@@ -521,7 +520,6 @@ async def upload_document_for_role(
     except Exception as e:
         logger.exception("Failed to upload document for role")
         raise HTTPException(status_code=500, detail="Failed to upload document")
-
 
 
 @company_admin_router.get("/debug/all-data")

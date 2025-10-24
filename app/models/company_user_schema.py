@@ -1,15 +1,16 @@
 from pydantic import BaseModel, EmailStr, Field
 from typing import List
-
+from typing import Optional
 
 class CompanyUserCreate(BaseModel):
     email: EmailStr
     company_role: str  # e.g. "teacher", "manager", etc.
 
 class CompanyUserUpdate(BaseModel):
-    name: str
-    email: EmailStr
-    assigned_roles: List[str] = Field()
+    id: Optional[str] = None  # a1, a2…
+    name: Optional[str] = ""   # optional, can be empty
+    email: EmailStr            # must exist + must be valid email
+    assigned_roles: List[str] = Field(default_factory=list)
 
 class CompanyRoleCreate(BaseModel):
     role_name: str = Field(..., example="role_a")
