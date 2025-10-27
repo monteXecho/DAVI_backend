@@ -124,7 +124,7 @@ async def add_user(
             return {"status": "admin_created", "user": new_admin}
         else:
             # Default: add as regular company user
-            new_user = await repo.add_user_by_admin(company_id, admin_id, payload.email, payload.company_role)
+            new_user = await repo.add_user_by_admin(company_id, admin_id, payload.email, payload.company_role, payload.assigned_role)
             return {"status": "user_created", "user": new_user}
 
     except ValueError as e:

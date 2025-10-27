@@ -5,6 +5,7 @@ from typing import Optional
 class CompanyUserCreate(BaseModel):
     email: EmailStr
     company_role: str  # e.g. "teacher", "manager", etc.
+    assigned_role: str
 
 class CompanyUserUpdate(BaseModel):
     id: Optional[str] = None  # a1, a2…

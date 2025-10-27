@@ -927,7 +927,7 @@ class CompanyRepository:
             "pass_ids": pass_ids,
         }
 
-    async def add_user_by_admin(self, company_id: str, added_by_admin_id: str, email: str, company_role: str):
+    async def add_user_by_admin(self, company_id: str, added_by_admin_id: str, email: str, company_role: str, assigned_role: str):
         """Company admin creates a user under their company."""
         # Prevent duplicates
         if await self.users.find_one({"company_id": company_id, "email": email}):
@@ -937,8 +937,9 @@ class CompanyRepository:
             "user_id": str(uuid.uuid4()),
             "company_id": company_id,
             "added_by_admin_id": added_by_admin_id,  # tracking who added
-            "email": email,
+            "email": email, 
             "company_role": company_role,
+            "assigned_roles": [assigned_role],
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
             "name": None,  # filled later by user
@@ -951,6 +952,7 @@ class CompanyRepository:
             "email": email,
             "company_role": company_role,
             "added_by_admin_id": added_by_admin_id,
+            "assigned_roles": user_doc["assigned_roles"],
             "name": None,
             "documents": [],
         }
