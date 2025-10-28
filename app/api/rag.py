@@ -23,10 +23,12 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
     data = {
         "index_id": company_id,
         "file_ids": [f"{user_id}--{os.path.basename(fp)}" for fp in file_paths],
+        "original_file_paths": file_paths, 
     }
 
     try:
         for file_path in file_paths:
+            logger.info(f"   _____ File paths _____: {file_paths}")
             file_name = os.path.basename(file_path)
             files.append(("files", (file_name, open(file_path, "rb"), "application/octet-stream")))
 
@@ -61,13 +63,16 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str):
     data = {
         "index_id": company_id,
         "file_ids": [f"{user_id}--{os.path.basename(fp)}" for fp in file_paths],
+        "original_file_paths": file_paths, 
     }
 
     try:
         for file_path in file_paths:
+            logger.info(f"   _____ File path _____: {file_path}")
             file_name = os.path.basename(file_path)
             files.append(("files", (file_name, open(file_path, "rb"), "application/octet-stream")))
 
+        logger.info(f"   _____ File path _____: {file_paths}")
         logger.info(f"📤 (SYNC) Sending RAG index request to {RAG_INDEX_URL}")
         logger.info(f"   Files: {[f[1][0] for f in files]}")
         logger.info(f"   Data: {data}")

@@ -101,21 +101,8 @@ def fuzzy_match(seg, block, threshold=70):
             return True
     return False
 
-
-def find_and_highlight(pdf_filename, snippet_text, target_page, output_path):
-    # Determine input source: use highlighted version if available
-    highlighted_path = os.path.join("output", "highlighted", pdf_filename)
-    fallback_path = os.path.join("documenten-import", pdf_filename)
-
-    if os.path.exists(highlighted_path):
-        pdf_path = highlighted_path
-        print(f"📂 Using existing highlighted file: {highlighted_path}")
-    elif os.path.exists(fallback_path):
-        pdf_path = fallback_path
-        print(f"📂 Using original input file: {fallback_path}")
-    else:
-        raise FileNotFoundError(f"❌ Neither highlighted nor original file found for: {pdf_filename}")
-
+def find_and_highlight(pdf_path, snippet_text, target_page, output_path):
+    print(f"📂 Processing file: {pdf_path}")
     doc = fitz.open(pdf_path)
     total_pages = len(doc)
     segments = split_snippet(snippet_text)
@@ -126,79 +113,45 @@ def find_and_highlight(pdf_filename, snippet_text, target_page, output_path):
     best_score = 0
 
     for i in range(target_page - 1, target_page + 2):
-        if i < 0 or i >= total_pages:
-            continue
-        page = doc[i]
-        page_text = page.get_text()
-        text_block = find_best_window_match(page_text, full_snippet)
-        if text_block:
-            score = fuzz.ratio(full_snippet, text_block)
-            if score > best_score:
-                best_score = score
-                best_page_index = i
-                best_text_block = text_block
-            if best_score >= 95:
-                break
+        if 0 <= i < total_pages:
+            page = doc[i]
+            page_text = page.get_text()
+            text_block = find_best_window_match(page_text, full_snippet)
+            if text_block:
+                score = fuzz.ratio(full_snippet, text_block)
+                if score > best_score:
+                    best_score = score
+                    best_page_index = i
+                    best_text_block = text_block
+                if best_score >= 95:
+                    break
 
     if best_page_index == -1 or not best_text_block:
-        print("❌ No matching block found.")
-        doc.close()
-        return
-
-    matched = []
-    for i, seg in enumerate(segments):
-        if fuzzy_match(seg, best_text_block):
-            matched.append(i)
-
-    if not matched:
-        print("❌ No segments matched inside best text block.")
-        doc.close()
-        return
-
-    first_idx = matched[0]
-    last_idx = matched[-1]
-
-    highlight_start = first_idx
-    while highlight_start > 0 and fuzzy_match(segments[highlight_start - 1], best_text_block):
-        highlight_start -= 1
-
-    highlight_end = last_idx
-    while highlight_end + 1 < len(segments) and fuzzy_match(segments[highlight_end + 1], best_text_block):
-        highlight_end += 1
-
-    highlight_start = max(0, highlight_start - 1)
-    highlight_end = min(len(segments) - 1, highlight_end + 1)
-
-    highlight_text_to_search = " ".join(segments[highlight_start:highlight_end + 1])
-
-    best_page = doc[best_page_index]
-    if not highlight_text(best_page, highlight_text_to_search):
-        print("⚠️ Exact match not found. Falling back to fuzzy window match.")
-        fallback = find_best_window_match(best_page.get_text(), highlight_text_to_search)
-        if fallback:
-            highlight_text(best_page, fallback)
-            print("✅ Fuzzy fallback matched and highlighted.")
-        else:
-            print("❌ Highlight failed.")
+        print("⚠️ No matching text found — exporting original PDF.")
     else:
-        print("✅ Highlight successful.")
+        matched = [i for i, seg in enumerate(segments) if fuzzy_match(seg, best_text_block)]
+        if matched:
+            highlight_start = max(0, matched[0] - 1)
+            highlight_end = min(len(segments) - 1, matched[-1] + 1)
+            highlight_text_to_search = " ".join(segments[highlight_start:highlight_end + 1])
+
+            best_page = doc[best_page_index]
+            if not highlight_text(best_page, highlight_text_to_search):
+                print("⚠️ Exact match not found. Falling back to fuzzy window match.")
+                fallback = find_best_window_match(best_page.get_text(), highlight_text_to_search)
+                if fallback:
+                    highlight_text(best_page, fallback)
+                    print("✅ Fuzzy fallback matched and highlighted.")
+                else:
+                    print("⚠️ Highlight failed — exporting original.")
+        else:
+            print("⚠️ No fuzzy match — exporting original.")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # Handle save overwrite case
-    if os.path.abspath(output_path) == os.path.abspath(pdf_path):
-        # Avoid saving over the opened input: write to temp and replace
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            temp_path = tmp.name
-        doc.save(temp_path, incremental=False, garbage=1, deflate=False)
-        doc.close()
-        shutil.move(temp_path, output_path)
-    else:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        doc.save(output_path, incremental=False, garbage=1, deflate=False)
-        doc.close()
-
+    doc.save(output_path, incremental=False, garbage=1, deflate=False)
+    doc.close()
+    print(f"✅ File exported: {output_path}")
 
 
 # --- Usage ---

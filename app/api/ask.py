@@ -38,29 +38,26 @@ def prepare_highlighted_dir(output_dir: str):
 
 
 def highlight_documents(documents, output_dir: str):
-    """
-    Highlight matched snippets in user documents.
-    File naming convention: {user_id}--{file_name}.pdf
-    """
     base_upload_dir = "/var/opt/DAVI_backend/uploads/documents"
 
     for doc in documents:
         snippet = doc["content"]
         meta = doc["meta"]
-        file_id = meta.get("file_id") 
+        file_id = meta.get("file_id")
+        actual_file_name = meta.get("file_path")
 
         if not file_id:
             logger.warning("⚠️ Missing file_id in document meta.")
             continue
 
-        # Extract user_id and file_name
-        if "--" in file_id:
-            user_id, actual_file_name = file_id.split("--", 1)
+        original_path = meta.get("original_file_path", "")
+        if original_path.startswith('/app/uploads/documents/'):
+            relative_path = original_path[len('/app/uploads/documents/'):]
         else:
-            logger.warning(f"⚠️ Unexpected file_id format: {meta}")
-            continue
+            relative_path = original_path
 
-        abs_input_path = os.path.join(base_upload_dir, user_id, actual_file_name)
+        abs_input_path = os.path.join(base_upload_dir, relative_path)
+        logger.info(f"✅✅✅ ----- abs_input_path -----: {abs_input_path}")
         output_path = os.path.join(output_dir, actual_file_name)
 
         if not os.path.exists(abs_input_path):
@@ -69,11 +66,9 @@ def highlight_documents(documents, output_dir: str):
 
         try:
             find_and_highlight(abs_input_path, snippet, meta.get("page_number", 1), output_path)
-            meta["highlighted_path"] = output_path  # add for frontend
-            logger.info(f"✅ Highlighted file created: {output_path}")
+            meta["highlighted_path"] = output_path
         except Exception as e:
-            logger.error(f"❌ Failed to highlight {abs_input_path}: {e}")
-
+            logger.error(f"❌ Failed to process {abs_input_path}: {e}")
 
 # --------------------------------------------------------------------------
 # Endpoint
@@ -148,6 +143,7 @@ async def ask_question(
                 "meta": {
                     "file_id": file_id,
                     "file_path": file_path,  # for backward compatibility
+                    "original_file_path": meta.get("original_file_path", ""),
                     "page_number": meta.get("page_number", 1),
                     "file_name": meta.get("file_name", os.path.basename(file_id)),
                     "score": meta.get("score", None),
