@@ -240,8 +240,9 @@ class CompanyRepository:
         })
         docs = await docs_cursor.to_list(None)
 
+        # Return empty dict if no documents found instead of raising exception
         if not docs:
-            raise HTTPException(status_code=404, detail="No documents found for this admin.")
+            return {}
 
         result = defaultdict(lambda: {"folders": []})
 
@@ -282,22 +283,23 @@ class CompanyRepository:
 
         # --- Step 3: Find all users who belong to any of these roles ---
         role_names = list(result.keys())
-        users_cursor = self.users.find({
-            "company_id": company_id,
-            "assigned_roles": {"$in": role_names}
-        })
-        users = await users_cursor.to_list(None)
+        if role_names:  # Only query users if we have roles with documents
+            users_cursor = self.users.find({
+                "company_id": company_id,
+                "assigned_roles": {"$in": role_names}
+            })
+            users = await users_cursor.to_list(None)
 
-        # --- Step 4: Map users to roles ---
-        for user in users:
-            user_id = user.get("user_id")
-            user_name = user.get("name")
-            user_email = user.get('email')
-            for role in user.get("assigned_roles", []):
-                if role in result:
-                    for folder in result[role]["folders"]:
-                        for doc_entry in folder["documents"]:
-                            doc_entry["assigned_to"].append({"name": user_name, "email": user_email})
+            # --- Step 4: Map users to roles ---
+            for user in users:
+                user_id = user.get("user_id")
+                user_name = user.get("name")
+                user_email = user.get('email')
+                for role in user.get("assigned_roles", []):
+                    if role in result:
+                        for folder in result[role]["folders"]:
+                            for doc_entry in folder["documents"]:
+                                doc_entry["assigned_to"].append({"name": user_name, "email": user_email})
 
         # --- Step 5: Return structured response ---
         return dict(result)
