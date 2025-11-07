@@ -25,7 +25,7 @@ async def register_user(
         if not invited_user:
             raise HTTPException(
                 status_code=400,
-                detail="Email not found. Please ask your Admin to invite you first."
+                detail="Email not found."
             )
 
         # 2. Check if already in Keycloak
@@ -38,9 +38,11 @@ async def register_user(
         first_name = parts[0]
         last_name = parts[1] if len(parts) > 1 else ""
 
+        email_prefix = payload.email.split("@")[0]
+
         # 4. Create user in Keycloak
         user_id = keycloak_admin.create_user({
-            "username": payload.username,
+            "username": email_prefix,
             "email": payload.email,
             "firstName": first_name,
             "lastName": last_name,

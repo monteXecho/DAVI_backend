@@ -1,8 +1,8 @@
 import logging
 import pandas as pd
 import os, json
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query
-from app.deps.auth import require_role, get_keycloak_admin
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, status
+from app.deps.auth import require_role, get_keycloak_admin, get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload, DeleteDocumentsPayload, DeleteRolesPayload, ResetPasswordPayload
@@ -45,6 +45,62 @@ async def get_admin_company_id(
         "admin_email": admin_email
     }
 
+@company_admin_router.get("/user")
+async def get_login_user(
+    user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    """
+    Return the currently logged-in user's information.
+    Works for both company_admin and company_user roles.
+    """
+    repo = CompanyRepository(db)
+
+    email = user.get("email")
+    roles = user.get("realm_access", {}).get("roles", [])
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Missing email in authentication token")
+
+    # --- Company Admin ---
+    if "company_admin" in roles:
+        admin_record = await db.company_admins.find_one({"email": email})
+        if not admin_record:
+            raise HTTPException(status_code=404, detail="Admin not found in backend database")
+
+        return {
+            "type": "company_admin",
+            "email": admin_record.get("email"),
+            "name": admin_record.get("name"),
+            "company_id": admin_record.get("company_id"),
+            "user_id": admin_record.get("user_id"),
+            "modules": admin_record.get("modules", [])
+        }
+
+    # --- Company User ---
+    elif "company_user" in roles:
+        user_record = await db.company_users.find_one({"email": email})
+        if not user_record:
+            raise HTTPException(status_code=404, detail="User not found in backend database")
+
+        return {
+            "type": "company_admin",
+            "email": user_record.get("email"),
+            "name": user_record.get("name"),
+            "company_id": user_record.get("company_id"),
+            "user_id": user_record.get("user_id"),
+            "roles": user_record.get("assigned_roles", []),
+            "modules": user_record.get("modules", [])
+        }
+
+    # --- Unknown role ---
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not have a valid company role"
+        )
+
+    
 
 # GET all users belonging to the same company
 @company_admin_router.get("/users")

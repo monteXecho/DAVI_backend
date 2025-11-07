@@ -26,9 +26,7 @@ os.makedirs(UPLOAD_ROOT, exist_ok=True)
 
 DEFAULT_MODULES = {
     "Documenten chat": {"desc": "AI-zoek & Q&A over geuploade documenten.", "enabled": False},
-    "VGC module": {"desc": "Vaste gezichten criterium controles & rapportage.", "enabled": False},
-    "3-uurs regeling": {"desc": "Toetsing + logica voor afwijkvensters.", "enabled": False},
-    "BKR": {"desc": "Beroepskracht-kindratio berekenen & bewaken.", "enabled": False},
+    "GGD Checks": {"desc": "Automatische GGD-controles, inclusief BKR-bewaking, afwijkingslogica en rapportage.", "enabled": False}
 }
 
 

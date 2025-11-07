@@ -11,7 +11,7 @@ class ModuleConfig(BaseModel):
 class RegisterRequest(BaseModel):
     fullName: str
     email: EmailStr
-    username: str
+    # username: str
     password: str
     
 
