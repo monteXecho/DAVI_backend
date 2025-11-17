@@ -36,6 +36,9 @@ class CompanyAddAdmin(BaseModel):
     email: EmailStr
     modules: List[ModuleConfig]
 
+class CompanyReAssignAdmin(BaseModel):
+    name: str
+    email: EmailStr
 
 class CompanyAdminModules(BaseModel):
     modules: List[ModuleConfig]

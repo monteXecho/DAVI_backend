@@ -1,11 +1,11 @@
 import logging
 import pandas as pd
 import os, json
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, status
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, status, Form, Body
 from app.deps.auth import require_role, get_keycloak_admin, get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
-from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload, DeleteDocumentsPayload, DeleteRolesPayload, ResetPasswordPayload
+from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload, DeleteDocumentsPayload, DeleteRolesPayload, ResetPasswordPayload, CompanyRoleModifyUsers
 from app.api.rag import rag_index_files
 
 logger = logging.getLogger("uvicorn")
@@ -54,53 +54,99 @@ async def get_login_user(
     Return the currently logged-in user's information.
     Works for both company_admin and company_user roles.
     """
-    repo = CompanyRepository(db)
-
     email = user.get("email")
     roles = user.get("realm_access", {}).get("roles", [])
 
     if not email:
         raise HTTPException(status_code=400, detail="Missing email in authentication token")
 
-    # --- Company Admin ---
+    # ---------- COMPANY ADMIN ----------
     if "company_admin" in roles:
         admin_record = await db.company_admins.find_one({"email": email})
         if not admin_record:
-            raise HTTPException(status_code=404, detail="Admin not found in backend database")
+            raise HTTPException(status_code=404, detail="Admin not found in backend")
 
         return {
             "type": "company_admin",
-            "email": admin_record.get("email"),
+            "email": admin_record["email"],
             "name": admin_record.get("name"),
             "company_id": admin_record.get("company_id"),
             "user_id": admin_record.get("user_id"),
-            "modules": admin_record.get("modules", [])
+            "modules": admin_record.get("modules", {})
         }
 
-    # --- Company User ---
+    # ---------- COMPANY USER ----------
     elif "company_user" in roles:
         user_record = await db.company_users.find_one({"email": email})
         if not user_record:
-            raise HTTPException(status_code=404, detail="User not found in backend database")
+            raise HTTPException(status_code=404, detail="User not found")
 
-        return {
-            "type": "company_admin",
-            "email": user_record.get("email"),
-            "name": user_record.get("name"),
-            "company_id": user_record.get("company_id"),
-            "user_id": user_record.get("user_id"),
-            "roles": user_record.get("assigned_roles", []),
-            "modules": user_record.get("modules", [])
+        company_id = user_record["company_id"]
+        assigned_roles = user_record.get("assigned_roles", [])
+
+        # Default modules are disabled
+        final_modules = {
+            "Documenten chat": {"enabled": False},
+            "GGD Checks": {"enabled": False}
         }
 
-    # --- Unknown role ---
+        # If user has no assigned roles → return defaults
+        if not assigned_roles:
+            return {
+                "type": "company_user",
+                "email": user_record["email"],
+                "name": user_record.get("name"),
+                "company_id": company_id,
+                "user_id": user_record.get("user_id"),
+                "roles": assigned_roles,
+                "modules": final_modules
+            }
+
+        # Always use the correct collection: company_roles
+        roles_collection = db.company_roles
+
+        # Fetch roles assigned to the user
+        user_roles = await roles_collection.find({
+            "company_id": company_id,
+            "name": {"$in": assigned_roles}
+        }).to_list(length=None)
+
+        # Combine modules across all assigned roles
+        for role in user_roles:
+            for module_name, cfg in role.get("modules", {}).items():
+
+                # Normalize "True"/"False" to boolean
+                enabled_raw = cfg.get("enabled", False)
+                enabled_bool = (
+                    enabled_raw.lower() == "true"
+                    if isinstance(enabled_raw, str)
+                    else bool(enabled_raw)
+                )
+
+                # If module exists, OR the enable value
+                if module_name in final_modules:
+                    final_modules[module_name]["enabled"] |= enabled_bool
+                else:
+                    # Add new module
+                    final_modules[module_name] = {"enabled": enabled_bool}
+
+        return {
+            "type": "company_user",
+            "email": user_record["email"],
+            "name": user_record.get("name"),
+            "company_id": company_id,
+            "user_id": user_record.get("user_id"),
+            "roles": assigned_roles,
+            "modules": final_modules
+        }
+
+    # ---------- UNKNOWN ROLE ----------
     else:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=403,
             detail="User does not have a valid company role"
         )
 
-    
 
 # GET all users belonging to the same company
 @company_admin_router.get("/users")
@@ -192,6 +238,7 @@ async def add_user(
 @company_admin_router.post("/users/upload")
 async def upload_users_from_file(
     file: UploadFile = File(...),
+    role: str = Form(default=""),  # Add role as optional form parameter
     admin_context=Depends(get_admin_company_id),
     db=Depends(get_db)
 ):
@@ -221,12 +268,15 @@ async def upload_users_from_file(
         # Read file content
         content = await file.read()
         
-        # Process file using repository
+        # Process file using repository with role parameter
+        print(f"DEBUG: Selected Role is: '{role}'")
+        print(f"DEBUG: Role type: {type(role)}")
         results = await repo.add_users_from_email_file(
             company_id=company_id,
             admin_id=admin_id,
             file_content=content,
-            file_extension=file_extension
+            file_extension=file_extension,
+            selected_role=role  # Pass the selected role
         )
 
         return {
@@ -239,16 +289,9 @@ async def upload_users_from_file(
             },
             "details": results
         }
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except pd.errors.EmptyDataError:
-        raise HTTPException(status_code=400, detail="The file is empty.")
-    except pd.errors.ParserError:
-        raise HTTPException(status_code=400, detail="Error parsing the file. Please check the file format.")
     except Exception as e:
-        logger.exception("Failed to process user upload file")
-        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
+        logger.error(f"Error uploading users file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @company_admin_router.post("/users/reset-password")
 async def reset_user_password(
@@ -338,17 +381,19 @@ async def delete_user(
     user_ids_list = user_ids.split(',')
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
     kc = get_keycloak_admin()
 
     deleted_count = 0
+
     for user_id in user_ids_list:
-        # 1) Get user from MongoDB to retrieve email
+        # 1) Get user from MongoDB to retrieve email (for Keycloak deletion)
         user = await db.company_users.find_one({
             "company_id": company_id,
             "user_id": user_id
         })
 
-        logger.info(f"USER EMAIL TO DELETE: {user}")
+        logger.info(f"USER TO DELETE: {user}")
 
         if user and user.get("email"):
             email = user["email"]
@@ -362,9 +407,8 @@ async def delete_user(
             except Exception as e:
                 logger.error(f"Failed Keycloak deletion for {email}: {str(e)}")
 
-        # 3) Delete user from MongoDB
-        result = await repo.delete_users(company_id, [user_id])
-        deleted_count += result
+    # 3) Delete users from MongoDB using repository (includes role count updates)
+    deleted_count = await repo.delete_users(company_id, user_ids_list, admin_id)
 
     if deleted_count == 0:
         raise HTTPException(status_code=404, detail="No users deleted")
@@ -374,6 +418,93 @@ async def delete_user(
         "deleted_count": deleted_count,
         "deleted_user_ids": user_ids_list
     }
+
+# DELETE role from users
+@company_admin_router.post("/users/role/delete")
+async def delete_role_from_user(
+    payload: CompanyRoleModifyUsers,
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    roleName = payload.role_name
+    print(f"--- Role Name: ---", roleName)
+
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    # Validate role exists
+    role = await CompanyRepository(db).get_role_by_name(
+        company_id=company_id,
+        admin_id=admin_id,
+        role_name=roleName
+    )
+
+    if not role:
+        raise HTTPException(status_code=404, detail=f"Role '{roleName}' does not exist.")
+
+    try:
+        # Remove the role from the assigned_roles array for selected users
+        result = await db.company_users.update_many(
+            {
+                "user_id": {"$in": payload.user_ids},
+                "company_id": company_id
+            },
+            {
+                "$pull": {"assigned_roles": roleName}
+            }
+        )
+
+        return {
+            "status": "success",
+            "removedRole": roleName,
+            "affectedUsers": payload.user_ids,
+            "modifiedCount": result.modified_count
+        }
+
+    except Exception as e:
+        print("Error removing role:", e)
+        raise HTTPException(status_code=500, detail="Could not remove role from users.")
+
+
+@company_admin_router.post("/users/role/add")
+async def add_role_to_users(
+    payload: CompanyRoleModifyUsers,
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    roleName = payload.role_name
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    # Check role exists
+    role = await CompanyRepository(db).get_role_by_name(
+        company_id=company_id,
+        admin_id=admin_id,
+        role_name=roleName
+    )
+    if not role:
+        raise HTTPException(status_code=404, detail=f"Role '{roleName}' does not exist.")
+
+    try:
+        result = await db.company_users.update_many(
+            {
+                "user_id": {"$in": payload.user_ids},
+                "company_id": company_id
+            },
+            {
+                "$addToSet": {"assigned_roles": roleName}
+            }
+        )
+
+        return {
+            "status": "success",
+            "addedRole": roleName,
+            "affectedUsers": payload.user_ids,
+            "modifiedCount": result.modified_count
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not add role to users.")
 
 
 # GET Company stats
@@ -472,7 +603,7 @@ async def add_or_update_role(
     admin_id = admin_context["admin_id"]
 
     try:
-        result = await repo.add_or_update_role(company_id, admin_id, payload.role_name, payload.folders)
+        result = await repo.add_or_update_role(company_id, admin_id, payload.role_name, payload.folders, payload.modules)
         return result
     except Exception as e:
         logger.exception("Failed to add or update role")

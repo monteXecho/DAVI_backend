@@ -64,6 +64,9 @@ class CompanyRepository:
 
     async def get_admin_by_id(self, company_id: str, user_id: str):
         return await self.admins.find_one({"company_id": company_id, "user_id": user_id})
+    
+    async def get_role_by_name(self, company_id: str, admin_id: str, role_name: str):
+        return await self.roles.find_one({"company_id": company_id, "added_by_admin_id": admin_id, "name": role_name})
 
 
     # ---------------- Companies ---------------- #
@@ -178,6 +181,43 @@ class CompanyRepository:
             "modules": serialize_modules(admin_doc["modules"]),
             "documents": [],  # empty until uploaded
         }
+
+    async def reassign_admin(self, company_id: str, admin_id: str, name: str, email: str):
+        # Check if another admin already uses this email
+        existing = await self.admins.find_one({
+            "company_id": company_id,
+            "email": email,
+        })
+        if existing:
+            raise ValueError("Admin with this email already exists")
+
+        # Update only the fields you want to change
+        update_result = await self.admins.update_one(
+            {"company_id": company_id, "user_id": admin_id},
+            {
+                "$set": {
+                    "name": name,
+                    "email": email,
+                    "updated_at": datetime.utcnow(),
+                }
+            }
+        )
+
+        if update_result.matched_count == 0:
+            raise ValueError("Admin not found")
+
+        # Return updated fields
+        updated_admin = await self.admins.find_one({"company_id": company_id, "user_id": admin_id})
+
+        return {
+            "user_id": updated_admin["user_id"],
+            "company_id": updated_admin["company_id"],
+            "name": updated_admin["name"],
+            "email": updated_admin["email"],
+            "modules": serialize_modules(updated_admin["modules"]),
+            "documents": updated_admin.get("documents", []),
+        }
+
 
     async def delete_admin(self, company_id: str, user_id: str) -> bool:
         admin = await self.admins.find_one({"company_id": company_id, "user_id": user_id})
@@ -379,7 +419,8 @@ class CompanyRepository:
         company_id: str,
         admin_id: str,
         file_content: bytes,
-        file_extension: str
+        file_extension: str,
+        selected_role: str = None  # Add selected_role parameter
     ) -> dict:
         """
         Add multiple users from CSV/Excel file containing email addresses.
@@ -390,6 +431,11 @@ class CompanyRepository:
             
             print(f"DEBUG: Processing file with extension: {file_extension}")
             print(f"DEBUG: File size: {len(file_content)} bytes")
+            print(f"DEBUG: Selected role: {selected_role}")
+
+            # Get roles based on the selected role logic
+            roles_to_assign = await self._get_roles_to_assign(company_id, admin_id, selected_role)
+            print(f"DEBUG: Roles to assign: {roles_to_assign}")
 
             # Read the file
             try:
@@ -455,6 +501,9 @@ class CompanyRepository:
                 "duplicates": []
             }
 
+            # Track successful user creations for role assignment counting
+            successful_users = []
+
             for email in emails:
                 try:
                     # Check for existing user
@@ -473,7 +522,7 @@ class CompanyRepository:
                     # Use email prefix as name
                     name = email.split('@')[0]
 
-                    # Create user document
+                    # Create user document with role assignment
                     user_doc = {
                         "user_id": str(uuid.uuid4()),
                         "company_id": company_id,
@@ -481,17 +530,21 @@ class CompanyRepository:
                         "email": email,
                         "name": name,
                         "company_role": "company_user",
-                        "assigned_roles": [],
+                        "assigned_roles": roles_to_assign,  # Assign the determined roles
                         "created_at": datetime.utcnow(),
                         "updated_at": datetime.utcnow(),
                     }
 
                     await self.users.insert_one(user_doc)
 
+                    # Add to successful users for role counting
+                    successful_users.append(user_doc)
+
                     results["successful"].append({
                         "email": email,
                         "name": name,
-                        "user_id": user_doc["user_id"]
+                        "user_id": user_doc["user_id"],
+                        "assigned_roles": roles_to_assign  # Include assigned roles in response
                     })
 
                 except Exception as e:
@@ -500,11 +553,122 @@ class CompanyRepository:
                         "error": str(e)
                     })
 
+            # Update assigned_user_count for roles if there are successful users and roles to assign
+            if successful_users and roles_to_assign:
+                await self._update_role_user_counts(company_id, admin_id, roles_to_assign, len(successful_users))
+
             return results
 
         except Exception as e:
             logger.error(f"Error processing user upload file: {str(e)}")
             raise
+
+    async def _get_roles_to_assign(self, company_id: str, admin_id: str, selected_role: str) -> list:
+        """
+        Determine which roles to assign based on the selected role logic:
+        - "Alle rollen": Assign all roles created by this admin
+        - "Zonder rol" or empty: Assign no roles (empty list)
+        - Specific role: Validate and assign that specific role if created by this admin
+        """
+        
+        # Case 1: No role or "Zonder rol" - assign empty roles
+        if not selected_role or selected_role == "Zonder rol":
+            print(f"DEBUG: No roles to assign for selected_role: {selected_role}")
+            return []
+        
+        # Case 2: "Alle rollen" - get all roles created by this admin
+        if selected_role == "Alle rollen":
+            try:
+                # Get all roles created by this admin for this company
+                all_admin_roles = await self.roles.find({
+                    "company_id": company_id,
+                    "added_by_admin_id": admin_id
+                }).to_list(length=None)
+                
+                role_names = [role.get("name") for role in all_admin_roles if role.get("name")]
+                print(f"DEBUG: Found {len(role_names)} roles for admin {admin_id}: {role_names}")
+                return role_names
+                
+            except Exception as e:
+                print(f"DEBUG: Error fetching all admin roles: {e}")
+                return []
+        
+        # Case 3: Specific role - validate and assign if exists
+        try:
+            # Check if the specific role exists and was created by this admin
+            existing_role = await self.roles.find_one({
+                "company_id": company_id,
+                "added_by_admin_id": admin_id,
+                "name": selected_role
+            })
+            
+            if existing_role:
+                print(f"DEBUG: Valid role found: {selected_role}")
+                return [selected_role]
+            else:
+                print(f"DEBUG: Role '{selected_role}' not found or not created by this admin")
+                # You might want to handle this case differently - either raise error or proceed without role
+                return []
+                
+        except Exception as e:
+            print(f"DEBUG: Error validating specific role '{selected_role}': {e}")
+            return []
+
+    async def _update_role_user_counts(self, company_id: str, admin_id: str, roles: list, user_count: int):
+        """
+        Update the assigned_user_count for roles when users are assigned to them.
+        More granular approach that handles missing roles gracefully.
+        """
+        try:
+            print(f"DEBUG: Updating role user counts for {len(roles)} roles with {user_count} users")
+            
+            updated_roles = []
+            failed_roles = []
+            
+            for role_name in roles:
+                try:
+                    # First check if the role exists
+                    existing_role = await self.roles.find_one({
+                        "company_id": company_id,
+                        "added_by_admin_id": admin_id,
+                        "name": role_name
+                    })
+                    
+                    if not existing_role:
+                        print(f"DEBUG: Role '{role_name}' not found, skipping count update")
+                        failed_roles.append(role_name)
+                        continue
+                    
+                    # Increment the assigned_user_count for the role
+                    result = await self.roles.update_one(
+                        {
+                            "company_id": company_id,
+                            "added_by_admin_id": admin_id,
+                            "name": role_name
+                        },
+                        {
+                            "$inc": {"assigned_user_count": user_count},
+                            "$set": {"updated_at": datetime.utcnow()}
+                        }
+                    )
+                    
+                    if result.modified_count > 0:
+                        print(f"DEBUG: Successfully updated assigned_user_count for role '{role_name}' by {user_count}")
+                        updated_roles.append(role_name)
+                    else:
+                        print(f"DEBUG: Failed to update role '{role_name}'")
+                        failed_roles.append(role_name)
+                        
+                except Exception as role_error:
+                    print(f"DEBUG: Error updating role '{role_name}': {role_error}")
+                    failed_roles.append(role_name)
+            
+            print(f"DEBUG: Role update summary - Updated: {len(updated_roles)}, Failed: {len(failed_roles)}")
+            if failed_roles:
+                print(f"DEBUG: Failed to update these roles: {failed_roles}")
+                
+        except Exception as e:
+            print(f"DEBUG: Error in _update_role_user_counts: {e}")
 
     def _extract_emails_from_text(self, text_content):
         """Extract emails from plain text content"""
@@ -544,22 +708,156 @@ class CompanyRepository:
             "documents": [],
         }
 
-    async def delete_users(self, company_id: str, user_ids: list[str]) -> int:
-        result = await self.users.delete_many({
-            "company_id": company_id,
-            "user_id": {"$in": user_ids}
-        })
+    async def delete_users(self, company_id: str, user_ids: list[str], admin_id: str = None) -> int:
+        """
+        Delete users and decrease role user counts.
+        """
+        try:
+            # 1) First, get all users to be deleted to retrieve their assigned roles
+            users_to_delete = await self.users.find({
+                "company_id": company_id,
+                "user_id": {"$in": user_ids}
+            }).to_list(length=None)
+            
+            print(f"DEBUG: Found {len(users_to_delete)} users to delete")
 
-        if result.deleted_count > 0:
-            await self.documents.delete_many({"user_id": {"$in": user_ids}})
+            # 2) Delete users from MongoDB
+            result = await self.users.delete_many({
+                "company_id": company_id,
+                "user_id": {"$in": user_ids}
+            })
 
-        return result.deleted_count
-    
+            deleted_count = result.deleted_count
+            
+            if deleted_count > 0:
+                # 3) Delete user documents
+                await self.documents.delete_many({"user_id": {"$in": user_ids}})
+                
+                # 4) Update role user counts if admin_id is provided
+                if admin_id and users_to_delete:
+                    await self._decrease_role_user_counts(company_id, admin_id, users_to_delete)
+
+            return deleted_count
+
+        except Exception as e:
+            logger.error(f"Error in delete_users: {str(e)}")
+            raise
+
+    async def _decrease_role_user_counts(self, company_id: str, admin_id: str, deleted_users: list):
+        """
+        Decrease the assigned_user_count for roles when users with those roles are deleted.
+        """
+        try:
+            # Count how many users had each role
+            role_decrement_counts = {}
+            
+            for user in deleted_users:
+                assigned_roles = user.get("assigned_roles", [])
+                for role_name in assigned_roles:
+                    if role_name in role_decrement_counts:
+                        role_decrement_counts[role_name] += 1
+                    else:
+                        role_decrement_counts[role_name] = 1
+            
+            print(f"DEBUG: Role decrement counts: {role_decrement_counts}")
+            
+            # Update each role's count using $inc with negative value
+            updated_roles = []
+            failed_roles = []
+            
+            for role_name, decrement_count in role_decrement_counts.items():
+                try:
+                    # Use $inc with negative value to decrement
+                    result = await self.roles.update_one(
+                        {
+                            "company_id": company_id,
+                            "added_by_admin_id": admin_id,
+                            "name": role_name
+                        },
+                        {
+                            "$inc": {"assigned_user_count": -decrement_count},
+                            "$set": {"updated_at": datetime.utcnow()}
+                        }
+                    )
+                    
+                    if result.modified_count > 0:
+                        print(f"DEBUG: Successfully decreased assigned_user_count for role '{role_name}' by {decrement_count}")
+                        updated_roles.append(role_name)
+                    else:
+                        print(f"DEBUG: Role '{role_name}' not found or count not updated")
+                        failed_roles.append(role_name)
+                        
+                except Exception as role_error:
+                    print(f"DEBUG: Error updating role '{role_name}': {role_error}")
+                    failed_roles.append(role_name)
+            
+            print(f"DEBUG: Role decrement summary - Updated: {len(updated_roles)}, Failed: {len(failed_roles)}")
+            if failed_roles:
+                print(f"DEBUG: Failed to update these roles: {failed_roles}")
+                
+        except Exception as e:
+            print(f"DEBUG: Error in _decrease_role_user_counts: {e}")
+            # Don't raise the error to avoid failing the entire delete operation
+
+    async def delete_users_by_admin(self, company_id: str, admin_id: str, kc_admin=None) -> int:
+        """
+        Delete all users added by a specific admin.
+        Returns the number of users deleted.
+        """
+        try:
+            # Get all users added by this admin
+            admin_users = await self.users.find({
+                "company_id": company_id,
+                "added_by_admin_id": admin_id
+            }).to_list(length=None)
+            
+            user_emails = [user.get("email") for user in admin_users if user.get("email")]
+            user_ids = [user.get("user_id") for user in admin_users if user.get("user_id")]
+            
+            print(f"DEBUG: Found {len(admin_users)} users added by admin {admin_id}")
+            
+            if not admin_users:
+                return 0
+
+            # Delete users from Keycloak if kc_admin is provided
+            keycloak_deleted = 0
+            if kc_admin:
+                for user in admin_users:
+                    email = user.get("email")
+                    if email:
+                        try:
+                            kc_users = kc_admin.get_users(query={"email": email})
+                            if kc_users:
+                                keycloak_user_id = kc_users[0]["id"]
+                                kc_admin.delete_user(keycloak_user_id)
+                                keycloak_deleted += 1
+                                print(f"DEBUG: Deleted Keycloak user: {email}")
+                        except Exception as e:
+                            print(f"DEBUG: Failed to delete Keycloak user {email}: {e}")
+
+            # Delete user documents
+            if user_ids:
+                await self.documents.delete_many({"user_id": {"$in": user_ids}})
+
+            # Delete users from MongoDB
+            result = await self.users.delete_many({
+                "company_id": company_id,
+                "added_by_admin_id": admin_id
+            })
+            
+            print(f"DEBUG: Successfully deleted {result.deleted_count} users added by admin {admin_id}")
+            
+            return result.deleted_count
+            
+        except Exception as e:
+            logger.error(f"Error deleting users for admin {admin_id}: {str(e)}")
+            print(f"DEBUG: Error in delete_users_by_admin: {e}")
+            return 0
 
     # ---------------- Company Roles ---------------- #
-    async def add_or_update_role(self, company_id: str, admin_id: str, role_name: str, folders: list[str]) -> dict:
+    async def add_or_update_role(self, company_id: str, admin_id: str, role_name: str, folders: list[str], modules: list) -> dict:
         """
-        Create or update a company role with given subfolders.
+        Create or update a company role with given subfolders and modules.
         Ensures folders exist on disk under /app/uploads/documents/roleBased/{company_id}/.
         Also removes deleted folders and their documents.
         """
@@ -569,6 +867,33 @@ class CompanyRepository:
             "company_id": company_id,
             "name": role_name
         })
+
+        # Convert modules from array to dictionary format
+        modules_dict = None
+        if modules is not None:
+            if isinstance(modules, list):
+                # Convert array format to dictionary format
+                # From: [{"name": "Documenten chat", "enabled": false}, {"name": "GGD Checks", "enabled": true}]
+                # To: {"Documenten chat": {"enabled": false}, "GGD Checks": {"enabled": true}}
+                modules_dict = {}
+                for module in modules:
+                    if isinstance(module, dict):
+                        module_name = module.get('name')
+                        if module_name:
+                            # Extract only the relevant fields (remove 'name' since it's the key)
+                            module_data = {k: v for k, v in module.items() if k != 'name'}
+                            modules_dict[module_name] = module_data
+                    elif hasattr(module, 'dict'):  # If it's a Pydantic model
+                        module_dict = module.dict()
+                        module_name = module_dict.get('name')
+                        if module_name:
+                            module_data = {k: v for k, v in module_dict.items() if k != 'name'}
+                            modules_dict[module_name] = module_data
+            else:
+                # If it's already a dict, use as is
+                modules_dict = modules
+
+        print(f"DEBUG: Converted modules: {modules_dict}")
 
         if existing_role:
             # Get current folders to identify which ones were removed
@@ -616,15 +941,26 @@ class CompanyRepository:
                 
                 logger.info(f"Removed folder '{removed_folder}' and deleted {delete_docs_result.deleted_count} documents")
 
-            # Update the role with the new folder list (complete replacement)
+            # Update the role with the new folder list and modules (complete replacement)
+            update_data = {
+                "folders": folders,
+                "updated_at": datetime.utcnow()
+            }
+            
+            # Add modules to update if provided
+            if modules_dict is not None:
+                update_data["modules"] = modules_dict
+            
             await self.roles.update_one(
                 {"_id": existing_role["_id"]},
-                {"$set": {"folders": folders, "updated_at": datetime.utcnow()}}
+                {"$set": update_data}
             )
             status = "role_updated"
             updated_folders = folders
+            final_modules = modules_dict if modules_dict is not None else existing_role.get("modules", {})
         else:
-            await self.roles.insert_one({
+            # Create new role with modules
+            role_data = {
                 "company_id": company_id,
                 "name": role_name,
                 "added_by_admin_id": admin_id,
@@ -633,9 +969,16 @@ class CompanyRepository:
                 "document_count": 0,
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
-            })
+            }
+            
+            # Add modules to new role if provided
+            if modules_dict is not None:
+                role_data["modules"] = modules_dict
+            
+            await self.roles.insert_one(role_data)
             updated_folders = folders
             status = "role_created"
+            final_modules = modules_dict if modules_dict is not None else {}
 
         # Ensure new folders exist on disk
         base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
@@ -648,6 +991,7 @@ class CompanyRepository:
             "company_id": company_id,
             "role_name": role_name,
             "folders": updated_folders,
+            "modules": final_modules
         }
 
     async def list_roles(self, company_id: str, admin_id: str) -> list[dict]:
@@ -659,7 +1003,8 @@ class CompanyRepository:
                 "name": r.get("name"),
                 "folders": r.get("folders", []),
                 "user_count": r.get("assigned_user_count", 0),
-                "document_count": r.get("document_count", 0)
+                "document_count": r.get("document_count", 0),
+                "modules": r.get("modules", [])
             }
             for r in roles
         ]
@@ -819,7 +1164,7 @@ class CompanyRepository:
         if existing_doc:
             raise HTTPException(
                 status_code=409,
-                detail=f"A document named '{file_name}' already exists in folder '{safe_folder}' for role '{role_name}'."
+                detail=f"Het document '{file_name}' bestaat al in de map '{safe_folder}' voor rol '{role_name}'."
             )
 
         # ✅ Save file asynchronously
@@ -857,6 +1202,157 @@ class CompanyRepository:
             "file_name": file_name,
             "path": file_path,
         }
+
+    async def delete_roles_by_admin(self, company_id: str, admin_id: str) -> int:
+        """
+        Delete all roles created by a specific admin.
+        Returns the number of roles deleted.
+        """
+        try:
+            # Get all roles created by this admin
+            admin_roles = await self.roles.find({
+                "company_id": company_id,
+                "added_by_admin_id": admin_id
+            }).to_list(length=None)
+            
+            role_names = [role.get("name") for role in admin_roles if role.get("name")]
+            print(f"DEBUG: Deleting {len(admin_roles)} roles created by admin {admin_id}: {role_names}")
+            
+            # Simply delete the roles - no need to update users since they're being deleted too
+            result = await self.roles.delete_many({
+                "company_id": company_id,
+                "added_by_admin_id": admin_id
+            })
+            
+            print(f"DEBUG: Successfully deleted {result.deleted_count} roles created by admin {admin_id}")
+            return result.deleted_count
+            
+        except Exception as e:
+            logger.error(f"Error deleting roles for admin {admin_id}: {str(e)}")
+            print(f"DEBUG: Error in delete_roles_by_admin: {e}")
+            return 0
+
+    async def delete_role_documents_by_admin(self, company_id: str, admin_id: str) -> int:
+        """
+        Delete all role documents uploaded by a specific admin.
+        This includes both database records and actual files from the filesystem.
+        Returns the number of documents deleted.
+        """
+        try:
+            # Get all role documents uploaded by this admin
+            role_documents = await self.documents.find({
+                "company_id": company_id,
+                "user_id": admin_id,
+                "upload_type": {"$exists": True}  # This indicates role-based documents
+            }).to_list(length=None)
+            
+            print(f"DEBUG: Found {len(role_documents)} role documents uploaded by admin {admin_id}")
+            
+            if not role_documents:
+                return 0
+
+            # Delete actual files from filesystem
+            files_deleted = 0
+            for doc in role_documents:
+                file_path = doc.get("path")
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        files_deleted += 1
+                        print(f"DEBUG: Deleted file: {file_path}")
+                        
+                        # Also delete the directory if it's empty
+                        directory = os.path.dirname(file_path)
+                        if os.path.exists(directory) and not os.listdir(directory):
+                            os.rmdir(directory)
+                            print(f"DEBUG: Deleted empty directory: {directory}")
+                            
+                    except Exception as e:
+                        print(f"DEBUG: Failed to delete file {file_path}: {e}")
+            
+            # Update document counts for roles
+            role_doc_counts = {}
+            for doc in role_documents:
+                role_name = doc.get("upload_type")
+                if role_name:
+                    if role_name in role_doc_counts:
+                        role_doc_counts[role_name] += 1
+                    else:
+                        role_doc_counts[role_name] = 1
+            
+            # Decrement document_count for each role
+            for role_name, doc_count in role_doc_counts.items():
+                try:
+                    await self.roles.update_one(
+                        {"company_id": company_id, "name": role_name},
+                        {"$inc": {"document_count": -doc_count}}
+                    )
+                    print(f"DEBUG: Decreased document_count for role '{role_name}' by {doc_count}")
+                except Exception as e:
+                    print(f"DEBUG: Failed to update document_count for role '{role_name}': {e}")
+
+            # Delete database records
+            result = await self.documents.delete_many({
+                "company_id": company_id,
+                "user_id": admin_id,
+                "upload_type": {"$exists": True}
+            })
+            
+            print(f"DEBUG: Successfully deleted {result.deleted_count} role document records from database")
+            print(f"DEBUG: Successfully deleted {files_deleted} actual files from filesystem")
+            
+            return result.deleted_count
+            
+        except Exception as e:
+            logger.error(f"Error deleting role documents for admin {admin_id}: {str(e)}")
+            print(f"DEBUG: Error in delete_role_documents_by_admin: {e}")
+            return 0
+
+    async def delete_company_role_documents(self, company_id: str) -> int:
+        """
+        Delete all role-based documents for a company.
+        Simple delete - no need to update role counts since roles are being deleted.
+        Returns the number of documents deleted.
+        """
+        try:
+            # Get all role documents for this company
+            role_documents = await self.documents.find({
+                "company_id": company_id,
+                "upload_type": {"$exists": True}  # This indicates role-based documents
+            }).to_list(length=None)
+            
+            print(f"DEBUG: Found {len(role_documents)} role documents for company {company_id}")
+            
+            if not role_documents:
+                return 0
+
+            # Delete actual files from filesystem
+            files_deleted = 0
+            for doc in role_documents:
+                file_path = doc.get("path")
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        files_deleted += 1
+                        print(f"DEBUG: Deleted file: {file_path}")
+                    except Exception as e:
+                        print(f"DEBUG: Failed to delete file {file_path}: {e}")
+
+            # Delete database records
+            result = await self.documents.delete_many({
+                "company_id": company_id,
+                "upload_type": {"$exists": True}
+            })
+            
+            print(f"DEBUG: Successfully deleted {result.deleted_count} role document records from database")
+            print(f"DEBUG: Successfully deleted {files_deleted} actual role document files from filesystem")
+            
+            return result.deleted_count
+            
+        except Exception as e:
+            logger.error(f"Error deleting role documents for company {company_id}: {str(e)}")
+            print(f"DEBUG: Error in delete_company_role_documents: {e}")
+            return 0
 
     # ---------------- Shared ---------------- #
     async def get_user_with_documents(self, email: str):
@@ -1038,5 +1534,6 @@ class CompanyRepository:
         await self.companies.delete_many({})
         await self.admins.delete_many({})
         await self.users.delete_many({})
-        await self.documents.delete_many({})
+        await self.documents.delete_many({})    
+        await self.roles.delete_many({})
         return {"status": "All collections cleared"}

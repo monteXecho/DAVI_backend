@@ -2,6 +2,11 @@ from pydantic import BaseModel, EmailStr, Field
 from typing import List
 from typing import Optional
 
+class ModuleConfig(BaseModel):
+    name: str
+    desc: Optional[str] = None 
+    enabled: bool = False
+
 class CompanyUserCreate(BaseModel):
     email: EmailStr
     company_role: str  # e.g. "teacher", "manager", etc.
@@ -16,6 +21,7 @@ class CompanyUserUpdate(BaseModel):
 class CompanyRoleCreate(BaseModel):
     role_name: str = Field(..., example="role_a")
     folders: List[str] = Field(..., example=["bkr", "vgc/kkr", "uur/trc"])
+    modules: List[ModuleConfig]
     
 class AssignRolePayload(BaseModel):
     user_id: str
@@ -29,3 +35,8 @@ class DeleteRolesPayload(BaseModel):
 
 class ResetPasswordPayload(BaseModel):
     email: str
+
+class CompanyRoleModifyUsers(BaseModel):
+    user_ids: List[str]
+    role_name: str
+
