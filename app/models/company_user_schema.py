@@ -9,13 +9,13 @@ class ModuleConfig(BaseModel):
 
 class CompanyUserCreate(BaseModel):
     email: EmailStr
-    company_role: str  # e.g. "teacher", "manager", etc.
+    company_role: str  
     assigned_role: str
 
 class CompanyUserUpdate(BaseModel):
-    id: Optional[str] = None  # a1, a2…
-    name: Optional[str] = ""   # optional, can be empty
-    email: EmailStr            # must exist + must be valid email
+    id: Optional[str] = None  
+    name: Optional[str] = ""  
+    email: EmailStr           
     assigned_roles: List[str] = Field(default_factory=list)
 
 class CompanyRoleCreate(BaseModel):

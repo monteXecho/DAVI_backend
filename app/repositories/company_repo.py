@@ -29,10 +29,8 @@ DEFAULT_MODULES = {
     "GGD Checks": {"desc": "Automatische GGD-controles, inclusief BKR-bewaking, afwijkingslogica en rapportage.", "enabled": False}
 }
 
-
 def serialize_modules(modules: dict) -> list:
     return [{"name": k, "desc": v["desc"], "enabled": v["enabled"]} for k, v in modules.items()]
-
 
 def serialize_documents(docs_cursor, user_id: str):
     return [
@@ -42,7 +40,6 @@ def serialize_documents(docs_cursor, user_id: str):
         }
         for d in docs_cursor
     ]
-
 
 class CompanyRepository:
     def __init__(self, db: AsyncIOMotorDatabase):
@@ -266,6 +263,39 @@ class CompanyRepository:
             return None
         return {"email": user["email"], "role": "company_user"}
 
+    async def get_all_private_documents(self, email: str, document_type: str):
+        user_rec = await self.users.find_one({"email": email})
+        admin_rec = await self.admins.find_one({"email": email})
+
+        user = user_rec or admin_rec
+
+        if not user:
+            return {"documents": []}
+
+        user_id = user["user_id"]
+        if not user_id:
+            return {"documents": []}
+
+        docs_cursor = self.documents.find({
+            "user_id": user_id,
+            "upload_type": document_type
+        })
+
+        docs = await docs_cursor.to_list(length=None)
+
+        if not docs:
+            return {"documents": []}
+
+        result = {"documents": []}
+
+        for doc in docs:
+            result["documents"].append({
+                "file_name": doc.get("file_name"),
+                "upload_type": doc.get("upload_type")
+            })
+
+        return result
+
     async def get_admin_documents(self, company_id: str, admin_id: str):
         """
         Get all documents uploaded by the admin, grouped by role and folder,
@@ -342,23 +372,64 @@ class CompanyRepository:
         # --- Step 5: Return structured response ---
         return dict(result)
 
+    async def delete_private_documents(
+        self,
+        email: str,
+        documents_to_delete: List[dict]
+    ) -> int:
+
+        user_rec = await self.users.find_one({"email": email})
+        admin_rec = await self.admins.find_one({"email": email})
+
+        user = user_rec or admin_rec
+
+        user_id = user["user_id"]
+
+        deleted_count = 0
+
+        for doc_info in documents_to_delete:
+            file_name = doc_info.get("file_name")
+
+            if not file_name:
+                continue 
+
+            try:
+                query = {
+                    "user_id": user_id,
+                    "file_name": file_name,
+                    "upload_type": "document"
+                }
+
+                document = await self.documents.find_one(query)
+                if not document:
+                    continue
+
+                file_path = document.get("path")
+
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Deleted physical file: {file_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete physical file {file_path}: {str(e)}")
+
+                delete_result = await self.documents.delete_one({"_id": document["_id"]})
+                if delete_result.deleted_count > 0:
+                    deleted_count += 1
+
+            except Exception as e:
+                logger.error(f"Error deleting document {file_name}: {str(e)}")
+                continue
+
+        return deleted_count
+
     async def delete_documents(
         self,
         company_id: str,
         admin_id: str,
         documents_to_delete: List[dict]
     ) -> int:
-        """
-        Delete multiple documents by file name and role.
-        
-        Args:
-            company_id: The company ID
-            admin_id: The admin ID who uploaded the documents
-            documents_to_delete: List of dicts with 'fileName' and 'role' keys
-        
-        Returns:
-            Number of documents successfully deleted
-        """
+
         deleted_count = 0
 
         for doc_info in documents_to_delete:

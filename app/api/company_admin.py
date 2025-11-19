@@ -147,7 +147,6 @@ async def get_login_user(
             detail="User does not have a valid company role"
         )
 
-
 # GET all users belonging to the same company
 @company_admin_router.get("/users")
 async def get_all_users(
@@ -203,6 +202,25 @@ async def get_admin_uploaded_documents(
         "admin_id": admin_id,
         "data": result
     }
+
+# Get all private documents uploaded by this current logged in user
+@company_admin_router.get("/documents/private")
+async def get_admin_uploaded_documents(
+    user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    email = user.get("email")
+
+    repo = CompanyRepository(db)
+
+    result = await repo.get_all_private_documents(email, document_type="document")
+
+    return {
+        "success": True,
+        "data": result
+    }
+
+
 
 # ADD new user (with email + company_role)
 @company_admin_router.post("/users")
@@ -572,6 +590,38 @@ async def delete_documents(
         deleted_count = await repo.delete_documents(
             company_id=company_id,
             admin_id=admin_id,
+            documents_to_delete=payload.documents
+        )
+
+        if deleted_count == 0:
+            raise HTTPException(status_code=404, detail="No documents found to delete")
+
+        return {
+            "success": True,
+            "deleted_count": deleted_count,
+            "deleted_documents": payload.documents
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to delete documents")
+        raise HTTPException(status_code=500, detail=f"Failed to delete documents: {str(e)}")
+    
+
+@company_admin_router.post("/documents/delete/private")
+async def delete_documents(
+    payload: DeleteDocumentsPayload,
+    user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    email = user.get("email")
+
+    repo = CompanyRepository(db)
+ 
+    try:
+        deleted_count = await repo.delete_private_documents(
+            email=email,
             documents_to_delete=payload.documents
         )
 

@@ -11,13 +11,12 @@ class ModuleConfig(BaseModel):
 class RegisterRequest(BaseModel):
     fullName: str
     email: EmailStr
-    # username: str
     password: str
     
 
 class CompanyAdmin(BaseModel):
-    id: Optional[str] = None  # a1, a2…
-    user_id: uuid.UUID = Field(default_factory=uuid.uuid4)  # auto-generated UUID
+    id: Optional[str] = None  
+    user_id: uuid.UUID = Field(default_factory=uuid.uuid4) 
     name: str
     email: EmailStr
     modules: List[ModuleConfig]
@@ -45,6 +44,6 @@ class CompanyAdminModules(BaseModel):
 
 
 class CompanyOut(BaseModel):
-    id: str  # c1, c2…
+    id: str 
     name: str
     admins: List[CompanyAdmin]
