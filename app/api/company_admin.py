@@ -770,3 +770,4 @@ async def clear_all_data(db=Depends(get_db)):
     repo = CompanyRepository(db)
     result = await repo.clear_all_data()
     return result
+
