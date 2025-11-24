@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, 
 from app.deps.auth import require_role, get_keycloak_admin, get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
-from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload, DeleteDocumentsPayload, DeleteRolesPayload, ResetPasswordPayload, CompanyRoleModifyUsers
+from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload, DeleteDocumentsPayload, DeleteFolderPayload, DeleteRolesPayload, ResetPasswordPayload, CompanyRoleModifyUsers
 from app.api.rag import rag_index_files
 
 logger = logging.getLogger("uvicorn")
@@ -84,13 +84,11 @@ async def get_login_user(
         company_id = user_record["company_id"]
         assigned_roles = user_record.get("assigned_roles", [])
 
-        # Default modules are disabled
         final_modules = {
             "Documenten chat": {"enabled": False},
             "GGD Checks": {"enabled": False}
         }
 
-        # If user has no assigned roles → return defaults
         if not assigned_roles:
             return {
                 "type": "company_user",
@@ -102,20 +100,16 @@ async def get_login_user(
                 "modules": final_modules
             }
 
-        # Always use the correct collection: company_roles
         roles_collection = db.company_roles
 
-        # Fetch roles assigned to the user
         user_roles = await roles_collection.find({
             "company_id": company_id,
             "name": {"$in": assigned_roles}
         }).to_list(length=None)
 
-        # Combine modules across all assigned roles
         for role in user_roles:
             for module_name, cfg in role.get("modules", {}).items():
 
-                # Normalize "True"/"False" to boolean
                 enabled_raw = cfg.get("enabled", False)
                 enabled_bool = (
                     enabled_raw.lower() == "true"
@@ -123,11 +117,9 @@ async def get_login_user(
                     else bool(enabled_raw)
                 )
 
-                # If module exists, OR the enable value
                 if module_name in final_modules:
                     final_modules[module_name]["enabled"] |= enabled_bool
                 else:
-                    # Add new module
                     final_modules[module_name] = {"enabled": enabled_bool}
 
         return {
@@ -219,7 +211,6 @@ async def get_admin_uploaded_documents(
         "success": True,
         "data": result
     }
-
 
 
 # ADD new user (with email + company_role)
@@ -575,13 +566,7 @@ async def delete_documents(
     admin_context=Depends(get_admin_company_id),
     db=Depends(get_db)
 ):
-    """
-    Delete multiple documents by file name and role.
-    Each document in the payload should have:
-    - fileName: The name of the file
-    - role: The role that the file belongs to
-    - path: Optional file path (if available)
-    """
+    
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -639,6 +624,41 @@ async def delete_documents(
     except Exception as e:
         logger.exception("Failed to delete documents")
         raise HTTPException(status_code=500, detail=f"Failed to delete documents: {str(e)}")
+
+
+@company_admin_router.post("/folders/delete")
+async def delete_folder(
+    payload: DeleteFolderPayload,
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    try:
+        result = await repo.delete_folders(
+            company_id=company_id,
+            admin_id=admin_id,
+            role_names=payload.role_names,
+            folder_names=payload.folder_names
+        )
+
+        return {
+            "success": True,
+            "status": result["status"],
+            "deleted_folders": result["deleted_folders"],
+            "total_documents_deleted": result["total_documents_deleted"]
+        }
+
+    except HTTPException:
+        # Directly rethrow known user-facing exceptions
+        raise
+
+    except Exception as e:
+        logger.exception("Failed to delete folders")
+        raise HTTPException(status_code=500, detail=f"Failed to delete folders: {str(e)}")
+
     
 
 # ADD or UPDAT a company role and document folders for the role

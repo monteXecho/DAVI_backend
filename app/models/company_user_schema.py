@@ -30,6 +30,10 @@ class AssignRolePayload(BaseModel):
 class DeleteDocumentsPayload(BaseModel):
     documents: List[dict] 
 
+class DeleteFolderPayload(BaseModel):
+    folder_names: List[str]
+    role_names: List[str]
+
 class DeleteRolesPayload(BaseModel):
     role_names: List[str]
 

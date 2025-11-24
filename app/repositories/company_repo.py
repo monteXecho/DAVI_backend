@@ -6,6 +6,7 @@ import re
 import io
 import aiofiles
 import pandas as pd
+import shutil
 from fastapi import HTTPException, UploadFile
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -484,6 +485,76 @@ class CompanyRepository:
                 continue
 
         return deleted_count
+
+    async def delete_folders(
+        self,
+        company_id: str,
+        folder_names: List[str],
+        role_names: List[str],
+        admin_id: str
+    ) -> dict:
+
+        deleted_folders = []
+        total_documents_deleted = 0
+
+        # Loop through matched role/folder pairs
+        for role_name, folder_name in zip(role_names, folder_names):
+
+            # Find the role that contains this folder
+            role = await self.roles.find_one({
+                "company_id": company_id,
+                "added_by_admin_id": admin_id,
+                "name": role_name,
+                "folders": folder_name   # folder exists in the role's array
+            })
+
+            if not role:
+                continue
+
+            # Delete all documents belonging to this role/folder
+            delete_docs_result = await self.documents.delete_many({
+                "company_id": company_id,
+                "user_id": admin_id,
+                "upload_type": role_name,
+                "path": {"$regex": f"/{folder_name}/"}
+            })
+
+            total_documents_deleted += delete_docs_result.deleted_count
+
+            # Remove folder from filesystem
+            base_path = os.path.join(
+                UPLOAD_ROOT,
+                "roleBased",
+                company_id,
+                admin_id,
+                role_name,
+                folder_name
+            )
+
+            if os.path.exists(base_path):
+                shutil.rmtree(base_path, ignore_errors=True)
+
+            # Remove folder name from the role document array
+            await self.roles.update_one(
+                {"_id": role["_id"]},
+                {"$pull": {"folders": folder_name}}
+            )
+
+            deleted_folders.append({
+                "role_name": role_name,
+                "folder_name": folder_name
+            })
+
+        if not deleted_folders:
+            raise HTTPException(status_code=404, detail="No matching folders found")
+
+        return {
+            "status": "deleted",
+            "deleted_folders": deleted_folders,
+            "total_documents_deleted": total_documents_deleted
+        }
+
+
 
     async def add_users_from_email_file(
         self,
@@ -1089,7 +1160,7 @@ class CompanyRepository:
 
         for role_name in role_names:
             # --- Verify role exists ---
-            role = await self.roles.find_one({"company_id": company_id, "name": role_name})
+            role = await self.roles.find_one({"company_id": company_id, "added_by_admin_id": admin_id, "name": role_name})
             if not role:
                 # Skip if role doesn't exist, but continue with others
                 continue
