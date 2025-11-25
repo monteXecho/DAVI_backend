@@ -1584,6 +1584,14 @@ class CompanyRepository:
         }
         await self.users.insert_one(user_doc)
 
+        # --- NEW: Increment user count for the assigned role ---
+        role = await self.roles.find_one({"name": assigned_role, "company_id": company_id})
+        
+        await self.roles.update_one(
+                {"_id": role["_id"]},
+                {"$inc": {"assigned_user_count": 1}}
+            )
+
         return {
             "user_id": user_doc["user_id"],
             "company_id": company_id,

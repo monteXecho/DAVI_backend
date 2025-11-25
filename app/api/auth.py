@@ -6,6 +6,7 @@ from app.models.company_admin_schema import RegisterRequest
 from app.deps.auth import keycloak_admin, ensure_role_exists
 from keycloak.exceptions import KeycloakGetError
 import traceback
+import re
 
 auth_router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -44,11 +45,16 @@ async def register_user(
         # -------------------------------------------------------------
         # 3. Prepare username, first name, last name
         # -------------------------------------------------------------
-        parts = payload.fullName.strip().split(" ", 1)
-        first_name = parts[0]
-        last_name = parts[1] if len(parts) > 1 else ""
 
-        username = (first_name + last_name).lower()
+        # Split into unlimited parts (first, middle, last, etc.)
+        name_parts = payload.fullName.strip().split()
+
+        first_name = name_parts[0]
+        last_name = name_parts[-1] if len(name_parts) > 1 else ""
+
+        # Username: remove ALL spaces and invalid characters
+        raw_username = "".join(name_parts).lower()
+        username = re.sub(r"[^a-z0-9._-]", "", raw_username)
 
         # -------------------------------------------------------------
         # 4. Create user in Keycloak

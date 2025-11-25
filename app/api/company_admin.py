@@ -660,7 +660,6 @@ async def delete_folder(
         raise HTTPException(status_code=500, detail=f"Failed to delete folders: {str(e)}")
 
     
-
 # ADD or UPDAT a company role and document folders for the role
 @company_admin_router.post("/roles")
 async def add_or_update_role(
