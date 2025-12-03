@@ -42,6 +42,8 @@ class CompanyReAssignAdmin(BaseModel):
 class CompanyAdminModules(BaseModel):
     modules: List[ModuleConfig]
 
+class AddFoldersPayload(BaseModel):
+    folder_names: List[str]
 
 class CompanyOut(BaseModel):
     id: str 

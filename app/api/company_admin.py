@@ -6,6 +6,7 @@ from app.deps.auth import require_role, get_keycloak_admin, get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload, DeleteDocumentsPayload, DeleteFolderPayload, DeleteRolesPayload, ResetPasswordPayload, CompanyRoleModifyUsers
+from app.models.company_admin_schema import AddFoldersPayload
 from app.api.rag import rag_index_files
 
 logger = logging.getLogger("uvicorn")
@@ -139,48 +140,34 @@ async def get_login_user(
             detail="User does not have a valid company role"
         )
 
-# GET all users belonging to the same company
 @company_admin_router.get("/users")
 async def get_all_users(
     admin_context=Depends(get_admin_company_id),
     db=Depends(get_db)
 ):
     repo = CompanyRepository(db)
-
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
 
-    users_cursor = db.company_users.find({"company_id": company_id, "added_by_admin_id": admin_id})
+    try:
+        users = await repo.get_all_users_created_by_admin_id(company_id, admin_id)
+        
+        return {
+            "company_id": company_id,
+            "members": users,
+            "total": len(users)
+        }
 
-    users = []
-    async for usr in users_cursor:
-        users.append({
-            "id": usr.get("user_id"),
-            "name": usr.get("name"),
-            "email": usr.get("email"),
-            "roles": usr.get("assigned_roles")
-        })
+    except Exception as e:
+        logger.exception("Failed to get users")
+        raise HTTPException(status_code=500, detail=f"Failed to get users: {str(e)}")
 
-    # Combine both lists
-    combined = users
-
-    return {"company_id": company_id, "members": combined}
-
-# Get all documents uploaded by the admin (grouped by role/folder)
 @company_admin_router.get("/documents", summary="Get all uploaded documents by admin")
 async def get_admin_uploaded_documents(
     admin_context=Depends(get_admin_company_id),
     db=Depends(get_db)
 ):
-    """
-    Retrieve all documents uploaded by the current admin, grouped by role and folder.
     
-    This endpoint returns a structured view showing:
-      - Roles (e.g., role_A, role_B)
-      - Folders under each role
-      - Documents within each folder
-      - Users (by role) that the documents are assigned to
-    """
     company_id: str = admin_context["company_id"]
     admin_id: str = admin_context["admin_id"]
 
@@ -195,7 +182,6 @@ async def get_admin_uploaded_documents(
         "data": result
     }
 
-# Get all private documents uploaded by this current logged in user
 @company_admin_router.get("/documents/private")
 async def get_admin_uploaded_documents(
     user=Depends(get_current_user),
@@ -213,7 +199,6 @@ async def get_admin_uploaded_documents(
     }
 
 
-# ADD new user (with email + company_role)
 @company_admin_router.post("/users")
 async def add_user(
     payload: CompanyUserCreate,
@@ -225,16 +210,12 @@ async def add_user(
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
 
-    # Step 4: Create new user
     try:
-        # ✅ Step 4: If company_role is "company_admin", create admin instead of user
         if payload.company_role == "company_admin":
-            # Name is optional, fallback to email prefix if missing
             name = getattr(payload, "name", None) or payload.email.split("@")[0]
-            new_admin = await repo.add_admin(company_id, name, payload.email)
+            new_admin = await repo.add_admin(company_id, admin_id, name, payload.email)
             return {"status": "admin_created", "user": new_admin}
         else:
-            # Default: add as regular company user
             new_user = await repo.add_user_by_admin(company_id, admin_id, payload.email, payload.company_role, payload.assigned_role)
             return {"status": "user_created", "user": new_user}
 
@@ -363,7 +344,6 @@ async def reset_user_password(
         )
 
 
-# UPDATE user (when the user registers and sets their name)
 @company_admin_router.put("/users/{user_id}")
 async def update_user(
     user_id: str,
@@ -374,13 +354,15 @@ async def update_user(
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
 
-    updated = await repo.update_user(company_id, user_id, payload.name, payload.email, payload.assigned_roles)
+    user_type = payload.user_type
+
+    updated = await repo.update_user(company_id, user_id, user_type, payload.name, payload.email, payload.assigned_roles)
     if not updated:
         raise HTTPException(status_code=404, detail="User not found or not in your company")
 
     return {"success": True, "user_id": user_id, "new_name": payload.name, "assigned_roles": payload.assigned_roles,}
 
-# DELETE user
+
 @company_admin_router.delete("/users")
 async def delete_user(
     user_ids: str = Query(..., description="Comma-separated list of user IDs"),
@@ -396,7 +378,6 @@ async def delete_user(
     deleted_count = 0
 
     for user_id in user_ids_list:
-        # 1) Get user from MongoDB to retrieve email (for Keycloak deletion)
         user = await db.company_users.find_one({
             "company_id": company_id,
             "user_id": user_id
@@ -407,7 +388,6 @@ async def delete_user(
         if user and user.get("email"):
             email = user["email"]
             try:
-                # 2) Find user in Keycloak (by email)
                 kc_users = kc.get_users(query={"email": email})
                 if kc_users:
                     keycloak_user_id = kc_users[0]["id"]
@@ -416,7 +396,6 @@ async def delete_user(
             except Exception as e:
                 logger.error(f"Failed Keycloak deletion for {email}: {str(e)}")
 
-    # 3) Delete users from MongoDB using repository (includes role count updates)
     deleted_count = await repo.delete_users(company_id, user_ids_list, admin_id)
 
     if deleted_count == 0:
@@ -428,7 +407,6 @@ async def delete_user(
         "deleted_user_ids": user_ids_list
     }
 
-# DELETE role from users
 @company_admin_router.post("/users/role/delete")
 async def delete_role_from_user(
     payload: CompanyRoleModifyUsers,
@@ -516,7 +494,6 @@ async def add_role_to_users(
         raise HTTPException(status_code=500, detail="Could not add role to users.")
 
 
-# GET Company stats
 @company_admin_router.get("/stats")
 async def get_company_stats(
     admin_context=Depends(get_admin_company_id),
@@ -559,7 +536,6 @@ async def get_company_stats(
     }
 
 
-# DELETE documents
 @company_admin_router.post("/documents/delete")
 async def delete_documents(
     payload: DeleteDocumentsPayload,
@@ -625,6 +601,68 @@ async def delete_documents(
         logger.exception("Failed to delete documents")
         raise HTTPException(status_code=500, detail=f"Failed to delete documents: {str(e)}")
 
+@company_admin_router.post("/folders")
+async def add_folders(
+    payload: AddFoldersPayload, 
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    try:
+        result = await repo.add_folders(
+            company_id=company_id,
+            admin_id=admin_id,
+            folder_names=payload.folder_names
+        )
+
+        return {
+            "success": result["success"],
+            "message": result["message"],
+            "added_folders": result["added_folders"],
+            "duplicated_folders": result["duplicated_folders"],
+            "total_added": result["total_added"],
+            "total_duplicates": result["total_duplicates"]
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.exception("Failed to add folders")
+        raise HTTPException(status_code=500, detail=f"Failed to add folders: {str(e)}")
+
+@company_admin_router.get("/folders")
+async def get_folders(
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    try:
+        # Call the repository method
+        result = await repo.get_folders(
+            company_id=company_id,
+            admin_id=admin_id,
+        )
+
+        # Return the complete result from the repository
+        return {
+            "success": result["success"],
+            "folders": result["folders"],
+        }
+
+    except HTTPException:
+        # Directly rethrow known user-facing exceptions
+        raise
+
+    except Exception as e:
+        logger.exception("Failed to get folders")
+        raise HTTPException(status_code=500, detail=f"Failed to get folders: {str(e)}")
 
 @company_admin_router.post("/folders/delete")
 async def delete_folder(
@@ -660,7 +698,6 @@ async def delete_folder(
         raise HTTPException(status_code=500, detail=f"Failed to delete folders: {str(e)}")
 
     
-# ADD or UPDAT a company role and document folders for the role
 @company_admin_router.post("/roles")
 async def add_or_update_role(
     payload: CompanyRoleCreate,
@@ -670,9 +707,10 @@ async def add_or_update_role(
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
+    action = payload.action
 
     try:
-        result = await repo.add_or_update_role(company_id, admin_id, payload.role_name, payload.folders, payload.modules)
+        result = await repo.add_or_update_role(company_id, admin_id, payload.role_name, payload.folders, payload.modules, action)
         return result
     except Exception as e:
         logger.exception("Failed to add or update role")
@@ -732,28 +770,22 @@ async def assign_role_to_user(
         print("Failed to assign role:", e)
         raise HTTPException(status_code=500, detail="Failed to assign role")
     
-@company_admin_router.post("/roles/upload/{role_name}/{folder_name}")
+@company_admin_router.post("/roles/upload/{folder_name}")
 async def upload_document_for_role(
-    role_name: str,
     folder_name: str,
     file: UploadFile = File(...),
     admin_context=Depends(get_admin_company_id),
     db=Depends(get_db)
 ):
-    """
-    Upload a document for a given company role and folder.
-    Stores the file under /app/uploads/documents/roleBased/{company_id}/{admin_id}/{role_name}/{folder_name}/.
-    Also registers it in the DB.
-    """
+
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
 
     try:
-        result = await repo.upload_document_for_role(
+        result = await repo.upload_document_for_folder(
             company_id=company_id,
             admin_id=admin_id,
-            role_name=role_name,
             folder_name=folder_name,
             file=file
         )
@@ -771,7 +803,6 @@ async def upload_document_for_role(
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Target folder not found for this role")
     except HTTPException:
-        # Allow intentional HTTP errors (like 409 Conflict) to pass through
         raise
     except Exception as e:
         logger.exception("Failed to upload document for role")

@@ -50,6 +50,7 @@ class CompanyRepository:
         self.users = db.company_users
         self.roles = db.company_roles
         self.documents = db.documents
+        self.folders = db.company_folders
 
     async def get_admins_by_company(self, company_id: str):
         return await self.admins.find({"company_id": company_id}).to_list(None)
@@ -92,7 +93,6 @@ class CompanyRepository:
         async for company in companies_cursor:
             company_id = company["company_id"]
 
-            # Fetch admins
             admins_cursor = self.admins.find({"company_id": company_id})
             admins = []
             async for admin in admins_cursor:
@@ -113,7 +113,6 @@ class CompanyRepository:
                     "documents": documents,
                 })
 
-            # Fetch users
             users_cursor = self.users.find({"company_id": company_id})
             users = []
             async for user in users_cursor:
@@ -150,7 +149,7 @@ class CompanyRepository:
 
 
     # ---------------- Admins ---------------- #
-    async def add_admin(self, company_id: str, name: str, email: str, modules: Optional[dict] = None):
+    async def add_admin(self, company_id: str, admin_id: str, name: str, email: str, modules: Optional[dict] = None):
         if await self.admins.find_one({"company_id": company_id, "email": email}):
             raise ValueError("Admin with this email already exists")
 
@@ -165,6 +164,7 @@ class CompanyRepository:
             "user_id": str(uuid.uuid4()),
             "name": name,
             "email": email,
+            "added_by_admin_id": admin_id,
             "modules": admin_modules,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
@@ -177,7 +177,7 @@ class CompanyRepository:
             "name": admin_doc["name"],
             "email": admin_doc["email"],
             "modules": serialize_modules(admin_doc["modules"]),
-            "documents": [],  # empty until uploaded
+            "documents": [], 
         }
 
     async def reassign_admin(self, company_id: str, admin_id: str, name: str, email: str):
@@ -297,81 +297,94 @@ class CompanyRepository:
 
         return result
 
+
     async def get_admin_documents(self, company_id: str, admin_id: str):
-        """
-        Get all documents uploaded by the admin, grouped by role and folder,
-        including which users (by role) have access.
-        """
-        # --- Step 1: Fetch all admin documents ---
-        docs_cursor = self.documents.find({
-            "company_id": company_id,
-            "user_id": admin_id
-        })
-        docs = await docs_cursor.to_list(None)
-
-        # Return empty dict if no documents found instead of raising exception
-        if not docs:
-            return {}
-
-        result = defaultdict(lambda: {"folders": []})
-
-        # --- Step 2: Group documents by upload_type (role name) ---
-        for doc in docs:
-            upload_type = doc.get("upload_type")
-            path = doc.get("path", "")
-            file_name = doc.get("file_name")
-
-            # Skip invalid documents
-            if not upload_type or upload_type == "document":
-                continue
-
-            # Try to extract folder name relative to the upload_type
-            folder_name = "Uncategorized"
-            try:
-                parts = path.split(f"/{upload_type}/")[1].split("/")
-                if len(parts) > 1:
-                    folder_name = os.path.join(*parts[:-1])
-            except Exception:
-                pass
-
-            # Find or create folder entry
-            folder_entry = next(
-                (f for f in result[upload_type]["folders"] if f["name"] == folder_name),
-                None
-            )
-            if not folder_entry:
-                folder_entry = {"name": folder_name, "documents": []}
-                result[upload_type]["folders"].append(folder_entry)
-
-            folder_entry["documents"].append({
-                "file_name": file_name,
-                "path": path,
-                "uploaded_at": doc.get("uploaded_at") or doc.get("created_at"),
-                "assigned_to": []
+        try:
+            roles_cursor = self.roles.find({
+                "company_id": company_id,
+                "added_by_admin_id": admin_id
             })
-
-        # --- Step 3: Find all users who belong to any of these roles ---
-        role_names = list(result.keys())
-        if role_names:  # Only query users if we have roles with documents
+            roles = await roles_cursor.to_list(None)
+            
+            if not roles:
+                return {}
+            
+            folders_cursor = self.folders.find({
+                "company_id": company_id,
+                "admin_id": admin_id
+            })
+            all_folders = await folders_cursor.to_list(None)
+            folder_names = [folder["name"] for folder in all_folders]
+            
+            if not folder_names:
+                return {}
+            
+            docs_cursor = self.documents.find({
+                "company_id": company_id,
+                "user_id": admin_id,
+                "upload_type": {"$in": folder_names}
+            })
+            documents = await docs_cursor.to_list(None)
+            
             users_cursor = self.users.find({
                 "company_id": company_id,
-                "assigned_roles": {"$in": role_names}
+                "added_by_admin_id": admin_id
             })
             users = await users_cursor.to_list(None)
-
-            # --- Step 4: Map users to roles ---
+            
+            role_folders_map = defaultdict(set)
+            for role in roles:
+                role_name = role["name"]
+                for folder_name in role.get("folders", []):
+                    role_folders_map[role_name].add(folder_name)
+            
+            folder_docs_map = defaultdict(list)
+            for doc in documents:
+                folder_name = doc.get("upload_type")
+                if folder_name in folder_names:
+                    folder_docs_map[folder_name].append({
+                        "file_name": doc.get("file_name"),
+                        "path": doc.get("path", ""),
+                        "uploaded_at": doc.get("uploaded_at") or doc.get("created_at"),
+                        "_id": str(doc.get("_id", ""))
+                    })
+            
+            role_users_map = defaultdict(list)
             for user in users:
-                user_id = user.get("user_id")
-                user_name = user.get("name")
-                user_email = user.get('email')
-                for role in user.get("assigned_roles", []):
-                    if role in result:
-                        for folder in result[role]["folders"]:
-                            for doc_entry in folder["documents"]:
-                                doc_entry["assigned_to"].append({"name": user_name, "email": user_email})
+                for role_name in user.get("assigned_roles", []):
+                    user_info = {
+                        "name": user.get("name", ""),
+                        "email": user.get("email", "")
+                    }
+                    if user_info not in role_users_map[role_name]:
+                        role_users_map[role_name].append(user_info)
+            
+            result = {}
+            for role in roles:
+                role_name = role["name"]
+                role_data = {"folders": []}
+                
+                for folder_name in role_folders_map[role_name]:
+                    folder_docs = folder_docs_map.get(folder_name, [])
+                    
+                    for doc in folder_docs:
+                        doc["assigned_to"] = role_users_map.get(role_name, [])
+                    
+                    folder_entry = {
+                        "name": folder_name,
+                        "documents": folder_docs
+                    }
+                    role_data["folders"].append(folder_entry)
+                
+                if role_data["folders"]:
+                    result[role_name] = role_data
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error in get_admin_documents: {str(e)}")
+            return {}
 
-        # --- Step 5: Return structured response ---
-        return dict(result)
 
     async def delete_private_documents(
         self,
@@ -435,33 +448,29 @@ class CompanyRepository:
 
         for doc_info in documents_to_delete:
             file_name = doc_info.get("fileName")
-            role_name = doc_info.get("role")
+            folder_name = doc_info.get("folderName")
             path = doc_info.get("path")
 
-            if not file_name or not role_name:
-                continue  # Skip invalid entries
+            if not file_name or not folder_name:
+                continue  
 
             try:
-                # Build query to find the document
                 query = {
                     "company_id": company_id,
                     "user_id": admin_id,
                     "file_name": file_name,
-                    "upload_type": role_name
+                    "upload_type": folder_name
                 }
 
-                # If path is provided, use it for more precise matching
                 if path:
                     query["path"] = path
 
-                # Find the document to get its path for file deletion
                 document = await self.documents.find_one(query)
                 if not document:
                     continue
 
                 file_path = document.get("path")
 
-                # Delete the physical file
                 if file_path and os.path.exists(file_path):
                     try:
                         os.remove(file_path)
@@ -469,22 +478,87 @@ class CompanyRepository:
                     except Exception as e:
                         logger.warning(f"Failed to delete physical file {file_path}: {str(e)}")
 
-                # Delete the database record
                 delete_result = await self.documents.delete_one({"_id": document["_id"]})
                 if delete_result.deleted_count > 0:
                     deleted_count += 1
 
-                    # Decrement document count for the role
-                    await self.roles.update_one(
-                        {"company_id": company_id, "name": role_name},
+                    await self.folders.update_one(
+                        {"company_id": company_id, 'admin_id': admin_id, "name": folder_name},
                         {"$inc": {"document_count": -1}}
                     )
 
             except Exception as e:
-                logger.error(f"Error deleting document {file_name} for role {role_name}: {str(e)}")
+                logger.error(f"Error deleting document {file_name} for folder {folder_name}: {str(e)}")
                 continue
 
         return deleted_count
+
+    async def get_folders(
+        self,
+        company_id: str,
+        admin_id: str
+    ) -> dict:
+        # Get existing folders for this company
+        existing_folders = await self.folders.find(
+            {"company_id": company_id, "admin_id": admin_id}
+        ).to_list(length=None)
+
+        # Extract just the folder names
+        folder_names = [folder.get("name", "") for folder in existing_folders]
+
+        return {
+            "success": True,
+            "folders": folder_names,
+            "total": len(folder_names)
+        }
+
+    async def add_folders(
+        self,
+        company_id: str,
+        admin_id: str,
+        folder_names: List[str]
+    ) -> dict:
+        existing_folders = await self.folders.find(
+            {"company_id": company_id, "admin_id": admin_id}
+        ).to_list(length=None)
+        
+        existing_names = {folder["name"].lower() for folder in existing_folders}
+        
+        duplicated = []
+        new_folders = []
+        
+        for folder_name in folder_names:
+            normalized_name = folder_name.lower()
+            if normalized_name in existing_names:
+                duplicated.append(folder_name)
+            else:
+                new_folders.append(folder_name)
+        
+        if new_folders:
+            folder_documents = []
+            for folder_name in new_folders:
+                folder_doc = {
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "name": folder_name.strip(),
+                    "document_count": 0,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                    "status": "active"
+                }
+                folder_documents.append(folder_doc)
+            
+            if folder_documents:
+                await self.folders.insert_many(folder_documents)
+        
+        return {
+            "success": True,
+            "message": "Folders processed successfully",
+            "added_folders": new_folders,
+            "duplicated_folders": duplicated,
+            "total_added": len(new_folders),
+            "total_duplicates": len(duplicated)
+        }
 
     async def delete_folders(
         self,
@@ -996,13 +1070,77 @@ class CompanyRepository:
             print(f"DEBUG: Error in delete_users_by_admin: {e}")
             return 0
 
+    async def get_all_users_created_by_admin_id(
+        self,
+        company_id: str,
+        admin_id: str
+    ) -> List[dict]:
+
+        try:
+            users = []
+            
+            users_cursor = self.users.find({
+                "company_id": company_id, 
+                "added_by_admin_id": admin_id
+            })
+            
+            async for usr in users_cursor:
+                user_name = usr.get("name")
+                user_email = usr.get("email")
+                users.append({
+                    "id": usr.get("user_id"),
+                    "name": user_name if user_name is not None else "",
+                    "email": user_email if user_email is not None else "",
+                    "roles": usr.get("assigned_roles", []),
+                    "type": "user",
+                    "created_at": usr.get("created_at"),
+                    "updated_at": usr.get("updated_at")
+                })
+            
+            admins_cursor = self.admins.find({
+                "company_id": company_id,
+                "added_by_admin_id": admin_id
+            })
+            
+            async for admin in admins_cursor:
+                admin_name = admin.get("name")
+                admin_email = admin.get("email")
+                users.append({
+                    "id": admin.get("user_id"),
+                    "name": admin_name if admin_name is not None else "",
+                    "email": admin_email if admin_email is not None else "",
+                    "roles": ["Beheerder"],  
+                    "type": "admin",
+                    "created_at": admin.get("created_at"),
+                    "updated_at": admin.get("updated_at")
+                })
+            
+            def get_sort_key(user):
+                type_weight = 0 if user.get("type") == "admin" else 1
+                
+                name = user.get("name")
+                email = user.get("email")
+                
+                sort_name = ""
+                if name:
+                    sort_name = name.lower()
+                elif email:
+                    sort_name = email.lower()
+                
+                return (type_weight, sort_name)
+            
+            users.sort(key=get_sort_key)
+            
+            return users
+            
+        except Exception as e:
+            print(f"Error in get_all_users_created_by_admin_id: {str(e)}")
+            return []
+
     # ---------------- Company Roles ---------------- #
-    async def add_or_update_role(self, company_id: str, admin_id: str, role_name: str, folders: list[str], modules: list) -> dict:
-        """
-        Create or update a company role with given subfolders and modules.
-        Ensures folders exist on disk under /app/uploads/documents/roleBased/{company_id}/.
-        Also removes deleted folders and their documents.
-        """
+    async def add_or_update_role(self, company_id: str, admin_id: str, role_name: str, folders: list[str], modules: list, action: str) -> dict:
+        """Add or update a role based on the action parameter."""
+        
         folders = [f.strip("/") for f in folders if f.strip()]
 
         existing_role = await self.roles.find_one({
@@ -1010,86 +1148,40 @@ class CompanyRepository:
             "name": role_name
         })
 
-        # Convert modules from array to dictionary format
+        if action == "create" and existing_role:
+            return {
+                "status": "error",
+                "error_type": "duplicate_role",
+                "message": f"Role '{role_name}' already exists",
+                "company_id": company_id,
+                "role_name": role_name
+            }
+
         modules_dict = None
         if modules is not None:
             if isinstance(modules, list):
-                # Convert array format to dictionary format
-                # From: [{"name": "Documenten chat", "enabled": false}, {"name": "GGD Checks", "enabled": true}]
-                # To: {"Documenten chat": {"enabled": false}, "GGD Checks": {"enabled": true}}
                 modules_dict = {}
                 for module in modules:
                     if isinstance(module, dict):
                         module_name = module.get('name')
                         if module_name:
-                            # Extract only the relevant fields (remove 'name' since it's the key)
                             module_data = {k: v for k, v in module.items() if k != 'name'}
                             modules_dict[module_name] = module_data
-                    elif hasattr(module, 'dict'):  # If it's a Pydantic model
+                    elif hasattr(module, 'dict'):  
                         module_dict = module.dict()
                         module_name = module_dict.get('name')
                         if module_name:
                             module_data = {k: v for k, v in module_dict.items() if k != 'name'}
                             modules_dict[module_name] = module_data
             else:
-                # If it's already a dict, use as is
                 modules_dict = modules
 
-        print(f"DEBUG: Converted modules: {modules_dict}")
-
         if existing_role:
-            # Get current folders to identify which ones were removed
-            current_folders = set(existing_role.get("folders", []))
-            new_folders = set(folders)
-            
-            # Find folders that were removed
-            removed_folders = current_folders - new_folders
-            
-            # Delete documents and folders that were removed
-            for removed_folder in removed_folders:
-                # Delete documents associated with the removed folder
-                folder_path_pattern = os.path.join(
-                    UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name, removed_folder
-                )
-                
-                # Delete database records for documents in the removed folder
-                delete_docs_result = await self.documents.delete_many({
-                    "company_id": company_id,
-                    "user_id": admin_id,
-                    "upload_type": role_name,
-                    "path": {"$regex": f".*{re.escape(removed_folder)}.*"}
-                })
-                
-                # Delete the physical folder and its contents
-                folder_full_path = os.path.join(
-                    UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name, removed_folder
-                )
-                if os.path.exists(folder_full_path):
-                    for root, dirs, files in os.walk(folder_full_path, topdown=False):
-                        for file in files:
-                            try:
-                                os.remove(os.path.join(root, file))
-                            except Exception as e:
-                                logger.warning(f"Failed to delete file {file}: {str(e)}")
-                        for dir in dirs:
-                            try:
-                                os.rmdir(os.path.join(root, dir))
-                            except Exception as e:
-                                logger.warning(f"Failed to delete directory {dir}: {str(e)}")
-                    try:
-                        os.rmdir(folder_full_path)
-                    except Exception as e:
-                        logger.warning(f"Failed to delete folder {folder_full_path}: {str(e)}")
-                
-                logger.info(f"Removed folder '{removed_folder}' and deleted {delete_docs_result.deleted_count} documents")
-
-            # Update the role with the new folder list and modules (complete replacement)
             update_data = {
                 "folders": folders,
                 "updated_at": datetime.utcnow()
             }
             
-            # Add modules to update if provided
             if modules_dict is not None:
                 update_data["modules"] = modules_dict
             
@@ -1101,7 +1193,6 @@ class CompanyRepository:
             updated_folders = folders
             final_modules = modules_dict if modules_dict is not None else existing_role.get("modules", {})
         else:
-            # Create new role with modules
             role_data = {
                 "company_id": company_id,
                 "name": role_name,
@@ -1113,7 +1204,6 @@ class CompanyRepository:
                 "updated_at": datetime.utcnow(),
             }
             
-            # Add modules to new role if provided
             if modules_dict is not None:
                 role_data["modules"] = modules_dict
             
@@ -1122,8 +1212,7 @@ class CompanyRepository:
             status = "role_created"
             final_modules = modules_dict if modules_dict is not None else {}
 
-        # Ensure new folders exist on disk
-        base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
+        base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id)
         for folder in updated_folders:
             full_path = os.path.join(base_path, folder)
             os.makedirs(full_path, exist_ok=True)
@@ -1140,16 +1229,37 @@ class CompanyRepository:
         """List all roles for a given company."""
         cursor = self.roles.find({"company_id": company_id, "added_by_admin_id": admin_id})
         roles = await cursor.to_list(length=None)
-        return [
-            {
+        
+        result = []
+        
+        for r in roles:
+            role_folders = r.get("folders", [])
+            
+            if role_folders:
+                folder_cursor = self.folders.find({
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "name": {"$in": role_folders}
+                })
+                
+                folders_data = await folder_cursor.to_list(length=None)
+                
+                total_document_count = sum(
+                    folder.get("document_count", 0) 
+                    for folder in folders_data
+                )
+            else:
+                total_document_count = 0
+            
+            result.append({
                 "name": r.get("name"),
-                "folders": r.get("folders", []),
+                "folders": role_folders,
                 "user_count": r.get("assigned_user_count", 0),
-                "document_count": r.get("document_count", 0),
+                "document_count": total_document_count,
                 "modules": r.get("modules", [])
-            }
-            for r in roles
-        ]
+            })
+        
+        return result
 
     async def delete_roles(self, company_id: str, role_names: List[str], admin_id: str) -> dict:
         """Delete one or multiple roles by name, remove them from users' assigned_roles, and delete related documents/folders."""
@@ -1266,50 +1376,40 @@ class CompanyRepository:
             "assigned_roles": assigned_roles
         }
 
-    async def upload_document_for_role(
+    async def upload_document_for_folder(
         self,
         company_id: str,
         admin_id: str,
-        role_name: str,
         folder_name: str,
         file: UploadFile
     ) -> dict:
-        """
-        Upload a document under a specific role and folder for the given company admin.
 
-        - Ensures files are stored under: /uploads/documents/roleBased/{company_id}/{admin_id}/{role}/{folder}/
-        - Prevents duplicate uploads (same file name under same role/folder).
-        """
-        # ✅ Validate and sanitize inputs
         file_name = (file.filename or "").strip()
         safe_folder = folder_name.strip("/ ")
 
         if not file_name:
             raise HTTPException(status_code=400, detail="Missing file name")
 
-        # ✅ Build target directory
         base_path = os.path.join(
-            UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name, safe_folder
+            UPLOAD_ROOT, "roleBased", company_id, admin_id, safe_folder
         )
         os.makedirs(base_path, exist_ok=True)
 
         file_path = os.path.join(base_path, file_name)
 
-        # ✅ Check for duplicate before uploading
         existing_doc = await self.documents.find_one({
             "company_id": company_id,
             "user_id": admin_id,
-            "upload_type": role_name,
+            "upload_type": safe_folder,
             "path": file_path
         })
 
         if existing_doc:
             raise HTTPException(
                 status_code=409,
-                detail=f"Het document '{file_name}' bestaat al in de map '{safe_folder}' voor rol '{role_name}'."
+                detail=f"Het document '{file_name}' bestaat al in de map '{safe_folder}'."
             )
 
-        # ✅ Save file asynchronously
         try:
             async with aiofiles.open(file_path, "wb") as f:
                 content = await file.read()
@@ -1317,29 +1417,25 @@ class CompanyRepository:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"File save failed: {str(e)}")
 
-        # ✅ Prepare metadata for DB
         doc_record = {
             "company_id": company_id,
             "user_id": admin_id,
             "file_name": file_name,
-            "upload_type": role_name,
+            "upload_type": safe_folder,
             "path": file_path,
             "uploaded_at": datetime.utcnow(),
         }
 
-        # ✅ Insert metadata
         await self.documents.insert_one(doc_record)
 
-        # ✅ Increment document count for this role
-        await self.roles.update_one(
-            {"company_id": company_id, "name": role_name},
+        await self.folders.update_one(
+            {"company_id": company_id, "admin_id": admin_id, "name": safe_folder},
             {"$inc": {"document_count": 1}}
         )
 
         return {
             "success": True,
             "status": "uploaded",
-            "role": role_name,
             "folder": safe_folder,
             "file_name": file_name,
             "path": file_path,
@@ -1498,7 +1594,6 @@ class CompanyRepository:
 
     # ---------------- Shared ---------------- #
     async def get_user_with_documents(self, email: str):
-        # 1️⃣ Find the user (from either collection)
         user = await self.admins.find_one({"email": email})
         user_type = "admin"
         if not user:
@@ -1511,19 +1606,16 @@ class CompanyRepository:
         user_id = user["user_id"]
         company_id = user["company_id"]
 
-        # 2️⃣ Base query — all documents directly owned by the user
         query = {"user_id": user_id}
         owned_docs_cursor = self.documents.find(query)
         owned_docs = [d async for d in owned_docs_cursor]
 
-        # 3️⃣ If company user → also include role-based documents from the admin
         role_based_docs = []
         if user_type == "company_user":
             assigned_roles = user.get("assigned_roles", [])
             added_by_admin_id = user.get("added_by_admin_id")
 
             if assigned_roles and added_by_admin_id:
-                # Fetch documents uploaded by that admin and matching role types
                 role_query = {
                     "user_id": added_by_admin_id,
                     "company_id": company_id,
@@ -1532,7 +1624,6 @@ class CompanyRepository:
                 role_cursor = self.documents.find(role_query)
                 role_based_docs = [d async for d in role_cursor]
 
-        # 4️⃣ Merge and format results
         all_docs = owned_docs + role_based_docs
         formatted_docs = [
             {
@@ -1543,14 +1634,11 @@ class CompanyRepository:
             for doc in all_docs
         ]
 
-        # 5️⃣ Generate pass_ids
         pass_ids = []
         for doc in formatted_docs:
             fn = doc["file_name"]
             upload_type = doc.get("upload_type", "document")
 
-            # If upload_type is "document" → private
-            # Otherwise → role-based (shared)
             if upload_type == "document":
                 pid = f"{user_id}--{fn}"
             else:
@@ -1566,25 +1654,22 @@ class CompanyRepository:
         }
 
     async def add_user_by_admin(self, company_id: str, added_by_admin_id: str, email: str, company_role: str, assigned_role: str):
-        """Company admin creates a user under their company."""
-        # Prevent duplicates
         if await self.users.find_one({"company_id": company_id, "email": email}):
             raise ValueError("User with this email already exists in this company")
 
         user_doc = {
             "user_id": str(uuid.uuid4()),
             "company_id": company_id,
-            "added_by_admin_id": added_by_admin_id,  # tracking who added
+            "added_by_admin_id": added_by_admin_id,  
             "email": email, 
             "company_role": company_role,
             "assigned_roles": [assigned_role],
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
-            "name": None,  # filled later by user
+            "name": None,  
         }
         await self.users.insert_one(user_doc)
 
-        # --- NEW: Increment user count for the assigned role ---
         role = await self.roles.find_one({"name": assigned_role, "company_id": company_id})
         
         await self.roles.update_one(
@@ -1603,54 +1688,80 @@ class CompanyRepository:
             "documents": [],
         }
 
-    async def update_user(self, company_id: str, user_id: str, name: str, email: str, assigned_roles: list[str]) -> bool:
-        """
-        Update user info and adjust assigned_user_count for affected roles.
-        If roles were added or removed, increment/decrement counts accordingly.
-        """
+    async def update_user(
+        self, 
+        company_id: str, 
+        user_id: str, 
+        user_type: str, 
+        name: str, 
+        email: str, 
+        assigned_roles: list[str]
+    ) -> bool:
+        """Update user or admin information."""
         now = datetime.utcnow()
 
-        # Fetch the existing user
-        user_doc = await self.users.find_one({"company_id": company_id, "user_id": user_id})
-        if not user_doc:
-            raise HTTPException(status_code=404, detail="User not found")
+        if user_type == "admin":
+            admin_doc = await self.admins.find_one({
+                "company_id": company_id, 
+                "user_id": user_id
+            })
+            
+            if not admin_doc:
+                raise HTTPException(status_code=404, detail="Admin not found")
 
-        old_roles = set(user_doc.get("assigned_roles", []))
-        new_roles = set(assigned_roles)
+            await self.admins.update_one(
+                {"company_id": company_id, "user_id": user_id},
+                {
+                    "$set": {
+                        "name": name,
+                        "email": email,
+                        "updated_at": now,
+                    }
+                },
+            )
+            
+            return True
 
-        # --- Detect role changes ---
-        added_roles = new_roles - old_roles
-        removed_roles = old_roles - new_roles
+        else:
+            user_doc = await self.users.find_one({
+                "company_id": company_id, 
+                "user_id": user_id
+            })
+            
+            if not user_doc:
+                raise HTTPException(status_code=404, detail="User not found")
 
-        # --- Update user document ---
-        await self.users.update_one(
-            {"company_id": company_id, "user_id": user_id},
-            {
-                "$set": {
-                    "name": name,
-                    "email": email,
-                    "assigned_roles": list(new_roles),
-                    "updated_at": now,
-                }
-            },
-        )
+            old_roles = set(user_doc.get("assigned_roles", []))
+            new_roles = set(assigned_roles)
 
-        # --- Update assigned_user_count for roles ---
-        # Increment count for newly added roles
-        if added_roles:
-            await self.roles.update_many(
-                {"company_id": company_id, "name": {"$in": list(added_roles)}},
-                {"$inc": {"assigned_user_count": 1}},
+            added_roles = new_roles - old_roles
+            removed_roles = old_roles - new_roles
+
+            await self.users.update_one(
+                {"company_id": company_id, "user_id": user_id},
+                {
+                    "$set": {
+                        "name": name,
+                        "email": email,
+                        "assigned_roles": list(new_roles),
+                        "updated_at": now,
+                    }
+                },
             )
 
-        # Decrement count for removed roles
-        if removed_roles:
-            await self.roles.update_many(
-                {"company_id": company_id, "name": {"$in": list(removed_roles)}},
-                {"$inc": {"assigned_user_count": -1}},
-            )
+            if added_roles:
+                await self.roles.update_many(
+                    {"company_id": company_id, "name": {"$in": list(added_roles)}},
+                    {"$inc": {"assigned_user_count": 1}},
+                )
 
-        return True
+            if removed_roles:
+                await self.roles.update_many(
+                    {"company_id": company_id, "name": {"$in": list(removed_roles)}},
+                    {"$inc": {"assigned_user_count": -1}},
+                )
+
+            return True
 
     # ---------------- Debug / Inspection ---------------- #
     async def get_all_collections_data(self) -> dict:
@@ -1660,8 +1771,8 @@ class CompanyRepository:
         users = await self.users.find().to_list(None)
         documents = await self.documents.find().to_list(None)
         roles = await self.roles.find().to_list(None)
+        folders = await self.folders.find().to_list(None)
 
-        # Convert ObjectId and datetime objects to strings for JSON safety
         def serialize(obj):
             if isinstance(obj, datetime):
                 return obj.isoformat()
@@ -1676,14 +1787,15 @@ class CompanyRepository:
             "company_admins": serialize(admins),
             "company_users": serialize(users),
             "documents": serialize(documents),
-            "roles": serialize(roles)
+            "roles": serialize(roles),
+            "folders": serialize(folders)
         }
 
     async def clear_all_data(self) -> dict:
-        """⚠️ DANGER: Delete all data in all collections."""
         await self.companies.delete_many({})
         await self.admins.delete_many({})
         await self.users.delete_many({})
         await self.documents.delete_many({})    
         await self.roles.delete_many({})
+        await self.folders.delete_many({})
         return {"status": "All collections cleared"}

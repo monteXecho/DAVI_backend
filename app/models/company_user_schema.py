@@ -17,11 +17,13 @@ class CompanyUserUpdate(BaseModel):
     name: Optional[str] = ""  
     email: EmailStr           
     assigned_roles: List[str] = Field(default_factory=list)
+    user_type: str
 
 class CompanyRoleCreate(BaseModel):
     role_name: str = Field(..., example="role_a")
     folders: List[str] = Field(..., example=["bkr", "vgc/kkr", "uur/trc"])
     modules: List[ModuleConfig]
+    action: str
     
 class AssignRolePayload(BaseModel):
     user_id: str
