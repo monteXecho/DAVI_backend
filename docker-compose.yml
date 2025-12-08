@@ -3,8 +3,14 @@ services:
     build: .
     container_name: fastapi_app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    ports:
-      - "8000:8000"
+
+    # IMPORTANT: use host network instead of Docker bridge
+    network_mode: "host"
+
+    # When using host network, DO NOT publish ports
+    # ports:
+    #   - "8000:8000"
+
     volumes:
       - ./app:/code/app
       - ./requirements.txt:/code/requirements.txt
@@ -13,19 +19,27 @@ services:
       - ./output:/code/output
       - /var/opt/DAVI_backend/output/highlighted:/code/output/highlighted
 
+    restart: unless-stopped
     depends_on:
       - mongodb
+
     environment:
-      - MONGO_URI=mongodb://mongodb:27017/davi_db
+      # CHANGED: connect to MongoDB via localhost (host network)
+      - MONGO_URI=mongodb://localhost:27017/davi_db
       - DB_NAME=davi_db
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+
+    # extra_hosts is no longer needed for this purpose, you can keep or remove
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
 
   mongodb:
     image: mongo:6.0
     container_name: davi_mongodb
     restart: always
-    # ports:
-    #   - "27017:27017"
+
+    # Expose MongoDB to host so the app (now on host network) can reach it
+    ports:
+      - "27017:27017"
+
     volumes:
       - ./mongo-data:/data/db

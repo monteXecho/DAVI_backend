@@ -51,6 +51,7 @@ class CompanyRepository:
         self.roles = db.company_roles
         self.documents = db.documents
         self.folders = db.company_folders
+        self.guest_access = db.company_guest_access
 
     async def get_admins_by_company(self, company_id: str):
         return await self.admins.find({"company_id": company_id}).to_list(None)
@@ -1145,6 +1146,7 @@ class CompanyRepository:
 
         existing_role = await self.roles.find_one({
             "company_id": company_id,
+            "added_by_admin_id": admin_id,
             "name": role_name
         })
 
@@ -1653,8 +1655,26 @@ class CompanyRepository:
             "pass_ids": pass_ids,
         }
 
+    async def get_admin_with_documents_by_id(
+        self,
+        company_id: str,
+        admin_user_id: str,
+    ):
+        """
+        Returns the same structure as get_user_with_documents, but for a known admin user_id.
+        """
+        admin = await self.admins.find_one(
+            {"company_id": company_id, "user_id": admin_user_id}
+        )
+        if not admin:
+            return None
+
+        email = admin["email"]
+        return await self.get_user_with_documents(email)
+
+
     async def add_user_by_admin(self, company_id: str, added_by_admin_id: str, email: str, company_role: str, assigned_role: str):
-        if await self.users.find_one({"company_id": company_id, "email": email}):
+        if await self.users.find_one({"company_id": company_id, "added_by_admin_id": added_by_admin_id, "email": email}):
             raise ValueError("User with this email already exists in this company")
 
         user_doc = {
@@ -1687,6 +1707,49 @@ class CompanyRepository:
             "name": None,
             "documents": [],
         }
+
+    async def assign_teamlid_permissions(self, company_id: str, admin_id: str, email: str, permissions: dict) -> bool:
+        current_admin = await self.admins.find_one({
+            "company_id": company_id,
+            "user_id": admin_id
+        })  
+
+        current_admin_name = current_admin.get("name", "Een beheerder")
+
+        target_in_admins = await self.admins.find_one({
+            "company_id": company_id,
+            "email": email
+        })
+
+        target_in_users = await self.users.find_one({
+            "company_id": company_id,
+            "email": email
+        })
+
+        target_user = target_in_admins or target_in_users
+        if not target_user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        target_collection = self.admins if target_in_admins else self.users
+
+        update_result = await target_collection.update_one(
+            {"company_id": company_id, "email": email},
+            {
+                "$set": {
+                    "is_teamlid": True,
+                    "teamlid_permissions": permissions,
+                    "assigned_teamlid_by_id": admin_id,
+                    "assigned_teamlid_by_name": current_admin_name,
+                    "assigned_teamlid_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+
+        if update_result.modified_count == 0:
+            raise HTTPException(status_code=500, detail="Failed to update user")
+
+        return True
 
     async def update_user(
         self, 
@@ -1762,6 +1825,97 @@ class CompanyRepository:
                 )
 
             return True
+
+    # ---------------- Guest Access ---------------- #
+    async def upsert_guest_access(
+        self,
+        company_id: str,
+        owner_admin_id: str,
+        guest_user_id: str,
+        can_role_write: bool,
+        can_user_read: bool,
+        can_document_read: bool,
+        can_folder_write: bool,
+        created_by: str,
+    ) -> dict:
+        """
+        Create or update guest access for a given (owner_admin, guest_user) pair.
+        """
+        now = datetime.utcnow()
+        doc = {
+            "company_id": company_id,
+            "owner_admin_id": owner_admin_id,
+            "guest_user_id": guest_user_id,
+            "can_role_write": can_role_write,
+            "can_user_read": can_user_read,
+            "can_document_read": can_document_read,
+            "can_folder_write": can_folder_write,
+            "is_active": True,
+            "updated_at": now,
+            "created_by": created_by,
+        }
+
+        await self.guest_access.update_one(
+            {
+                "company_id": company_id,
+                "owner_admin_id": owner_admin_id,
+                "guest_user_id": guest_user_id,
+            },
+            {
+                "$set": doc,
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+        return doc
+
+    async def list_guest_workspaces_for_user(
+        self,
+        company_id: str,
+        guest_user_id: str,
+    ) -> list[dict]:
+        """
+        Return all active guest-access entries for given user in a company.
+        """
+        cursor = self.guest_access.find(
+            {
+                "company_id": company_id,
+                "guest_user_id": guest_user_id,
+                "is_active": True,
+            }
+        )
+        return [doc async for doc in cursor]
+
+    async def get_guest_access(
+        self,
+        company_id: str,
+        guest_user_id: str,
+        owner_admin_id: str,
+    ) -> Optional[dict]:
+        return await self.guest_access.find_one(
+            {
+                "company_id": company_id,
+                "guest_user_id": guest_user_id,
+                "owner_admin_id": owner_admin_id,
+                "is_active": True,
+            }
+        )
+
+    async def disable_guest_access(
+        self,
+        company_id: str,
+        owner_admin_id: str,
+        guest_user_id: str,
+    ) -> int:
+        res = await self.guest_access.update_one(
+            {
+                "company_id": company_id,
+                "owner_admin_id": owner_admin_id,
+                "guest_user_id": guest_user_id,
+            },
+            {"$set": {"is_active": False, "updated_at": datetime.utcnow()}},
+        )
+        return res.modified_count
 
     # ---------------- Debug / Inspection ---------------- #
     async def get_all_collections_data(self) -> dict:

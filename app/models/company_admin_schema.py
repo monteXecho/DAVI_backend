@@ -49,3 +49,23 @@ class CompanyOut(BaseModel):
     id: str 
     name: str
     admins: List[CompanyAdmin]
+
+class GuestAccessPayload(BaseModel):
+    guest_user_id: str
+    can_role_write: bool = False
+    can_user_read: bool = True
+    can_document_read: bool = True
+    can_folder_write: bool = False
+
+
+class GuestWorkspacePermissions(BaseModel):
+    role_write: bool = False
+    user_read: bool = False
+    document_read: bool = False
+    folder_write: bool = False
+
+
+class GuestWorkspaceOut(BaseModel):
+    ownerId: str
+    label: str
+    permissions: Optional[GuestWorkspacePermissions] = None

@@ -5,9 +5,13 @@ from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, 
 from app.deps.auth import require_role, get_keycloak_admin, get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
-from app.models.company_user_schema import CompanyUserCreate, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload, DeleteDocumentsPayload, DeleteFolderPayload, DeleteRolesPayload, ResetPasswordPayload, CompanyRoleModifyUsers
-from app.models.company_admin_schema import AddFoldersPayload
-from app.api.rag import rag_index_files
+from app.models.company_user_schema import CompanyUserCreate, TeamlidPermissionAssign, CompanyUserUpdate, CompanyRoleCreate, AssignRolePayload, DeleteDocumentsPayload, DeleteFolderPayload, DeleteRolesPayload, ResetPasswordPayload, CompanyRoleModifyUsers
+from app.models.company_admin_schema import (
+    AddFoldersPayload,
+    GuestAccessPayload,
+    GuestWorkspaceOut,
+)
+from app.api.rag import rag_index_filesf
 
 logger = logging.getLogger("uvicorn")
 KEYCLOAK_HOST = os.getenv("KEYCLOAK_HOST", "host.docker.internal")
@@ -19,10 +23,7 @@ async def get_admin_company_id(
     user=Depends(require_role("company_admin")),
     db=Depends(get_db)
 ):
-    """
-    Extract and validate the authenticated admin's company_id.
-    Ensures the admin exists in both Keycloak and backend DB.
-    """
+
     repo = CompanyRepository(db)
 
     admin_email = user.get("email")
@@ -46,22 +47,140 @@ async def get_admin_company_id(
         "admin_email": admin_email
     }
 
+@company_admin_router.post("/guest-access", status_code=201)
+async def create_or_update_guest_access(
+    payload: GuestAccessPayload,
+    ctx=Depends(get_admin_company_id),   # existing helper that enforces company_admin
+    db=Depends(get_db),
+):
+    """
+    Grant or update guest access for this admin's workspace.
+    """
+    repo = CompanyRepository(db)
+
+    company_id = ctx["company_id"]
+    owner_admin_id = ctx["admin_id"]
+
+    # Validate that guest user exists in this company (either admin or user)
+    guest_user = await db.company_users.find_one(
+        {"company_id": company_id, "user_id": payload.guest_user_id}
+    )
+    if not guest_user:
+        guest_user = await db.company_admins.find_one(
+            {"company_id": company_id, "user_id": payload.guest_user_id}
+        )
+
+    if not guest_user:
+        raise HTTPException(status_code=404, detail="Guest user not found in this company")
+
+    doc = await repo.upsert_guest_access(
+        company_id=company_id,
+        owner_admin_id=owner_admin_id,
+        guest_user_id=payload.guest_user_id,
+        can_role_write=payload.can_role_write,
+        can_user_read=payload.can_user_read,
+        can_document_read=payload.can_document_read,
+        can_folder_write=payload.can_folder_write,
+        created_by=owner_admin_id,
+    )
+
+    return {"ok": True, "guest_access": doc}
+
+@company_admin_router.get("/guest-workspaces")
+async def get_guest_workspaces(
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """
+    Return workspaces (self + guest-of-others) available for current user.
+    Works for company_admin and company_user.
+    """
+    email = user.get("email")
+    roles = user.get("realm_access", {}).get("roles", [])
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Missing email in token")
+
+    base_user = None
+    user_type = None
+
+    if "company_admin" in roles:
+        base_user = await db.company_admins.find_one({"email": email})
+        user_type = "company_admin"
+    elif "company_user" in roles:
+        base_user = await db.company_users.find_one({"email": email})
+        user_type = "company_user"
+    else:
+        raise HTTPException(status_code=403, detail="Unsupported role")
+
+    if not base_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    company_id = base_user["company_id"]
+    user_id = base_user["user_id"]
+
+    repo = CompanyRepository(db)
+    guest_entries = await repo.list_guest_workspaces_for_user(
+        company_id=company_id,
+        guest_user_id=user_id,
+    )
+
+    # Self workspace: for admins, it's their own; for users, it's their normal admin workspace.
+    if user_type == "company_admin":
+        self_owner_id = base_user["user_id"]
+        self_label = "My admin workspace"
+    else:
+        self_owner_id = base_user.get("added_by_admin_id", base_user["user_id"])
+        self_label = "My workspace"
+
+    response = {
+        "self": {
+            "ownerId": self_owner_id,
+            "label": self_label,
+            # permissions for self are not needed (backend already enforces)
+            "permissions": None,
+        },
+        "guestOf": [],
+    }
+
+    for entry in guest_entries:
+        owner_admin = await db.company_admins.find_one(
+            {
+                "company_id": company_id,
+                "user_id": entry["owner_admin_id"],
+            }
+        )
+        if not owner_admin:
+            continue
+
+        response["guestOf"].append(
+            {
+                "ownerId": entry["owner_admin_id"],
+                "label": owner_admin.get("name") or owner_admin.get("email"),
+                "permissions": {
+                    "role_write": entry.get("can_role_write", False),
+                    "user_read": entry.get("can_user_read", False),
+                    "document_read": entry.get("can_document_read", False),
+                    "folder_write": entry.get("can_folder_write", False),
+                },
+            }
+        )
+
+    return response
+
+
 @company_admin_router.get("/user")
 async def get_login_user(
     user=Depends(get_current_user),
     db=Depends(get_db)
 ):
-    """
-    Return the currently logged-in user's information.
-    Works for both company_admin and company_user roles.
-    """
+    
     email = user.get("email")
     roles = user.get("realm_access", {}).get("roles", [])
 
     if not email:
         raise HTTPException(status_code=400, detail="Missing email in authentication token")
 
-    # ---------- COMPANY ADMIN ----------
     if "company_admin" in roles:
         admin_record = await db.company_admins.find_one({"email": email})
         if not admin_record:
@@ -73,10 +192,13 @@ async def get_login_user(
             "name": admin_record.get("name"),
             "company_id": admin_record.get("company_id"),
             "user_id": admin_record.get("user_id"),
-            "modules": admin_record.get("modules", {})
+            "modules": admin_record.get("modules", {}),
+            
+            "is_teamlid": admin_record.get("is_teamlid", False),
+            "teamlid_permissions": admin_record.get("teamlid_permissions", {}),
+            "assigned_teamlid_by_name": admin_record.get("assigned_teamlid_by_name", None)
         }
 
-    # ---------- COMPANY USER ----------
     elif "company_user" in roles:
         user_record = await db.company_users.find_one({"email": email})
         if not user_record:
@@ -98,15 +220,18 @@ async def get_login_user(
                 "company_id": company_id,
                 "user_id": user_record.get("user_id"),
                 "roles": assigned_roles,
-                "modules": final_modules
+                "modules": final_modules,
+
+                "is_teamlid": user_record.get("is_teamlid", False),
+                "teamlid_permissions": user_record.get("teamlid_permissions", {}),
+                "assigned_teamlid_by_name": user_record.get("assigned_teamlid_by_name", None)
             }
 
         roles_collection = db.company_roles
-
         user_roles = await roles_collection.find({
             "company_id": company_id,
             "name": {"$in": assigned_roles}
-        }).to_list(length=None)
+        }).to_list(None)
 
         for role in user_roles:
             for module_name, cfg in role.get("modules", {}).items():
@@ -130,10 +255,13 @@ async def get_login_user(
             "company_id": company_id,
             "user_id": user_record.get("user_id"),
             "roles": assigned_roles,
-            "modules": final_modules
+            "modules": final_modules,
+
+            "is_teamlid": user_record.get("is_teamlid", False),
+            "teamlid_permissions": user_record.get("teamlid_permissions", {}),
+            "assigned_teamlid_by_name": user_record.get("assigned_teamlid_by_name", None)
         }
 
-    # ---------- UNKNOWN ROLE ----------
     else:
         raise HTTPException(
             status_code=403,
@@ -224,6 +352,36 @@ async def add_user(
     except Exception as e:
         logger.exception("Failed to add company user/admin")
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+@company_admin_router.post("/users/teamlid")
+async def assign_teamlid_permission(
+    payload: TeamlidPermissionAssign,
+    admin_context=Depends(get_admin_company_id),
+    db=Depends(get_db)
+):
+    repo = CompanyRepository(db)
+
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    await repo.assign_teamlid_permissions(
+        company_id=company_id,
+        admin_id=admin_id,
+        email=payload.email,
+        permissions=payload.team_permissions
+    )
+
+    return {
+        "success": True,
+        "message": "Teamlid permissions assigned successfully",
+        "data": {
+            "email": payload.email,
+            "assigned_by": admin_id,
+            "permissions": payload.team_permissions
+        }
+    }
+
 
 @company_admin_router.post("/users/upload")
 async def upload_users_from_file(

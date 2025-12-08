@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import List
+from typing import Dict, List
 from typing import Optional
 
 class ModuleConfig(BaseModel):
@@ -11,6 +11,10 @@ class CompanyUserCreate(BaseModel):
     email: EmailStr
     company_role: str  
     assigned_role: str
+
+class TeamlidPermissionAssign(BaseModel):
+    email: EmailStr
+    team_permissions: Optional[Dict[str, bool]] = None
 
 class CompanyUserUpdate(BaseModel):
     id: Optional[str] = None  

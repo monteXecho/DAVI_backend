@@ -4,8 +4,9 @@ import asyncio
 import logging
 from typing import List
 
-RAG_INDEX_URL = "http://host.docker.internal:1416/davi_indexing/run"
-RAG_QUERY_URL = "http://host.docker.internal:1416/davi_query/run"
+RAG_INDEX_URL = "http://localhost:1416/davi_indexing/run"
+RAG_QUERY_URL = "http://localhost:1416/davi_query/run"
+
 
 logger = logging.getLogger("uvicorn")
 
@@ -19,7 +20,6 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
     Uses httpx.AsyncClient for non-blocking uploads.
     """
     files = []
-    # ✅ use dict instead of list of tuples
     data = {
         "index_id": company_id,
         "file_ids": [f"{user_id}--{os.path.basename(fp)}" for fp in file_paths],

@@ -105,9 +105,8 @@ async def upload_document(
                 detail=f"Document '{file.filename}' already exists for this user and type.",
             )
 
-        logger.info(f"✅ File '{file.filename}' uploaded by {email} (user_id={user_id}, company_id={company_id})")
+        logger.info(f" File '{file.filename}' uploaded by {email} (user_id={user_id}, company_id={company_id})")
 
-        # Trigger RAG indexing, wrap in try/except so upload still succeeds even if RAG fails
         try:
             await rag_index_files(user_id, [file_path], company_id)
             logger.info(f"RAG indexing triggered for '{file.filename}'")
