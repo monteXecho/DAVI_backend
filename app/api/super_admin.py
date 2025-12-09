@@ -87,8 +87,15 @@ async def add_company_admin(
 ):
     repo = CompanyRepository(db)
     modules = {m.name: m.dict() for m in payload.modules}
+    
+    # Use super_admin's user ID (sub from JWT) as the admin_id who is adding this admin
+    admin_id = user.get("sub", "super_admin")
 
-    result = await repo.add_admin(company_id, payload.name, payload.email, modules)
+    try:
+        result = await repo.add_admin(company_id, admin_id, payload.name, payload.email, modules)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
     if not result:
         raise HTTPException(404, "Company not found")
 
@@ -192,7 +199,8 @@ async def delete_company(
     docs_deleted_total = 0
 
     # 2) Delete ALL roles for this company (simple delete by company_id)
-    roles_deleted = await db.roles.delete_many({"company_id": company_id})
+    roles_delete_result = await db.roles.delete_many({"company_id": company_id})
+    roles_deleted = roles_delete_result.deleted_count
     logger.info(f"Deleted {roles_deleted} roles for company {company_id}")
 
     # 3) Delete role-based documents and folders for the entire company

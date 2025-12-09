@@ -218,14 +218,32 @@ class CompanyRepository:
         }
 
 
-    async def delete_admin(self, company_id: str, user_id: str) -> bool:
-        admin = await self.admins.find_one({"company_id": company_id, "user_id": user_id})
+    async def delete_admin(self, company_id: str, user_id: str, admin_id: str = None) -> bool:
+        """
+        Delete an admin. If admin_id is provided, only deletes if the admin was added by admin_id.
+        """
+        query = {"company_id": company_id, "user_id": user_id}
+        if admin_id:
+            # Only delete if added by this admin
+            query["added_by_admin_id"] = admin_id
+        
+        admin = await self.admins.find_one(query)
         if not admin:
+            if admin_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You can only delete admins that you added."
+                )
             return False
 
         result = await self.admins.delete_one({"company_id": company_id, "user_id": user_id})
         if result.deleted_count > 0:
             await self.documents.delete_many({"user_id": admin["user_id"]})
+            # Also delete any guest_access entries where this admin is the guest
+            await self.guest_access.delete_many({
+                "company_id": company_id,
+                "guest_user_id": user_id
+            })
             return True
         return False
 
@@ -928,27 +946,34 @@ class CompanyRepository:
     async def delete_users(self, company_id: str, user_ids: list[str], admin_id: str = None) -> int:
         """
         Delete users and decrease role user counts.
+        Only deletes users added by the specified admin_id.
         """
         try:
             # 1) First, get all users to be deleted to retrieve their assigned roles
+            # Only get users that were added by this admin
             users_to_delete = await self.users.find({
                 "company_id": company_id,
-                "user_id": {"$in": user_ids}
+                "user_id": {"$in": user_ids},
+                "added_by_admin_id": admin_id  # Only delete users added by this admin
             }).to_list(length=None)
             
             print(f"DEBUG: Found {len(users_to_delete)} users to delete")
 
+            if not users_to_delete:
+                return 0
+
             # 2) Delete users from MongoDB
+            user_ids_to_delete = [u["user_id"] for u in users_to_delete]
             result = await self.users.delete_many({
                 "company_id": company_id,
-                "user_id": {"$in": user_ids}
+                "user_id": {"$in": user_ids_to_delete}
             })
 
             deleted_count = result.deleted_count
             
             if deleted_count > 0:
                 # 3) Delete user documents
-                await self.documents.delete_many({"user_id": {"$in": user_ids}})
+                await self.documents.delete_many({"user_id": {"$in": user_ids_to_delete}})
                 
                 # 4) Update role user counts if admin_id is provided
                 if admin_id and users_to_delete:
@@ -959,6 +984,7 @@ class CompanyRepository:
         except Exception as e:
             logger.error(f"Error in delete_users: {str(e)}")
             raise
+
 
     async def _decrease_role_user_counts(self, company_id: str, admin_id: str, deleted_users: list):
         """
@@ -1076,45 +1102,108 @@ class CompanyRepository:
         company_id: str,
         admin_id: str
     ) -> List[dict]:
-
+        """
+        Get all users and admins that can be managed by this admin:
+        1. Users added by this admin (added_by_admin_id = admin_id)
+        2. Admins added by this admin (added_by_admin_id = admin_id)
+        3. Admins who have teamlid role assigned by this admin (from guest_access where created_by = admin_id)
+        """
         try:
             users = []
+            seen_user_ids = set()  # Track to avoid duplicates
             
+            # 1. Get regular users added by this admin
             users_cursor = self.users.find({
                 "company_id": company_id, 
                 "added_by_admin_id": admin_id
             })
             
             async for usr in users_cursor:
+                user_id = usr.get("user_id")
+                if user_id in seen_user_ids:
+                    continue
+                seen_user_ids.add(user_id)
+                
                 user_name = usr.get("name")
                 user_email = usr.get("email")
                 users.append({
-                    "id": usr.get("user_id"),
+                    "id": user_id,
                     "name": user_name if user_name is not None else "",
                     "email": user_email if user_email is not None else "",
                     "roles": usr.get("assigned_roles", []),
                     "type": "user",
+                    "added_by_admin_id": usr.get("added_by_admin_id"),
                     "created_at": usr.get("created_at"),
                     "updated_at": usr.get("updated_at")
                 })
             
+            # 2. Get admins added by this admin
             admins_cursor = self.admins.find({
                 "company_id": company_id,
                 "added_by_admin_id": admin_id
             })
             
             async for admin in admins_cursor:
+                admin_user_id = admin.get("user_id")
+                if admin_user_id in seen_user_ids:
+                    continue
+                seen_user_ids.add(admin_user_id)
+                
                 admin_name = admin.get("name")
                 admin_email = admin.get("email")
                 users.append({
-                    "id": admin.get("user_id"),
+                    "id": admin_user_id,
                     "name": admin_name if admin_name is not None else "",
                     "email": admin_email if admin_email is not None else "",
                     "roles": ["Beheerder"],  
                     "type": "admin",
+                    "added_by_admin_id": admin.get("added_by_admin_id"),
+                    "is_teamlid": admin.get("is_teamlid", False),
                     "created_at": admin.get("created_at"),
                     "updated_at": admin.get("updated_at")
                 })
+            
+            # 3. Get admins who have teamlid role assigned by this admin
+            # Check guest_access collection where created_by = admin_id
+            teamlid_assignments = self.guest_access.find({
+                "company_id": company_id,
+                "created_by": admin_id,
+                "is_active": True
+            })
+            
+            async for assignment in teamlid_assignments:
+                teamlid_user_id = assignment.get("guest_user_id")
+                if teamlid_user_id in seen_user_ids:
+                    # Already added, but mark as teamlid if not already marked
+                    for user in users:
+                        if user.get("id") == teamlid_user_id:
+                            user["is_teamlid"] = True
+                            user["teamlid_assigned_by"] = admin_id
+                            break
+                    continue
+                
+                # Find the admin record for this teamlid
+                teamlid_admin = await self.admins.find_one({
+                    "company_id": company_id,
+                    "user_id": teamlid_user_id
+                })
+                
+                if teamlid_admin:
+                    seen_user_ids.add(teamlid_user_id)
+                    admin_name = teamlid_admin.get("name")
+                    admin_email = teamlid_admin.get("email")
+                    users.append({
+                        "id": teamlid_user_id,
+                        "name": admin_name if admin_name is not None else "",
+                        "email": admin_email if admin_email is not None else "",
+                        "roles": ["Beheerder"],
+                        "type": "admin",
+                        "added_by_admin_id": teamlid_admin.get("added_by_admin_id"),
+                        "is_teamlid": True,
+                        "teamlid_assigned_by": admin_id,  # This admin assigned the teamlid role
+                        "created_at": teamlid_admin.get("created_at"),
+                        "updated_at": teamlid_admin.get("updated_at")
+                    })
             
             def get_sort_key(user):
                 type_weight = 0 if user.get("type") == "admin" else 1
@@ -1137,6 +1226,77 @@ class CompanyRepository:
         except Exception as e:
             print(f"Error in get_all_users_created_by_admin_id: {str(e)}")
             return []
+
+    async def remove_teamlid_role(
+        self,
+        company_id: str,
+        admin_id: str,  # The admin who wants to remove the teamlid role
+        target_admin_id: str  # The admin whose teamlid role to remove
+    ) -> bool:
+        """
+        Remove teamlid role from an admin.
+        Only the admin who assigned the teamlid role can remove it.
+        """
+        # Check if this admin assigned the teamlid role to the target admin
+        guest_entry = await self.guest_access.find_one({
+            "company_id": company_id,
+            "owner_admin_id": admin_id,  # The workspace owner
+            "guest_user_id": target_admin_id,  # The teamlid
+            "created_by": admin_id,  # Must be created by this admin
+            "is_active": True
+        })
+        
+        if not guest_entry:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only remove teamlid roles that you assigned."
+            )
+        
+        # Deactivate the guest_access entry (soft delete)
+        result = await self.guest_access.update_one(
+            {
+                "company_id": company_id,
+                "owner_admin_id": admin_id,
+                "guest_user_id": target_admin_id,
+            },
+            {
+                "$set": {
+                    "is_active": False,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        # Also update the admin document to remove teamlid status if this was their only teamlid assignment
+        # Check if there are any other active teamlid assignments for this admin
+        other_assignments = await self.guest_access.count_documents({
+            "company_id": company_id,
+            "guest_user_id": target_admin_id,
+            "is_active": True
+        })
+        
+        if other_assignments == 0:
+            # No other teamlid assignments, remove teamlid status from admin document
+            await self.admins.update_one(
+                {
+                    "company_id": company_id,
+                    "user_id": target_admin_id
+                },
+                {
+                    "$set": {
+                        "is_teamlid": False,
+                        "updated_at": datetime.utcnow()
+                    },
+                    "$unset": {
+                        "teamlid_permissions": "",
+                        "assigned_teamlid_by_id": "",
+                        "assigned_teamlid_by_name": "",
+                        "assigned_teamlid_at": ""
+                    }
+                }
+            )
+        
+        return result.modified_count > 0
 
     # ---------------- Company Roles ---------------- #
     async def add_or_update_role(self, company_id: str, admin_id: str, role_name: str, folders: list[str], modules: list, action: str) -> dict:
@@ -1709,6 +1869,10 @@ class CompanyRepository:
         }
 
     async def assign_teamlid_permissions(self, company_id: str, admin_id: str, email: str, permissions: dict) -> bool:
+        """
+        Assign teamlid permissions to a user for a specific admin's workspace.
+        Supports multiple teamlid roles - each assignment creates a separate guest_access entry.
+        """
         current_admin = await self.admins.find_one({
             "company_id": company_id,
             "user_id": admin_id
@@ -1730,15 +1894,25 @@ class CompanyRepository:
         if not target_user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        target_collection = self.admins if target_in_admins else self.users
+        # CRITICAL: Only company admins can receive teamlid roles, not regular company users
+        if target_in_users and not target_in_admins:
+            raise HTTPException(
+                status_code=400,
+                detail="Teamlid roles can only be assigned to company admins, not regular company users."
+            )
 
+        target_user_id = target_user["user_id"]
+        target_collection = self.admins  # Always use admins collection since only admins can be teamlids
+
+        # Update user document to mark as teamlid (for backward compatibility)
+        # Note: This stores the LAST assignment, but we use guest_access for actual permissions
         update_result = await target_collection.update_one(
             {"company_id": company_id, "email": email},
             {
                 "$set": {
                     "is_teamlid": True,
-                    "teamlid_permissions": permissions,
-                    "assigned_teamlid_by_id": admin_id,
+                    "teamlid_permissions": permissions,  # Keep for backward compatibility
+                    "assigned_teamlid_by_id": admin_id,  # Keep for backward compatibility
                     "assigned_teamlid_by_name": current_admin_name,
                     "assigned_teamlid_at": datetime.utcnow(),
                     "updated_at": datetime.utcnow(),
@@ -1748,6 +1922,35 @@ class CompanyRepository:
 
         if update_result.modified_count == 0:
             raise HTTPException(status_code=500, detail="Failed to update user")
+
+        # Create/update guest_access entry for this specific teamlid assignment
+        # This allows multiple teamlid roles from different admins
+        # Each assignment creates a separate entry, so multiple admins can assign teamlid roles
+        
+        # Helper to convert permission value to boolean (handles string "True"/"False")
+        def to_bool(value):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.lower() in ("true", "1", "yes")
+            return bool(value)
+        
+        role_folder = permissions.get("role_folder_modify_permission", False)
+        user_modify = permissions.get("user_create_modify_permission", False)
+        document_modify = permissions.get("document_modify_permission", False)
+        
+        # Map teamlid permissions to guest_access format
+        # Note: Each call creates/updates a separate entry for this admin_id + target_user_id pair
+        await self.upsert_guest_access(
+            company_id=company_id,
+            owner_admin_id=admin_id,  # The admin whose workspace this teamlid can access
+            guest_user_id=target_user_id,
+            can_role_write=to_bool(role_folder),
+            can_user_read=to_bool(user_modify),  # Note: teamlid uses user_create_modify_permission
+            can_document_read=to_bool(document_modify),
+            can_folder_write=to_bool(role_folder),
+            created_by=admin_id,
+        )
 
         return True
 
@@ -1926,6 +2129,7 @@ class CompanyRepository:
         documents = await self.documents.find().to_list(None)
         roles = await self.roles.find().to_list(None)
         folders = await self.folders.find().to_list(None)
+        guests = await self.guest_access.find().to_list(None)
 
         def serialize(obj):
             if isinstance(obj, datetime):
@@ -1942,7 +2146,8 @@ class CompanyRepository:
             "company_users": serialize(users),
             "documents": serialize(documents),
             "roles": serialize(roles),
-            "folders": serialize(folders)
+            "folders": serialize(folders),
+            "guest_access": serialize(guests)
         }
 
     async def clear_all_data(self) -> dict:
@@ -1952,4 +2157,5 @@ class CompanyRepository:
         await self.documents.delete_many({})    
         await self.roles.delete_many({})
         await self.folders.delete_many({})
+        await self.guest_access.delete_many({})
         return {"status": "All collections cleared"}

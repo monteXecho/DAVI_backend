@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: fastapi_app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+    # App shares host network (for Keycloak, RAG on 1416, etc.)
+    network_mode: "host"
+
+    volumes:
+      - ./app:/code/app
+      - ./requirements.txt:/code/requirements.txt
+      - ./uploads:/app/uploads
+      - /var/opt/DAVI_backend/uploads:/var/opt/DAVI_backend/uploads
+      - ./output:/code/output
+      - /var/opt/DAVI_backend/output/highlighted:/code/output/highlighted
+
+    restart: unless-stopped
+    depends_on:
+      - mongodb
+
+    environment:
+      # App connects to Mongo on localhost, authenticated app user
+      - MONGO_URI=mongodb://davi_user:${MONGO_PASSWORD}@localhost:27017/davi_db?authSource=admin
+      - DB_NAME=davi_db
+
+      # If you call RAG server from the app:
+      # - RAG_BASE_URL=http://127.0.0.1:1416
+
+  mongodb:
+    image: mongo:6.0
+    container_name: davi_mongodb
+    restart: always
+
+    # Bind MongoDB only to localhost on the host
+    # -> external internet cannot reach port 27017
+    ports:
+      - "127.0.0.1:27017:27017"
+
+    environment:
+      # Root admin user for MongoDB
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USERNAME}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+      # Optional: default DB to create
+      - MONGO_INITDB_DATABASE=davi_db
+
+    volumes:
+      # Main data directory (your existing data path)
+      - /var/opt/DAVI_backend/mongo-data:/data/db
+      # Backup directory inside container -> /var/backups/davi-mongo on host
+      - /var/backups/davi-mongo:/data/backups
