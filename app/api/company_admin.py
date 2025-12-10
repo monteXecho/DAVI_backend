@@ -929,6 +929,12 @@ async def delete_role_from_user(
             }
         )
 
+        # Update role user count - decrement by the number of users who actually had the role removed
+        if result.modified_count > 0:
+            repo = CompanyRepository(db)
+            # Pass negative count to decrement
+            await repo._update_role_user_counts(company_id, admin_id, [roleName], -result.modified_count)
+
         return {
             "status": "success",
             "removedRole": roleName,
@@ -972,6 +978,11 @@ async def add_role_to_users(
                 "$addToSet": {"assigned_roles": roleName}
             }
         )
+
+        # Update role user count - only count users who actually got the role added
+        if result.modified_count > 0:
+            repo = CompanyRepository(db)
+            await repo._update_role_user_counts(company_id, admin_id, [roleName], result.modified_count)
 
         return {
             "status": "success",

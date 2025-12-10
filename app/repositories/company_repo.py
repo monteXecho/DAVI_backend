@@ -1837,25 +1837,25 @@ class CompanyRepository:
         if await self.users.find_one({"company_id": company_id, "added_by_admin_id": added_by_admin_id, "email": email}):
             raise ValueError("User with this email already exists in this company")
 
+        # Handle empty assigned_role
+        assigned_roles_list = [assigned_role] if assigned_role and assigned_role.strip() else []
+
         user_doc = {
             "user_id": str(uuid.uuid4()),
             "company_id": company_id,
             "added_by_admin_id": added_by_admin_id,  
             "email": email, 
             "company_role": company_role,
-            "assigned_roles": [assigned_role],
+            "assigned_roles": assigned_roles_list,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
             "name": None,  
         }
         await self.users.insert_one(user_doc)
 
-        role = await self.roles.find_one({"name": assigned_role, "company_id": company_id})
-        
-        await self.roles.update_one(
-                {"_id": role["_id"]},
-                {"$inc": {"assigned_user_count": 1}}
-            )
+        # Update role user count if a role was assigned
+        if assigned_roles_list:
+            await self._update_role_user_counts(company_id, added_by_admin_id, assigned_roles_list, 1)
 
         return {
             "user_id": user_doc["user_id"],
