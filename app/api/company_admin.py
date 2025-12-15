@@ -78,34 +78,45 @@ async def check_teamlid_permission(
     """
     Check if teamlid has write permission for the given operation.
     Supports multiple teamlid roles by checking guest_access collection based on acting workspace.
+    Works for both company_admin and company_user.
     """
     repo = CompanyRepository(db)
-    admin_email = admin_context.get("admin_email")
-    if not admin_email:
+    user_email = admin_context.get("admin_email") or admin_context.get("user_email")
+    if not user_email:
         return True  # If no email, skip check (shouldn't happen)
     
     # CRITICAL: If acting on own workspace (admin_id == real_admin_id), allow full access
     # Teamlid restrictions only apply when acting on someone else's workspace (guest mode)
-    real_admin_id = admin_context.get("real_admin_id")
+    real_user_id = admin_context.get("real_admin_id")
     acting_admin_id = admin_context.get("admin_id")
     company_id = admin_context.get("company_id")
+    user_type = admin_context.get("user_type", "company_admin")
     
-    if real_admin_id and acting_admin_id and real_admin_id == acting_admin_id:
-        # Acting on own workspace - full access, no restrictions
-        return True
+    if real_user_id and acting_admin_id and real_user_id == acting_admin_id:
+        # Acting on own workspace - full access, no restrictions (only for company_admin)
+        if user_type == "company_admin":
+            return True
     
-    admin_record = await repo.find_admin_by_email(admin_email)
-    if not admin_record:
+    # For company_users, they're always in guest mode (acting on admin's workspace)
+    # For company_admins, check if they're teamlid
+    if user_type == "company_admin":
+        user_record = await repo.find_admin_by_email(user_email)
+    else:
+        user_record = await db.company_users.find_one({"email": user_email})
+    
+    if not user_record:
         return True  # If not found, skip check
     
-    # If not teamlid, allow (company_admin has full access)
-    if not admin_record.get("is_teamlid", False):
+    # If not teamlid, allow (company_admin has full access, company_user always needs permission check)
+    if user_type == "company_admin" and not user_record.get("is_teamlid", False):
         return True
     
+    # For company_users: always check guest_access (they're always acting on admin's workspace)
+    # For company_admins: only check if they're teamlid and acting on different workspace
     # Check guest_access collection first (supports multiple teamlid roles)
     guest_entry = await repo.get_guest_access(
         company_id=company_id,
-        guest_user_id=real_admin_id,
+        guest_user_id=real_user_id,
         owner_admin_id=acting_admin_id,
     )
     
@@ -135,9 +146,19 @@ async def check_teamlid_permission(
                     status_code=403,
                     detail="U heeft geen toestemming om documenten te beheren."
                 )
+        # Permission check passed
+        return True
     else:
-        # Fallback for backward compatibility: check old teamlid_permissions on user document
-        perms = admin_record.get("teamlid_permissions", {})
+        # No guest_entry found
+        # For company_users: they MUST have a guest_entry to perform write operations
+        if user_type == "company_user":
+            raise HTTPException(
+                status_code=403,
+                detail="Geen gasttoegang gevonden voor deze werkruimte. Selecteer een teamlid rol om toegang te krijgen."
+            )
+        
+        # Fallback for backward compatibility: check old teamlid_permissions on user document (only for company_admin)
+        perms = user_record.get("teamlid_permissions", {})
         
         if permission_type == "users":
             if not _can_write_users(perms):
@@ -161,6 +182,137 @@ async def check_teamlid_permission(
     return True
 
 
+async def get_admin_or_user_company_id(
+    request: Request,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """
+    Extract and validate the authenticated user's company_id.
+    Supports both company_admin and company_user (with teamlid permissions).
+
+    Additionally:
+      - Reads X-Acting-Owner-Id header.
+      - If present and different from the real user_id, verifies guest access.
+      - Returns 'admin_id' as the WORKSPACE owner (acting admin),
+        plus 'real_admin_id' and 'guest_permissions' if in guest mode.
+    """
+    repo = CompanyRepository(db)
+
+    user_email = user.get("email")
+    if not user_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing email in authentication token",
+        )
+
+    roles = user.get("realm_access", {}).get("roles", [])
+    
+    # Check if user is company_admin or company_user
+    if "company_admin" in roles:
+        base_user = await db.company_admins.find_one({"email": user_email})
+        user_type = "company_admin"
+    elif "company_user" in roles:
+        base_user = await db.company_users.find_one({"email": user_email})
+        user_type = "company_user"
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="User must be company_admin or company_user",
+        )
+
+    if not base_user:
+        raise HTTPException(
+            status_code=403,
+            detail="User not found in company database",
+        )
+
+    company_id = base_user["company_id"]
+    real_user_id = base_user["user_id"]
+
+    # Default: normal mode, acting on own workspace
+    # For company_users, their "own workspace" is their admin's workspace
+    if user_type == "company_admin":
+        acting_admin_id = real_user_id
+        default_owner_id = real_user_id
+    else:
+        # Company user: their default workspace is their admin's workspace
+        default_owner_id = base_user.get("added_by_admin_id")
+        if not default_owner_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Company user must be added by an admin",
+            )
+        acting_admin_id = default_owner_id
+
+    guest_permissions = None
+
+    acting_owner_header = request.headers.get("X-Acting-Owner-Id")
+    # For company users: check if they're in guest mode (even if ownerId matches default)
+    # Check the isGuest flag from a custom header or check guest_access
+    is_guest_mode = request.headers.get("X-Acting-Owner-Is-Guest", "false").lower() == "true"
+    
+    # Check if we need to verify guest access
+    needs_guest_check = False
+    if acting_owner_header:
+        if acting_owner_header != default_owner_id:
+            # Different ownerId - definitely guest mode
+            needs_guest_check = True
+        elif user_type == "company_user" and is_guest_mode:
+            # Same ownerId but company user in guest mode (teamlid role for same admin)
+            needs_guest_check = True
+    
+    if needs_guest_check:
+        # Guest mode requested: verify guest access
+        # Check guest_access collection first (supports multiple teamlid roles and guest access)
+        guest_entry = await repo.get_guest_access(
+            company_id=company_id,
+            guest_user_id=real_user_id,
+            owner_admin_id=acting_owner_header,
+        )
+        if guest_entry:
+            # Found in guest_access collection (supports multiple teamlid roles)
+            # Backward compatibility: support both old and new field names
+            guest_permissions = {
+                "role_write": _get_guest_permission(guest_entry, "can_role_write"),
+                "user_write": _get_guest_permission(guest_entry, "can_user_write", "can_user_read"),
+                "document_write": _get_guest_permission(guest_entry, "can_document_write", "can_document_read"),
+                "folder_write": _get_guest_permission(guest_entry, "can_folder_write"),
+            }
+        else:
+            # Fallback for backward compatibility: check old teamlid assignment on user document
+            if (
+                base_user.get("is_teamlid")
+                and base_user.get("assigned_teamlid_by_id") == acting_owner_header
+            ):
+                teamlid_perms = base_user.get("teamlid_permissions", {})
+                guest_permissions = {
+                    "role_write": teamlid_perms.get("role_folder_modify_permission", False),
+                    "user_write": teamlid_perms.get("user_create_modify_permission", False),
+                    "document_write": teamlid_perms.get("document_modify_permission", False),
+                    "folder_write": teamlid_perms.get("role_folder_modify_permission", False),
+                }
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="No guest access for this workspace",
+                )
+
+        acting_admin_id = acting_owner_header
+
+    return {
+        "company_id": company_id,
+        # WORKSPACE owner (whose data we are managing)
+        "admin_id": acting_admin_id,
+        # Real logged-in user
+        "real_admin_id": real_user_id,
+        "admin_email": user_email,  # Keep for backward compatibility
+        "user_email": user_email,
+        "user_type": user_type,
+        "guest_permissions": guest_permissions,
+    }
+
+
 async def get_admin_company_id(
     request: Request,
     user=Depends(require_role("company_admin")),
@@ -168,6 +320,7 @@ async def get_admin_company_id(
 ):
     """
     Extract and validate the authenticated admin's company_id.
+    DEPRECATED: Use get_admin_or_user_company_id for support of company users with teamlid permissions.
 
     Additionally:
       - Reads X-Acting-Owner-Id header.
@@ -363,19 +516,35 @@ async def get_guest_workspaces(
             "folder_write": bool(role_folder),
         }
 
+    # Track seen owner IDs to avoid duplicates
+    seen_owner_ids = set()
+    
     for entry in guest_entries:
+        owner_admin_id = entry["owner_admin_id"]
+        
+        # For company users: if guest workspace ownerId matches self.ownerId, 
+        # still include it in guestOf (it represents teamlid permissions vs default permissions)
+        # For company admins: skip if it matches self.ownerId (they're the same workspace)
+        if user_type == "company_admin" and owner_admin_id == self_owner_id:
+            continue  # Skip - admin's own workspace is already in "self"
+        
+        # Skip if we've already added this owner (for other duplicates)
+        if owner_admin_id in seen_owner_ids:
+            continue
+            
         owner_admin = await db.company_admins.find_one(
             {
                 "company_id": company_id,
-                "user_id": entry["owner_admin_id"],
+                "user_id": owner_admin_id,
             }
         )
         if not owner_admin:
             continue
 
+        seen_owner_ids.add(owner_admin_id)
         response["guestOf"].append(
             {
-                "ownerId": entry["owner_admin_id"],
+                "ownerId": owner_admin_id,
                 "label": owner_admin.get("name") or owner_admin.get("email"),
                 "owner": {
                     "id": owner_admin.get("user_id"),
@@ -394,19 +563,19 @@ async def get_guest_workspaces(
     # Note: All teamlid assignments should now be in guest_entries (from guest_access collection)
     # This fallback is only for backward compatibility with old data
     # Check if there are any teamlid assignments in guest_access that weren't already added
-    all_guest_owner_ids = {g.get("ownerId") for g in response["guestOf"]}
     
     # Fallback: if user has old-style teamlid assignment on user document but not in guest_access
     if (
         base_user.get("is_teamlid")
         and base_user.get("assigned_teamlid_by_id")
-        and base_user.get("assigned_teamlid_by_id") not in all_guest_owner_ids
+        and base_user.get("assigned_teamlid_by_id") not in seen_owner_ids
     ):
         assigned_owner_id = base_user["assigned_teamlid_by_id"]
         owner_admin = await db.company_admins.find_one(
             {"company_id": company_id, "user_id": assigned_owner_id}
         )
         if owner_admin:
+            seen_owner_ids.add(assigned_owner_id)
             response["guestOf"].append(
                 {
                     "ownerId": assigned_owner_id,
@@ -526,7 +695,7 @@ async def get_login_user(
 
 @company_admin_router.get("/users")
 async def get_all_users(
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     repo = CompanyRepository(db)
@@ -548,7 +717,7 @@ async def get_all_users(
 
 @company_admin_router.get("/documents", summary="Get all uploaded documents by admin")
 async def get_admin_uploaded_documents(
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     
@@ -586,7 +755,7 @@ async def get_admin_uploaded_documents(
 @company_admin_router.post("/users")
 async def add_user(
     payload: CompanyUserCreate,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     repo = CompanyRepository(db)
@@ -657,7 +826,7 @@ async def assign_teamlid_permission(
 async def upload_users_from_file(
     file: UploadFile = File(...),
     role: str = Form(default=""),  # Add role as optional form parameter
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions
@@ -782,7 +951,7 @@ async def reset_user_password(
 async def update_user(
     user_id: str,
     payload: CompanyUserUpdate,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions
@@ -802,7 +971,7 @@ async def update_user(
 @company_admin_router.delete("/users")
 async def delete_user(
     user_ids: str = Query(..., description="Comma-separated list of user IDs"),
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions
@@ -942,7 +1111,7 @@ async def remove_teamlid_role(
 @company_admin_router.post("/users/role/delete")
 async def delete_role_from_user(
     payload: CompanyRoleModifyUsers,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     roleName = payload.role_name
@@ -994,7 +1163,7 @@ async def delete_role_from_user(
 @company_admin_router.post("/users/role/add")
 async def add_role_to_users(
     payload: CompanyRoleModifyUsers,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions
@@ -1084,7 +1253,7 @@ async def get_company_stats(
 @company_admin_router.post("/documents/delete")
 async def delete_documents(
     payload: DeleteDocumentsPayload,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions
@@ -1151,7 +1320,7 @@ async def delete_documents(
 @company_admin_router.post("/folders")
 async def add_folders(
     payload: AddFoldersPayload,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions
@@ -1185,7 +1354,7 @@ async def add_folders(
 
 @company_admin_router.get("/folders")
 async def get_folders(
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     repo = CompanyRepository(db)
@@ -1216,7 +1385,7 @@ async def get_folders(
 @company_admin_router.post("/folders/delete")
 async def delete_folder(
     payload: DeleteFolderPayload,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions
@@ -1252,7 +1421,7 @@ async def delete_folder(
 @company_admin_router.post("/roles")
 async def add_or_update_role(
     payload: CompanyRoleCreate,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions
@@ -1271,7 +1440,7 @@ async def add_or_update_role(
     
 @company_admin_router.get("/roles")
 async def list_roles(
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     """List all roles for the authenticated user's company."""
@@ -1288,7 +1457,7 @@ async def list_roles(
 @company_admin_router.post("/roles/delete")
 async def delete_roles(
     payload: DeleteRolesPayload,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions
@@ -1309,7 +1478,7 @@ async def delete_roles(
 @company_admin_router.post("/roles/assign")
 async def assign_role_to_user(
     payload: AssignRolePayload,
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions (assigning roles affects users)
@@ -1330,7 +1499,7 @@ async def assign_role_to_user(
 async def upload_document_for_role(
     folder_name: str,
     file: UploadFile = File(...),
-    admin_context=Depends(get_admin_company_id),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     # Check teamlid permissions

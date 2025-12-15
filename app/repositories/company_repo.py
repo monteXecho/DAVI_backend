@@ -1894,15 +1894,13 @@ class CompanyRepository:
         if not target_user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # CRITICAL: Only company admins can receive teamlid roles, not regular company users
-        if target_in_users and not target_in_admins:
-            raise HTTPException(
-                status_code=400,
-                detail="Teamlid roles can only be assigned to company admins, not regular company users."
-            )
-
         target_user_id = target_user["user_id"]
-        target_collection = self.admins  # Always use admins collection since only admins can be teamlids
+        
+        # Determine which collection to update based on whether user is admin or regular user
+        if target_in_admins:
+            target_collection = self.admins
+        else:
+            target_collection = self.users
 
         # Update user document to mark as teamlid (for backward compatibility)
         # Note: This stores the LAST assignment, but we use guest_access for actual permissions
