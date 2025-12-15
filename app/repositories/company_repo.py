@@ -556,10 +556,12 @@ class CompanyRepository:
         if new_folders:
             folder_documents = []
             for folder_name in new_folders:
+                # Normalize folder name to match upload logic (strip "/ " to be consistent)
+                normalized_name = folder_name.strip("/ ")
                 folder_doc = {
                     "company_id": company_id,
                     "admin_id": admin_id,
-                    "name": folder_name.strip(),
+                    "name": normalized_name,
                     "document_count": 0,
                     "created_at": datetime.utcnow(),
                     "updated_at": datetime.utcnow(),
@@ -1547,17 +1549,383 @@ class CompanyRepository:
     ) -> dict:
 
         file_name = (file.filename or "").strip()
-        safe_folder = folder_name.strip("/ ")
+        
+        # CRITICAL: Extract ONLY the file name, removing any folder path
+        # When uploading from a folder, file_name might contain the folder path (e.g., "roro/file.pdf")
+        # We need to extract just the file name (e.g., "file.pdf")
+        if "/" in file_name or "\\" in file_name:
+            # File name contains a path, extract just the filename
+            file_name = os.path.basename(file_name)
+        
+        # Remove any remaining path separators (shouldn't be any, but safety first)
+        file_name = file_name.replace("/", "").replace("\\", "").strip()
+        
+        # CRITICAL: The folder_name should already be normalized from API endpoint
+        # But we need to be absolutely sure it's just a folder name, not a path
+        import re
+        
+        # Strip and get only the last component if it contains path separators
+        safe_folder = folder_name.strip()
+        
+        # Split by any path separator and take the LAST non-empty part
+        parts = re.split(r'[/\\]+', safe_folder)
+        non_empty_parts = [p.strip() for p in parts if p.strip()]
+        
+        if non_empty_parts:
+            # Take only the last part
+            safe_folder = non_empty_parts[-1]
+        else:
+            safe_folder = safe_folder.strip()
+        
+        # Remove any remaining path separators (shouldn't be any, but safety first)
+        safe_folder = safe_folder.replace("/", "").replace("\\", "").strip()
 
         if not file_name:
             raise HTTPException(status_code=400, detail="Missing file name")
 
-        base_path = os.path.join(
-            UPLOAD_ROOT, "roleBased", company_id, admin_id, safe_folder
-        )
+        if not safe_folder:
+            raise HTTPException(status_code=400, detail="Invalid folder name")
+        
+        # CRITICAL CHECK: Verify folder name doesn't contain itself (like "folder/folder")
+        # This would indicate a duplication issue
+        if "/" in safe_folder or "\\" in safe_folder:
+            logger.error(f"ERROR: Folder name '{safe_folder}' still contains path separators after normalization!")
+            # Force extract just the last component
+            safe_folder = os.path.basename(safe_folder).replace("/", "").replace("\\", "").strip()
+            if not safe_folder:
+                raise HTTPException(status_code=400, detail="Invalid folder name: could not extract valid name")
+        
+        # Log the folder name to debug any duplication issues
+        logger.info(f"Repository: received folder_name='{folder_name}', extracted safe_folder='{safe_folder}'")
+
+        # Find the existing folder in database (should already exist from add_folders)
+        # Try to find folder by the normalized name first
+        folder_exists = await self.folders.find_one({
+            "company_id": company_id,
+            "admin_id": admin_id,
+            "name": safe_folder
+        })
+
+        # If not found, try case-insensitive search (folders might have been created with different casing)
+        if not folder_exists:
+            all_folders = await self.folders.find({
+                "company_id": company_id,
+                "admin_id": admin_id
+            }).to_list(length=None)
+            
+            # Find folder by case-insensitive match
+            for folder in all_folders:
+                if folder.get("name", "").lower() == safe_folder.lower():
+                    folder_exists = folder
+                    break
+
+        if not folder_exists:
+            # Folder doesn't exist, create it as fallback
+            logger.warning(f"Folder '{safe_folder}' not found in database, creating it as fallback")
+            folder_doc = {
+                "company_id": company_id,
+                "admin_id": admin_id,
+                "name": safe_folder,
+                "document_count": 0,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "status": "active"
+            }
+            try:
+                await self.folders.insert_one(folder_doc)
+                folder_exists = folder_doc
+            except DuplicateKeyError:
+                # Folder was created by another request, fetch it
+                logger.info(f"Folder '{safe_folder}' was created by another request")
+                folder_exists = await self.folders.find_one({
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "name": safe_folder
+                })
+        
+        # CRITICAL: Use the EXACT folder name from database - this is the source of truth
+        # This ensures we use the same name that was stored, preventing any path duplication
+        if folder_exists:
+            actual_folder_name = folder_exists["name"]
+        else:
+            actual_folder_name = safe_folder
+            logger.warning(f"Using safe_folder as fallback: '{actual_folder_name}'")
+        
+        # CRITICAL: Use the EXACT folder name from database - no more normalization needed
+        # The folder name from database is the source of truth and should be used as-is
+        # This prevents any duplication issues from multiple normalizations
+        # This is the key difference: manual upload uses folder from dropdown (already in DB),
+        # folder upload creates folder first, then we use that exact name from DB
+        final_folder_name = actual_folder_name.strip()
+        
+        # Only remove path separators if they somehow exist (shouldn't happen, but safety first)
+        if "/" in final_folder_name or "\\" in final_folder_name:
+            logger.warning(f"WARNING: Folder name from database contains path separators: '{final_folder_name}'")
+            final_folder_name = final_folder_name.replace("/", "").replace("\\", "").strip()
+        
+        if not final_folder_name:
+            raise HTTPException(status_code=400, detail="Invalid folder name: empty after extraction from database")
+        
+        logger.info(f"Using EXACT folder name from database: '{final_folder_name}' (original: '{folder_name}', safe_folder: '{safe_folder}', actual_folder_name: '{actual_folder_name}')")
+        
+        path_list = []
+        
+        # Add base path components (these are guaranteed safe)
+        if UPLOAD_ROOT:
+            path_list.append(UPLOAD_ROOT)
+        path_list.append("roleBased")
+        path_list.append(company_id)
+        path_list.append(admin_id)
+        
+        # CRITICAL: Verify final_folder_name is NOT already in the path components
+        if final_folder_name in path_list:
+            logger.error(f"ERROR: Folder name '{final_folder_name}' already in path components: {path_list}")
+            # Remove it and rebuild
+            path_list = [p for p in path_list if p != final_folder_name]
+            # Re-add base components to be safe
+            path_list = [UPLOAD_ROOT, "roleBased", company_id, admin_id]
+            logger.error(f"  Rebuilt path_list: {path_list}")
+        
+        # CRITICAL: Check if folder name is already in path_list before adding
+        if final_folder_name in path_list:
+            logger.error(f"CRITICAL: Folder name '{final_folder_name}' already in path_list before adding!")
+            logger.error(f"  path_list: {path_list}")
+            # Remove all occurrences
+            path_list = [p for p in path_list if p != final_folder_name]
+            logger.error(f"  path_list after removal: {path_list}")
+        
+        # Add folder name ONCE (this is the ONLY place we add it)
+        path_list.append(final_folder_name)
+        
+        # CRITICAL: Verify path_list doesn't have duplicates AFTER adding
+        if path_list.count(final_folder_name) != 1:
+            logger.error(f"CRITICAL: path_list has folder name {path_list.count(final_folder_name)} times after adding!")
+            logger.error(f"  path_list: {path_list}")
+            # Remove all occurrences and re-add once
+            path_list = [p for p in path_list if p != final_folder_name]
+            path_list = [UPLOAD_ROOT, "roleBased", company_id, admin_id, final_folder_name]
+            logger.error(f"  Fixed path_list: {path_list}")
+        
+        # Build the path by joining the list manually
+        # CRITICAL: Don't use os.path.normpath as it might cause issues with folder names
+        base_path = os.sep.join(path_list)
+        
+        # Clean up any double separators manually
+        while f"{os.sep}{os.sep}" in base_path:
+            base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+        
+        # VERIFY: Check that folder name appears exactly ONCE
+        path_parts = [p for p in base_path.split(os.sep) if p]
+        folder_count = path_parts.count(final_folder_name)
+        
+        if folder_count != 1:
+            logger.error(f"CRITICAL: Folder name '{final_folder_name}' appears {folder_count} times!")
+            logger.error(f"  Path list: {path_list}")
+            logger.error(f"  Path parts: {path_parts}")
+            logger.error(f"  base_path: '{base_path}'")
+            
+            # Force correction: find admin_id and rebuild manually
+            admin_idx = None
+            for i, part in enumerate(path_parts):
+                if part == admin_id:
+                    admin_idx = i
+                    break
+            
+            if admin_idx is not None:
+                # Rebuild: up to admin_id, then folder name ONCE
+                corrected = path_parts[:admin_idx + 1] + [final_folder_name]
+                base_path = os.sep.join(corrected)
+                # Clean double separators
+                while f"{os.sep}{os.sep}" in base_path:
+                    base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+                
+                # Final check
+                verify = [p for p in base_path.split(os.sep) if p]
+                if verify.count(final_folder_name) != 1:
+                    # Absolute last resort: manual string construction
+                    base_path = f"{UPLOAD_ROOT}{os.sep}roleBased{os.sep}{company_id}{os.sep}{admin_id}{os.sep}{final_folder_name}"
+                    # Clean double separators
+                    while f"{os.sep}{os.sep}" in base_path:
+                        base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+            else:
+                # Manual build
+                base_path = f"{UPLOAD_ROOT}{os.sep}roleBased{os.sep}{company_id}{os.sep}{admin_id}{os.sep}{final_folder_name}"
+                # Clean double separators
+                while f"{os.sep}{os.sep}" in base_path:
+                    base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+        
+        # Final verification before using the path
+        final_check_parts = [p for p in base_path.split(os.sep) if p]
+        final_folder_count = final_check_parts.count(final_folder_name)
+        
+        if final_folder_count != 1:
+            logger.error(f"CRITICAL: After all corrections, folder name still appears {final_folder_count} times!")
+            logger.error(f"  base_path: '{base_path}'")
+            logger.error(f"  final_folder_name: '{final_folder_name}'")
+            logger.error(f"  final_check_parts: {final_check_parts}")
+            
+            # Force rebuild: find admin_id and rebuild manually
+            admin_idx = None
+            for i, part in enumerate(final_check_parts):
+                if part == admin_id:
+                    admin_idx = i
+                    break
+            
+            if admin_idx is not None:
+                # Rebuild manually: everything up to admin_id, then folder name ONCE
+                corrected_parts = final_check_parts[:admin_idx + 1] + [final_folder_name]
+                base_path = os.sep.join(corrected_parts)
+                # Clean double separators
+                while f"{os.sep}{os.sep}" in base_path:
+                    base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+                logger.error(f"  FORCE REBUILT base_path: '{base_path}'")
+                
+                # Verify the rebuild worked
+                verify_parts = [p for p in base_path.split(os.sep) if p]
+                if verify_parts.count(final_folder_name) != 1:
+                    # Absolute last resort: manual string construction
+                    base_path = f"{UPLOAD_ROOT}{os.sep}roleBased{os.sep}{company_id}{os.sep}{admin_id}{os.sep}{final_folder_name}"
+                    while f"{os.sep}{os.sep}" in base_path:
+                        base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+            else:
+                # Manual build
+                base_path = f"{UPLOAD_ROOT}{os.sep}roleBased{os.sep}{company_id}{os.sep}{admin_id}{os.sep}{final_folder_name}"
+                while f"{os.sep}{os.sep}" in base_path:
+                    base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+        
+        # Final check before creating directory
+        verify_final = [p for p in base_path.split(os.sep) if p]
+        if verify_final.count(final_folder_name) != 1:
+            logger.error(f"CRITICAL ERROR: base_path verification failed! Folder name appears {verify_final.count(final_folder_name)} times")
+            logger.error(f"  base_path: '{base_path}'")
+            logger.error(f"  verify_final: {verify_final}")
+            raise HTTPException(status_code=500, detail=f"Path construction error: duplicate folder name in base path")
+        
+        # CRITICAL: One more verification before creating directory
+        # Split and check one more time to be absolutely sure
+        pre_makedirs_parts = [p for p in base_path.split(os.sep) if p]
+        pre_makedirs_count = pre_makedirs_parts.count(final_folder_name)
+        
+        if pre_makedirs_count != 1:
+            logger.error(f"CRITICAL: base_path STILL has duplication before makedirs! Count: {pre_makedirs_count}")
+            logger.error(f"  base_path: '{base_path}'")
+            logger.error(f"  pre_makedirs_parts: {pre_makedirs_parts}")
+            
+            # Force rebuild one more time
+            admin_idx = None
+            for i, part in enumerate(pre_makedirs_parts):
+                if part == admin_id:
+                    admin_idx = i
+                    break
+            
+            if admin_idx is not None:
+                base_path = os.sep.join(pre_makedirs_parts[:admin_idx + 1] + [final_folder_name])
+                while f"{os.sep}{os.sep}" in base_path:
+                    base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+            else:
+                base_path = f"{UPLOAD_ROOT}{os.sep}roleBased{os.sep}{company_id}{os.sep}{admin_id}{os.sep}{final_folder_name}"
+                while f"{os.sep}{os.sep}" in base_path:
+                    base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+        
+        # Final verification of base_path before using it
+        # CRITICAL: Split base_path and verify it has folder name exactly once
+        # Note: We preserve the absolute path nature by checking if base_path starts with /
+        is_absolute = base_path.startswith(os.sep)
+        base_path_parts_final = [p for p in base_path.split(os.sep) if p]
+        base_path_folder_count = base_path_parts_final.count(final_folder_name)
+        
+        if base_path_folder_count != 1:
+            logger.error(f"CRITICAL: base_path has wrong folder count before file_path construction: {base_path_folder_count}")
+            logger.error(f"  base_path: '{base_path}'")
+            logger.error(f"  base_path_parts_final: {base_path_parts_final}")
+            # Force rebuild base_path from scratch
+            # CRITICAL: Build absolute path properly - UPLOAD_ROOT is already absolute
+            base_path = f"{UPLOAD_ROOT}{os.sep}roleBased{os.sep}{company_id}{os.sep}{admin_id}{os.sep}{final_folder_name}"
+            while f"{os.sep}{os.sep}" in base_path:
+                base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+            # Re-verify
+            base_path_parts_final = [p for p in base_path.split(os.sep) if p]
+            if base_path_parts_final.count(final_folder_name) != 1:
+                raise HTTPException(status_code=500, detail=f"Path construction error: duplicate folder name in base path")
+        
         os.makedirs(base_path, exist_ok=True)
 
-        file_path = os.path.join(base_path, file_name)
+        # Build file path: base_path already contains folder name, just add file_name
+        # CRITICAL: Ensure file_name doesn't contain any path (should already be extracted above)
+        # Double-check: if file_name still contains path separators, extract just the basename
+        clean_file_name = file_name
+        if "/" in clean_file_name or "\\" in clean_file_name:
+            clean_file_name = os.path.basename(clean_file_name)
+            clean_file_name = clean_file_name.replace("/", "").replace("\\", "").strip()
+        
+        # Build from verified base_path_parts to ensure no duplication
+        # CRITICAL: Ensure absolute path - if base_path starts with /, file_path should too
+        # When we split base_path and filter empty strings, we lose the leading /
+        # So we need to restore it for file_path
+        file_path_parts_clean = base_path_parts_final + [clean_file_name]
+        file_path = os.sep.join(file_path_parts_clean)
+        # Ensure absolute path if base_path is absolute
+        if is_absolute and not file_path.startswith(os.sep):
+            file_path = os.sep + file_path
+        
+        logger.info(f"file_path_parts_clean before join: {file_path_parts_clean}")
+        logger.info(f"  final_folder_name count in file_path_parts_clean: {file_path_parts_clean.count(final_folder_name)}")
+        
+        # Clean up any double separators
+        while f"{os.sep}{os.sep}" in file_path:
+            file_path = file_path.replace(f"{os.sep}{os.sep}", os.sep)
+        
+        # Final verification - check file path
+        file_path_parts = [p for p in file_path.split(os.sep) if p]
+        folder_name_count_in_file_path = file_path_parts.count(final_folder_name)
+        
+        if folder_name_count_in_file_path != 1:
+            logger.error(f"CRITICAL ERROR: File path has incorrect folder name count: {folder_name_count_in_file_path}")
+            logger.error(f"  file_path: '{file_path}'")
+            logger.error(f"  file_path_parts: {file_path_parts}")
+            logger.error(f"  base_path: '{base_path}'")
+            logger.error(f"  base_path_parts_final: {base_path_parts_final}")
+            
+            # CRITICAL: Rebuild from verified base_path_parts, NOT from corrupted file_path_parts
+            # The base_path_parts_final is verified to have folder name exactly once
+            file_path_parts_clean = base_path_parts_final + [clean_file_name]
+            file_path = os.sep.join(file_path_parts_clean)
+            # CRITICAL: Ensure absolute path if base_path is absolute
+            # When we split base_path and filter empty strings, we lose the leading /
+            # So we need to restore it for file_path
+            if is_absolute and not file_path.startswith(os.sep):
+                file_path = os.sep + file_path
+            
+            # Clean double separators
+            while f"{os.sep}{os.sep}" in file_path:
+                file_path = file_path.replace(f"{os.sep}{os.sep}", os.sep)
+            
+            
+            # Final verification
+            verify_parts = [p for p in file_path.split(os.sep) if p]
+            verify_count = verify_parts.count(final_folder_name)
+            
+            if verify_count != 1:
+                logger.error(f"CRITICAL: Rebuild from base_path_parts still has wrong count: {verify_count}")
+                logger.error(f"  verify_parts: {verify_parts}")
+                logger.error(f"  base_path_parts_final: {base_path_parts_final}")
+                logger.error(f"  file_name: '{file_name}'")
+                
+                # Absolute last resort: build completely from scratch using known good values
+                file_path = f"{UPLOAD_ROOT}{os.sep}roleBased{os.sep}{company_id}{os.sep}{admin_id}{os.sep}{final_folder_name}{os.sep}{clean_file_name}"
+                while f"{os.sep}{os.sep}" in file_path:
+                    file_path = file_path.replace(f"{os.sep}{os.sep}", os.sep)
+                base_path = f"{UPLOAD_ROOT}{os.sep}roleBased{os.sep}{company_id}{os.sep}{admin_id}{os.sep}{final_folder_name}"
+                while f"{os.sep}{os.sep}" in base_path:
+                    base_path = base_path.replace(f"{os.sep}{os.sep}", os.sep)
+                os.makedirs(base_path, exist_ok=True)
+                
+                # Final verification
+                final_verify = [p for p in file_path.split(os.sep) if p]
+                if final_verify.count(final_folder_name) != 1:
+                    logger.error(f"CRITICAL: File path still incorrect after absolute rebuild!")
+                    logger.error(f"  final_verify: {final_verify}")
+                    raise HTTPException(status_code=500, detail=f"Path construction error: duplicate folder name in file path")
 
         existing_doc = await self.documents.find_one({
             "company_id": company_id,
@@ -1590,10 +1958,19 @@ class CompanyRepository:
 
         await self.documents.insert_one(doc_record)
 
-        await self.folders.update_one(
+        # Update folder document count - check if folder exists first
+        folder_update_result = await self.folders.update_one(
             {"company_id": company_id, "admin_id": admin_id, "name": safe_folder},
             {"$inc": {"document_count": 1}}
         )
+        
+        # If folder doesn't exist, log a warning but don't fail the upload
+        if folder_update_result.matched_count == 0:
+            logger.warning(
+                f"Folder '{safe_folder}' not found when updating document count. "
+                f"Company: {company_id}, Admin: {admin_id}. "
+                f"Document was uploaded successfully but folder count was not updated."
+            )
 
         return {
             "success": True,

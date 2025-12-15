@@ -1510,10 +1510,43 @@ async def upload_document_for_role(
     admin_id = admin_context["admin_id"]
 
     try:
+        # URL decode the folder name in case it was encoded
+        from urllib.parse import unquote
+        import os
+        import re
+        
+        # FastAPI automatically URL decodes path parameters, but let's be explicit
+        decoded_folder_name = unquote(folder_name)
+        
+        # AGGRESSIVE normalization: Extract ONLY the folder name, no paths
+        # Split by any path separator and take the last non-empty part
+        parts = re.split(r'[/\\]+', decoded_folder_name.strip())
+        # Filter out empty parts and get the last one
+        non_empty_parts = [p.strip() for p in parts if p.strip()]
+        
+        if not non_empty_parts:
+            raise HTTPException(status_code=400, detail="Invalid folder name: empty after normalization")
+        
+        # Take only the LAST part (in case path was included)
+        normalized_folder_name = non_empty_parts[-1]
+        
+        # Remove any remaining path separators (shouldn't be any, but safety first)
+        normalized_folder_name = normalized_folder_name.replace("/", "").replace("\\", "").strip()
+        
+        # Validate the folder name is not empty
+        if not normalized_folder_name:
+            raise HTTPException(status_code=400, detail="Invalid folder name: empty after normalization")
+        
+        # CRITICAL: Verify the folder name doesn't contain the folder name twice
+        # Check for patterns like "folder/folder" or "folder\\folder"
+        if "/" in normalized_folder_name or "\\" in normalized_folder_name:
+            # Extract just the last component
+            normalized_folder_name = os.path.basename(normalized_folder_name).replace("/", "").replace("\\", "").strip()
+        
         result = await repo.upload_document_for_folder(
             company_id=company_id,
             admin_id=admin_id,
-            folder_name=folder_name,
+            folder_name=normalized_folder_name,
             file=file
         )
 
@@ -1532,8 +1565,8 @@ async def upload_document_for_role(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Failed to upload document for role")
-        raise HTTPException(status_code=500, detail="Failed to upload document")
+        logger.exception(f"Failed to upload document for role. Folder: {folder_name}, Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload document: {str(e)}")
 
 
 @company_admin_router.get("/debug/all-data")

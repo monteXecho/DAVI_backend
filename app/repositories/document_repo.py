@@ -15,6 +15,22 @@ class DocumentRepository:
             unique=True,
         )
 
+    async def document_exists(
+        self,
+        company_id: str,
+        user_id: str,
+        file_name: str,
+        upload_type: str
+    ) -> bool:
+        """Check if a document already exists for the given parameters."""
+        existing = await self.collection.find_one({
+            "company_id": company_id,
+            "user_id": user_id,
+            "file_name": file_name,
+            "upload_type": upload_type,
+        })
+        return existing is not None
+
     async def add_document(
         self,
         company_id: str,

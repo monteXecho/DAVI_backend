@@ -78,6 +78,13 @@ async def upload_document(
         os.makedirs(upload_folder, exist_ok=True)
         file_path = os.path.abspath(os.path.join(upload_folder, file.filename))
 
+        # Check for duplicate document BEFORE saving the file
+        if await document_repo.document_exists(company_id, user_id, file.filename, upload_type):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Document '{file.filename}' already exists for this user and type.",
+            )
+
         # Save file
         try:
             await run_in_threadpool(save_uploaded_file, file, file_path)
@@ -100,6 +107,14 @@ async def upload_document(
         )
 
         if not doc_record:
+            # This should not happen if the check above worked, but handle it as a safety net
+            # Clean up the saved file if metadata insertion fails
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception as cleanup_error:
+                logger.error(f"Failed to cleanup file after duplicate detection: {cleanup_error}")
+            
             raise HTTPException(
                 status_code=409,
                 detail=f"Document '{file.filename}' already exists for this user and type.",
