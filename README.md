@@ -1,285 +1,349 @@
-# MijnDAVI RAG POC
+# MijnDAVI Backend API
 
 © 2025 by MijnDAVI
 
 ## Overview
 
-MijnDAVI RAG POC is a Retrieval-Augmented Generation (RAG) system designed specifically for childcare center management. The system allows managers and staff to query internal documents using natural language questions and receive accurate, contextual answers from their documentation corpus.
+MijnDAVI Backend is a production-ready FastAPI application that powers a Retrieval-Augmented Generation (RAG) system for childcare center management. The system enables managers and staff to query internal documents using natural language and receive accurate, contextual answers from their documentation corpus.
 
-The project implements a modern RAG pipeline using Haystack 2.11+ framework with Elasticsearch as the vector database and supports both local and cloud-based language models.
-
-## Features
-
-- **Multi-Model Support**: Compatible with local models (Granite 3.2/3.3) and OpenAI GPT-4
-- **Hybrid Search**: Combines BM25 and semantic search for improved document retrieval
-- **Document Reranking**: Uses transformer-based reranking for better relevance
-- **FastAPI REST API**: Production-ready API with automatic documentation
-- **Streamlit Web Interface**: User-friendly chat interface for testing
-- **Docker Support**: Easy deployment with Docker Compose
-- **Multilingual Support**: Optimized for Dutch content with multilingual embeddings
+The backend integrates with external RAG services, manages document storage, handles user authentication via Keycloak, and provides comprehensive administrative APIs for multi-tenant company management.
 
 ## Architecture
 
 ### Core Components
 
-1. **Document Indexing Pipeline** (`pipelines/indexing_pipeline.py`)
-   - Processes PDF documents from the `documenten-import/` folder
-   - Splits documents into chunks with overlap
-   - Generates embeddings using multilingual sentence transformers
-   - Stores in Elasticsearch with both text and vector search capabilities
+1. **FastAPI Application** (`app/main.py`)
+   - RESTful API with automatic OpenAPI documentation
+   - CORS middleware for cross-origin requests
+   - Static file serving for highlighted PDFs
+   - Modular router architecture
 
-2. **RAG API** (`app/main.py`)
-   - FastAPI-based REST API
-   - Hybrid retrieval (BM25 + semantic search)
-   - Document reranking and cleaning
-   - Caching pipeline per model for performance
-   - Comprehensive error handling and logging
+2. **Authentication & Authorization** (`app/deps/auth.py`)
+   - Keycloak JWT token validation
+   - Role-based access control (RBAC)
+   - User context management
+   - Secure token parsing and validation
 
-3. **Chat Interfaces**
-   - `chat-api.py`: Alternative FastAPI implementation
-   - `chat-local-llm-ranker.py`: Streamlit web interface
+3. **Database Layer** (`app/deps/db.py`)
+   - MongoDB integration via Motor (async driver)
+   - Connection pooling and management
+   - Repository pattern implementation
 
-4. **Infrastructure**
-   - Elasticsearch 8.11.1 for document storage and search
-   - Docker Compose for local development
-   - Support for both local LLM servers and OpenAI API
+4. **RAG Integration** (`app/api/rag.py`)
+   - External RAG service communication
+   - Document indexing pipeline
+   - Query processing with context
+   - Async HTTP client for non-blocking operations
 
-### Search Pipeline Flow
+5. **Document Management**
+   - PDF upload and storage
+   - Document highlighting with snippet extraction
+   - Folder and role-based organization
+   - Private and public document handling
+
+6. **Multi-Tenant System**
+   - Company isolation
+   - Workspace management
+   - Admin hierarchy (Super Admin → Company Admin → Users)
+   - Module-based feature access
+
+## Technology Stack
+
+- **Framework**: FastAPI 0.116.2
+- **Database**: MongoDB 6.0 (via Motor async driver)
+- **Authentication**: Keycloak (JWT tokens)
+- **PDF Processing**: PyMuPDF 1.26.3
+- **HTTP Client**: httpx (async)
+- **Validation**: Pydantic 1.10.21
+- **Logging**: Rich 14.1.0
+- **Server**: Uvicorn with ASGI
+
+## Project Structure
 
 ```
-User Query → BM25 Retriever ────┐
-             Text Embedder → Vector Retriever ────┐
-                                                  ├→ Document Joiner → Document Cleaner → Reranker → Prompt Builder → LLM → Answer Builder
+DAVI_backend/
+├── app/
+│   ├── main.py                    # FastAPI application entry point
+│   ├── api/
+│   │   ├── ask.py                 # RAG query endpoint
+│   │   ├── upload.py              # Document upload endpoint
+│   │   ├── auth.py                # Authentication endpoints
+│   │   ├── super_admin.py         # Super admin operations
+│   │   ├── company_admin.py       # Company admin operations
+│   │   └── rag.py                 # RAG service integration
+│   ├── core/
+│   │   ├── config.py              # Environment configuration
+│   │   └── highlight_snippet_in_pdf.py  # PDF highlighting logic
+│   ├── deps/
+│   │   ├── auth.py                # Authentication dependencies
+│   │   ├── context.py             # Request context management
+│   │   └── db.py                  # Database connection
+│   ├── models/
+│   │   ├── schema.py              # Request/response models
+│   │   ├── company_admin_schema.py
+│   │   └── company_user_schema.py
+│   └── repositories/
+│       ├── company_repo.py        # Company data access
+│       └── document_repo.py      # Document data access
+├── docker-compose.yml             # Local development setup
+├── Dockerfile                     # Production container
+├── requirements.txt               # Python dependencies
+└── README.md                      # This file
 ```
 
 ## Installation
 
 ### Prerequisites
 
-- Python 3.8+
-- Docker and Docker Compose
-- At least 4GB RAM available for Elasticsearch
+- Python 3.12+
+- MongoDB 6.0+ (local or remote)
+- Docker and Docker Compose (for containerized setup)
+- Keycloak instance (for authentication)
+- External RAG service (for document querying)
 
-### Setup
+### Local Development Setup
 
 1. **Clone the repository**
    ```bash
-   git clone <repository-url>
-   cd mijndavi-rag-poc
+   cd DAVI_backend
    ```
 
-2. **Install Python dependencies**
+2. **Create virtual environment**
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+
+3. **Install dependencies**
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Start Elasticsearch**
-   ```bash
-   docker-compose up -d
-   ```
-
 4. **Configure environment variables**
+   
    Create a `.env.local` file in the root directory:
    ```env
-   ELASTIC_HOST=http://localhost:9200
-   ELASTIC_USER=elastic
-   ELASTIC_PASSWORD=elastic
-   ELASTIC_INDEX=haystack_test
-   LLM_API_URL=http://your-local-llm:1234/v1
+   # MongoDB Configuration
+   MONGO_URI=mongodb://localhost:27017/davi_db
+   DB_NAME=davi_db
+
+   # Keycloak Configuration
+   KEYCLOAK_PUBLIC_KEY=your-keycloak-public-key
+
+   # RAG Service Configuration
+   RAG_INDEX_URL=http://localhost:1416/davi_indexing/run
+   RAG_QUERY_URL=http://localhost:1416/davi_query/run
+
+   # OpenAI Configuration (optional)
    OPENAI_API_URL=https://api.openai.com/v1
-   OPENAI_API_KEY=your-openai-key
    MAX_TOKENS=1024
    ```
 
-5. **Index your documents**
-   Place PDF files in the `documenten-import/` folder and run:
+5. **Start MongoDB** (if using Docker)
    ```bash
-   python pipelines/indexing_pipeline.py
+   docker-compose up -d mongodb
    ```
 
-## Usage
+6. **Run the development server**
+   ```bash
+   uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+   ```
 
-### Running the API Server
+The API will be available at `http://localhost:8000` with interactive documentation at `http://localhost:8000/docs`.
+
+## API Endpoints
+
+### Authentication
+
+- `POST /auth/register` - Register a new user
+
+### RAG Query
+
+- `POST /ask/run` - Query documents using RAG
+  - Requires authentication
+  - Returns answer with highlighted document snippets
+  - Supports multiple LLM models
+
+### Document Management
+
+- `POST /upload` - Upload and index documents
+  - Supports PDF files
+  - Automatic RAG indexing
+  - Folder and role assignment
+
+### Super Admin
+
+- `GET /super-admin/companies` - List all companies
+- `POST /super-admin/companies` - Create new company
+- `POST /super-admin/companies/{company_id}/admins` - Add company admin
+- `PATCH /super-admin/companies/{company_id}/admins/{admin_id}` - Update admin
+- `POST /super-admin/companies/{company_id}/admins/{admin_id}/modules` - Assign modules
+- `DELETE /super-admin/companies/{company_id}` - Delete company
+- `DELETE /super-admin/companies/{company_id}/admins/{admin_id}` - Remove admin
+
+### Company Admin
+
+- `GET /company-admin/user` - Get current user info
+- `GET /company-admin/users` - List company users
+- `POST /company-admin/users` - Create user
+- `POST /company-admin/users/teamlid` - Create team member
+- `POST /company-admin/users/upload` - Bulk import users
+- `PUT /company-admin/users/{user_id}` - Update user
+- `DELETE /company-admin/users` - Delete users
+- `POST /company-admin/users/reset-password` - Reset user password
+- `GET /company-admin/documents` - List documents
+- `GET /company-admin/documents/private` - List private documents
+- `POST /company-admin/documents/delete` - Delete documents
+- `POST /company-admin/folders` - Create folder
+- `GET /company-admin/folders` - List folders
+- `POST /company-admin/folders/delete` - Delete folder
+- `POST /company-admin/roles` - Create role
+- `GET /company-admin/roles` - List roles
+- `POST /company-admin/roles/delete` - Delete role
+- `POST /company-admin/roles/assign` - Assign role to user
+- `POST /company-admin/roles/upload/{folder_name}` - Upload documents to role
+- `GET /company-admin/stats` - Get company statistics
+- `POST /company-admin/guest-access` - Create guest access
+- `GET /company-admin/guest-workspaces` - List guest workspaces
+
+## Authentication
+
+The API uses Keycloak for authentication. All protected endpoints require a valid JWT token in the `Authorization` header:
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+The token is validated using Keycloak's public key, and user information is extracted from the token claims.
+
+### User Roles
+
+- **Super Admin**: Full system access, can manage all companies
+- **Company Admin**: Manages users, documents, and settings within their company
+- **User**: Standard user with access to documents based on assigned roles and folders
+
+## Database Schema
+
+### Collections
+
+- **companies**: Company information and configuration
+- **users**: User accounts and profiles
+- **documents**: Document metadata and references
+- **folders**: Document folder organization
+- **roles**: Role definitions and permissions
+
+## Docker Deployment
+
+### Development
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+docker-compose up -d
 ```
 
-The API will be available at `http://localhost:8000` with automatic documentation at `http://localhost:8000/docs`.
+This starts:
+- FastAPI application on port 8000
+- MongoDB on port 27017 (internal)
 
-### API Endpoints
-
-#### POST `/ask`
-Ask a question to the RAG system.
-
-**Request Body:**
-```json
-{
-  "question": "Hoe meld ik een incident?",
-  "model": "granite-3.2-8b-instruct@q8_0"
-}
-```
-
-**Response:**
-```json
-{
-  "answer": "Om een incident te melden...",
-  "model_used": "granite-3.2-8b-instruct@q8_0"
-}
-```
-
-#### GET `/`
-Health check endpoint.
-
-### Using cURL
+### Production
 
 ```bash
-curl -X POST "http://localhost:8000/ask" \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Hoe meld ik een incident?", "model": "granite-3.2-8b-instruct@q8_0"}'
+docker build -t mijndavi-backend .
+docker run -p 8000:8000 --env-file .env.local mijndavi-backend
 ```
 
-
-## Available Models
-
-The system supports multiple language models:
-
-- `granite-3.2-8b-instruct@q8_0` (Local)
-- `granite-3.2-8b-instruct@f16` (Local)
-- `OpenAI` (GPT-4 via OpenAI API)
-
-## Document Types
-
-Currently supported document formats:
-- PDF files (placed in `documenten-import/` folder)
-
-Example documents included:
-- Childcare policies and procedures
-- Safety guidelines
-- Employee handbooks
-- Regulatory compliance documents
-
-## Configuration
-
-### Environment Variables
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ELASTIC_HOST` | `http://localhost:9200` | Elasticsearch host URL |
-| `ELASTIC_USER` | `elastic` | Elasticsearch username |
-| `ELASTIC_PASSWORD` | `elastic` | Elasticsearch password |
-| `ELASTIC_INDEX` | `haystack_test` | Elasticsearch index name |
-| `LLM_API_URL` | `http://localhost:1234/v1` | Local LLM server URL |
+| `MONGO_URI` | `mongodb://localhost:27017/DAVI` | MongoDB connection string |
+| `DB_NAME` | `DAVI` | MongoDB database name |
+| `KEYCLOAK_PUBLIC_KEY` | - | Keycloak realm public key for JWT validation |
+| `RAG_INDEX_URL` | `http://localhost:1416/davi_indexing/run` | RAG indexing service URL |
+| `RAG_QUERY_URL` | `http://localhost:1416/davi_query/run` | RAG query service URL |
 | `OPENAI_API_URL` | `https://api.openai.com/v1` | OpenAI API base URL |
 | `MAX_TOKENS` | `1024` | Maximum tokens for LLM responses |
 
-### Pipeline Optimization
+## Development Guidelines
 
-The RAG pipeline is optimized for childcare documentation with:
+### Code Style
 
-- **BM25 Settings**: `top_k=8`, `fuzziness="AUTO:4,7"`
-- **Vector Search**: `top_k=6` with normalized embeddings
-- **Document Joining**: Reciprocal rank fusion with embedding weight of 1.2
-- **Reranking**: Top 5 documents using cross-encoder model
-- **Chunking**: 150 words with 50-word overlap
+- Follow PEP 8 conventions
+- Use type hints for function parameters and return values
+- Document complex functions with docstrings
+- Use async/await for I/O operations
 
-## Development
+### Error Handling
 
-### Project Structure
+- Use FastAPI's `HTTPException` for API errors
+- Log errors with appropriate levels
+- Return meaningful error messages to clients
+- Handle database connection errors gracefully
 
-```
-mijndavi-rag-poc/
-├── app/
-│   ├── __init__.py
-│   ├── main.py                                # FastAPI application entry point
-│   ├── api/
-│   │    ├── __init__.py
-│   │    └── apk.py                            # Route logic (/ask)
-│   ├── core/
-│   │    ├── __init__.py
-│   │    ├── pipeline.py                       # Haystack pipeline logic
-│   │    ├── highlight_snippet_in_pdf.py       # PDF snippet highlighting
-│   │    └── config.py                         # Environment configuration
-│   └── models/
-│        └── schema.py                         # Request/response Pydantic models
-├── pipelines/
-│   └── indexing_pipeline.py                   # Script to index PDFs
-├── documenten-import/                         # Input PDF files
-├── output/
-│   └── highlighted/                           # Output PDFs with highlights
-├── chat-api.py                                # Alternative FastAPI implementation
-├── chat-local-llm-ranker.py                   # Streamlit interface
-├── requirements.txt                           # Python dependencies
-├── docker-compose.yml                         # Docker services setup
-├── Dockerfile                                 # Docker app container
-├── .env.local                                 # Environment variables
-└── README.md                                  # Project documentation
-```
-
-### Key Technologies
-
-- **Haystack 2.11+**: RAG framework
-- **FastAPI**: Modern web framework
-- **Elasticsearch 8.11.1**: Search and vector database
-- **Sentence Transformers**: Multilingual embeddings
-- **Rich**: Enhanced logging and console output
-- **Streamlit**: Web interface framework
-
-## Deployment
-
-### Docker Deployment
-
-The project includes Docker configuration for easy deployment:
+### Testing
 
 ```bash
-# Start Elasticsearch
-docker-compose up -d
-
-# Build and run the application (customize as needed)
-docker build -t mijndavi-rag .
-docker run -p 8000:8000 --env-file .env.local mijndavi-rag
+# Run tests (when implemented)
+pytest tests/
 ```
 
-### Production Considerations
+### Logging
 
-- Use proper Elasticsearch security in production
-- Configure SSL/TLS for API endpoints
-- Implement proper authentication and authorization
-- Set up monitoring and logging
-- Scale Elasticsearch cluster as needed
-- Consider using a reverse proxy (nginx, Traefik)
+The application uses Rich for enhanced console logging. Log levels:
+- `INFO`: Normal operations
+- `WARNING`: Non-critical issues
+- `ERROR`: Errors that need attention
+- `DEBUG`: Detailed debugging information
+
+## Production Considerations
+
+1. **Security**
+   - Use HTTPS/TLS for all connections
+   - Implement rate limiting
+   - Validate and sanitize all inputs
+   - Use environment variables for secrets
+   - Rotate JWT keys regularly
+
+2. **Performance**
+   - Enable connection pooling for MongoDB
+   - Use async operations for I/O-bound tasks
+   - Implement caching where appropriate
+   - Monitor API response times
+
+3. **Monitoring**
+   - Set up application logging
+   - Monitor database performance
+   - Track API usage and errors
+   - Set up health check endpoints
+
+4. **Scalability**
+   - Use load balancers for multiple instances
+   - Implement horizontal scaling
+   - Use message queues for async tasks
+   - Consider database sharding for large datasets
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Elasticsearch Connection Failed**
-   - Ensure Elasticsearch is running: `docker-compose ps`
-   - Check the `ELASTIC_HOST` configuration
-   - Verify network connectivity
+1. **MongoDB Connection Failed**
+   - Verify MongoDB is running: `docker-compose ps`
+   - Check `MONGO_URI` configuration
+   - Ensure network connectivity
 
-2. **No Documents Found**
-   - Run the indexing pipeline: `python pipelines/indexing_pipeline.py`
-   - Check if PDF files are in `documenten-import/` folder
-   - Verify Elasticsearch index exists
+2. **Keycloak Authentication Errors**
+   - Verify `KEYCLOAK_PUBLIC_KEY` is correct
+   - Check token expiration
+   - Ensure Keycloak server is accessible
 
-3. **LLM Connection Issues**
-   - Check `LLM_API_URL` configuration
-   - Ensure local LLM server is running
-   - Verify API key for OpenAI models
+3. **RAG Service Unavailable**
+   - Verify RAG service is running
+   - Check `RAG_INDEX_URL` and `RAG_QUERY_URL`
+   - Review network connectivity
 
-4. **Memory Issues**
-   - Increase Docker memory limits
-   - Reduce batch sizes in configuration
-   - Consider using quantized models
-
-### Logging
-
-The application uses Rich logging for enhanced console output. Logs include:
-- Request processing information
-- Pipeline execution details
-- Error messages with tracebacks
-- Performance metrics
+4. **Document Upload Failures**
+   - Check file permissions
+   - Verify upload directory exists
+   - Ensure sufficient disk space
 
 ## License
 
@@ -287,14 +351,18 @@ The application uses Rich logging for enhanced console output. Logs include:
 
 ---
 
-## 🛠️ My Customized Commands
+## Quick Reference
 
-### Re-index PDFs:
-```bash
-python pipelines/indexing_pipeline.py
-```
-
-### Start API server (development):
+### Start Development Server
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### View API Documentation
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+
+### Check Health
+```bash
+curl http://localhost:8000/
 ```
