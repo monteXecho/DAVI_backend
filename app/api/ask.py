@@ -32,7 +32,7 @@ def prepare_highlighted_dir(output_dir: str):
                 elif os.path.isdir(file_path):
                     shutil.rmtree(file_path)
             except Exception as e:
-                print(f"⚠️ Could not remove {file_path}: {e}")
+                print(f"Could not remove {file_path}: {e}")
     else:
         os.makedirs(output_dir, exist_ok=True)
 
@@ -47,7 +47,7 @@ def highlight_documents(documents, output_dir: str):
         actual_file_name = meta.get("file_path")
 
         if not file_id:
-            logger.warning("⚠️ Missing file_id in document meta.")
+            logger.warning("Missing file_id in document meta.")
             continue
 
         original_path = meta.get("original_file_path", "")
@@ -57,18 +57,18 @@ def highlight_documents(documents, output_dir: str):
             relative_path = original_path
 
         abs_input_path = os.path.join(base_upload_dir, relative_path)
-        logger.info(f"✅✅✅ ----- abs_input_path -----: {abs_input_path}")
+        logger.info(f"----- abs_input_path -----: {abs_input_path}")
         output_path = os.path.join(output_dir, actual_file_name)
 
         if not os.path.exists(abs_input_path):
-            logger.error(f"❌ File not found for highlighting: {abs_input_path}")
+            logger.error(f"File not found for highlighting: {abs_input_path}")
             continue
 
         try:
             find_and_highlight(abs_input_path, snippet, meta.get("page_number", 1), output_path)
             meta["highlighted_path"] = output_path
         except Exception as e:
-            logger.error(f"❌ Failed to process {abs_input_path}: {e}")
+            logger.error(f"Failed to process {abs_input_path}: {e}")
 
 # --------------------------------------------------------------------------
 # Endpoint
