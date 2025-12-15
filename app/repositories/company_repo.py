@@ -1946,8 +1946,8 @@ class CompanyRepository:
             owner_admin_id=admin_id,  # The admin whose workspace this teamlid can access
             guest_user_id=target_user_id,
             can_role_write=to_bool(role_folder),
-            can_user_read=to_bool(user_modify),  # Note: teamlid uses user_create_modify_permission
-            can_document_read=to_bool(document_modify),
+            can_user_write=to_bool(user_modify),  # Note: teamlid uses user_create_modify_permission
+            can_document_write=to_bool(document_modify),
             can_folder_write=to_bool(role_folder),
             created_by=admin_id,
         )
@@ -2036,8 +2036,8 @@ class CompanyRepository:
         owner_admin_id: str,
         guest_user_id: str,
         can_role_write: bool,
-        can_user_read: bool,
-        can_document_read: bool,
+        can_user_write: bool,
+        can_document_write: bool,
         can_folder_write: bool,
         created_by: str,
     ) -> dict:
@@ -2050,8 +2050,8 @@ class CompanyRepository:
             "owner_admin_id": owner_admin_id,
             "guest_user_id": guest_user_id,
             "can_role_write": can_role_write,
-            "can_user_read": can_user_read,
-            "can_document_read": can_document_read,
+            "can_user_write": can_user_write,
+            "can_document_write": can_document_write,
             "can_folder_write": can_folder_write,
             "is_active": True,
             "updated_at": now,
@@ -2079,6 +2079,7 @@ class CompanyRepository:
     ) -> list[dict]:
         """
         Return all active guest-access entries for given user in a company.
+        Automatically migrates old field names to new ones.
         """
         cursor = self.guest_access.find(
             {
@@ -2087,7 +2088,51 @@ class CompanyRepository:
                 "is_active": True,
             }
         )
-        return [doc async for doc in cursor]
+        
+        entries = []
+        async for doc in cursor:
+            # Migrate each entry if needed
+            needs_migration = False
+            update_fields = {}
+            
+            if "can_user_read" in doc and "can_user_write" not in doc:
+                update_fields["can_user_write"] = doc["can_user_read"]
+                needs_migration = True
+            
+            if "can_document_read" in doc and "can_document_write" not in doc:
+                update_fields["can_document_write"] = doc["can_document_read"]
+                needs_migration = True
+            
+            if needs_migration:
+                unset_fields = {}
+                if "can_user_read" in doc:
+                    unset_fields["can_user_read"] = ""
+                if "can_document_read" in doc:
+                    unset_fields["can_document_read"] = ""
+                
+                update_doc = {
+                    "$set": {
+                        **update_fields,
+                        "updated_at": datetime.utcnow(),
+                    }
+                }
+                if unset_fields:
+                    update_doc["$unset"] = unset_fields
+                
+                await self.guest_access.update_one(
+                    {"_id": doc["_id"]},
+                    update_doc
+                )
+                
+                # Update the doc dict to reflect changes
+                doc.update(update_fields)
+                if unset_fields:
+                    for field in unset_fields.keys():
+                        doc.pop(field, None)
+            
+            entries.append(doc)
+        
+        return entries
 
     async def get_guest_access(
         self,
@@ -2095,7 +2140,7 @@ class CompanyRepository:
         guest_user_id: str,
         owner_admin_id: str,
     ) -> Optional[dict]:
-        return await self.guest_access.find_one(
+        entry = await self.guest_access.find_one(
             {
                 "company_id": company_id,
                 "guest_user_id": guest_user_id,
@@ -2103,6 +2148,55 @@ class CompanyRepository:
                 "is_active": True,
             }
         )
+        
+        if not entry:
+            return None
+        
+        # Automatic migration: Convert old field names to new ones if needed
+        needs_migration = False
+        update_fields = {}
+        
+        # Check if old field names exist and new ones don't
+        if "can_user_read" in entry and "can_user_write" not in entry:
+            # Migrate: can_user_read -> can_user_write (same value, just rename)
+            update_fields["can_user_write"] = entry["can_user_read"]
+            needs_migration = True
+        
+        if "can_document_read" in entry and "can_document_write" not in entry:
+            # Migrate: can_document_read -> can_document_write (same value, just rename)
+            update_fields["can_document_write"] = entry["can_document_read"]
+            needs_migration = True
+        
+        # If migration is needed, update the document
+        if needs_migration:
+            # Remove old fields and add new ones
+            unset_fields = {}
+            if "can_user_read" in entry:
+                unset_fields["can_user_read"] = ""
+            if "can_document_read" in entry:
+                unset_fields["can_document_read"] = ""
+            
+            update_doc = {
+                "$set": {
+                    **update_fields,
+                    "updated_at": datetime.utcnow(),
+                }
+            }
+            if unset_fields:
+                update_doc["$unset"] = unset_fields
+            
+            await self.guest_access.update_one(
+                {"_id": entry["_id"]},
+                update_doc
+            )
+            
+            # Update the entry dict to reflect changes
+            entry.update(update_fields)
+            if unset_fields:
+                for field in unset_fields.keys():
+                    entry.pop(field, None)
+        
+        return entry
 
     async def disable_guest_access(
         self,

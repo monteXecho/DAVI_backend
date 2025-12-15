@@ -9,8 +9,8 @@ from app.repositories.company_repo import CompanyRepository
 
 class GuestPermissions(BaseModel):
     role_write: bool = False
-    user_read: bool = False
-    document_read: bool = False
+    user_write: bool = False
+    document_write: bool = False
     folder_write: bool = False
 
 
@@ -90,11 +90,32 @@ async def get_request_context(
 
         is_guest_mode = True
         owner_admin_id = acting_owner_id
+        
+        # Helper function for backward compatibility
+        def _to_bool(value) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.lower() in ("true", "1", "yes")
+            return bool(value)
+        
+        def _get_guest_permission(entry: dict, new_field: str, old_field: str = None) -> bool:
+            value = entry.get(new_field)
+            if value is not None:
+                return _to_bool(value)
+            if old_field:
+                old_value = entry.get(old_field)
+                if old_value is not None:
+                    return _to_bool(old_value)
+            return False
+        
         guest_permissions = GuestPermissions(
-            role_write=guest_entry.get("can_role_write", False),
-            user_read=guest_entry.get("can_user_read", False),
-            document_read=guest_entry.get("can_document_read", False),
-            folder_write=guest_entry.get("can_folder_write", False),
+            role_write=_get_guest_permission(guest_entry, "can_role_write"),
+            user_write=_get_guest_permission(guest_entry, "can_user_write", "can_user_read"),
+            document_write=_get_guest_permission(guest_entry, "can_document_write", "can_document_read"),
+            folder_write=_get_guest_permission(guest_entry, "can_folder_write"),
         )
 
     return RequestContext(

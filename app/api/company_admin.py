@@ -43,6 +43,33 @@ def _can_write_documents(perms: dict) -> bool:
     return str(val).lower() == "true"
 
 
+def _to_bool(value) -> bool:
+    """Convert string/boolean to boolean, handling both old and new formats"""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def _get_guest_permission(guest_entry: dict, new_field: str, old_field: str = None) -> bool:
+    """Get guest permission with backward compatibility for old field names"""
+    # Try new field name first
+    value = guest_entry.get(new_field)
+    if value is not None:
+        return _to_bool(value)
+    
+    # Fallback to old field name if provided
+    if old_field:
+        old_value = guest_entry.get(old_field)
+        if old_value is not None:
+            return _to_bool(old_value)
+    
+    return False
+
+
 async def check_teamlid_permission(
     admin_context: dict,
     db,
@@ -84,13 +111,14 @@ async def check_teamlid_permission(
     
     if guest_entry:
         # Use permissions from guest_access entry (supports multiple assignments)
-        can_role_write = guest_entry.get("can_role_write", False)
-        can_user_read = guest_entry.get("can_user_read", False)
-        can_document_read = guest_entry.get("can_document_read", False)
-        can_folder_write = guest_entry.get("can_folder_write", False)
+        # Backward compatibility: support both old and new field names
+        can_role_write = _get_guest_permission(guest_entry, "can_role_write")
+        can_user_write = _get_guest_permission(guest_entry, "can_user_write", "can_user_read")
+        can_document_write = _get_guest_permission(guest_entry, "can_document_write", "can_document_read")
+        can_folder_write = _get_guest_permission(guest_entry, "can_folder_write")
         
         if permission_type == "users":
-            if not can_user_read:
+            if not can_user_write:
                 raise HTTPException(
                     status_code=403,
                     detail="U heeft geen toestemming om gebruikers te beheren."
@@ -102,7 +130,7 @@ async def check_teamlid_permission(
                     detail="U heeft geen toestemming om rollen of mappen te beheren."
                 )
         elif permission_type == "documents":
-            if not can_document_read:
+            if not can_document_write:
                 raise HTTPException(
                     status_code=403,
                     detail="U heeft geen toestemming om documenten te beheren."
@@ -188,11 +216,12 @@ async def get_admin_company_id(
         )
         if guest_entry:
             # Found in guest_access collection (supports multiple teamlid roles)
+            # Backward compatibility: support both old and new field names
             guest_permissions = {
-                "role_write": guest_entry.get("can_role_write", False),
-                "user_read": guest_entry.get("can_user_read", False),
-                "document_read": guest_entry.get("can_document_read", False),
-                "folder_write": guest_entry.get("can_folder_write", False),
+                "role_write": _get_guest_permission(guest_entry, "can_role_write"),
+                "user_write": _get_guest_permission(guest_entry, "can_user_write", "can_user_read"),
+                "document_write": _get_guest_permission(guest_entry, "can_document_write", "can_document_read"),
+                "folder_write": _get_guest_permission(guest_entry, "can_folder_write"),
             }
         else:
             # Fallback for backward compatibility: check old teamlid assignment on user document
@@ -203,8 +232,8 @@ async def get_admin_company_id(
                 teamlid_perms = full_admin.get("teamlid_permissions", {})
                 guest_permissions = {
                     "role_write": teamlid_perms.get("role_folder_modify_permission", False),
-                    "user_read": teamlid_perms.get("user_create_modify_permission", False),
-                    "document_read": teamlid_perms.get("document_modify_permission", False),
+                    "user_write": teamlid_perms.get("user_create_modify_permission", False),
+                    "document_write": teamlid_perms.get("document_modify_permission", False),
                     "folder_write": teamlid_perms.get("role_folder_modify_permission", False),
                 }
             else:
@@ -257,8 +286,8 @@ async def create_or_update_guest_access(
         owner_admin_id=owner_admin_id,
         guest_user_id=payload.guest_user_id,
         can_role_write=payload.can_role_write,
-        can_user_read=payload.can_user_read,
-        can_document_read=payload.can_document_read,
+        can_user_write=payload.can_user_write,
+        can_document_write=payload.can_document_write,
         can_folder_write=payload.can_folder_write,
         created_by=owner_admin_id,
     )
@@ -329,8 +358,8 @@ async def get_guest_workspaces(
         document_modify = perms.get("document_modify_permission", False)
         return {
             "role_write": bool(role_folder),
-            "user_read": bool(user_modify),
-            "document_read": bool(document_modify),
+            "user_write": bool(user_modify),
+            "document_write": bool(document_modify),
             "folder_write": bool(role_folder),
         }
 
@@ -354,10 +383,10 @@ async def get_guest_workspaces(
                     "email": owner_admin.get("email"),
                 },
                 "permissions": {
-                    "role_write": entry.get("can_role_write", False),
-                    "user_read": entry.get("can_user_read", False),
-                    "document_read": entry.get("can_document_read", False),
-                    "folder_write": entry.get("can_folder_write", False),
+                    "role_write": _get_guest_permission(entry, "can_role_write"),
+                    "user_write": _get_guest_permission(entry, "can_user_write", "can_user_read"),
+                    "document_write": _get_guest_permission(entry, "can_document_write", "can_document_read"),
+                    "folder_write": _get_guest_permission(entry, "can_folder_write"),
                 },
             }
         )
@@ -590,6 +619,17 @@ async def assign_teamlid_permission(
     admin_context=Depends(get_admin_company_id),
     db=Depends(get_db)
 ):
+    # CRITICAL: Only allow assigning teamlid permissions when acting on own workspace
+    # Teamlids cannot assign permissions to others
+    real_admin_id = admin_context.get("real_admin_id")
+    acting_admin_id = admin_context.get("admin_id")
+    
+    if real_admin_id != acting_admin_id:
+        raise HTTPException(
+            status_code=403,
+            detail="U kunt alleen teamlid rechten toewijzen in uw eigen werkruimte."
+        )
+    
     repo = CompanyRepository(db)
 
     company_id = admin_context["company_id"]
@@ -676,8 +716,12 @@ async def upload_users_from_file(
 @company_admin_router.post("/users/reset-password")
 async def reset_user_password(
     payload: ResetPasswordPayload,
-    admin_context = Depends(get_admin_company_id)
+    admin_context = Depends(get_admin_company_id),
+    db=Depends(get_db)
 ):
+    # Check teamlid permissions (resetting passwords is a user management operation)
+    await check_teamlid_permission(admin_context, db, "users")
+    
     kc = get_keycloak_admin()
     email = payload.email
     logger.info(f"Password reset requested for {email}")

@@ -53,15 +53,15 @@ class CompanyOut(BaseModel):
 class GuestAccessPayload(BaseModel):
     guest_user_id: str
     can_role_write: bool = False
-    can_user_read: bool = True
-    can_document_read: bool = True
+    can_user_write: bool = False
+    can_document_write: bool = False
     can_folder_write: bool = False
 
 
 class GuestWorkspacePermissions(BaseModel):
     role_write: bool = False
-    user_read: bool = False
-    document_read: bool = False
+    user_write: bool = False
+    document_write: bool = False
     folder_write: bool = False
 
 
