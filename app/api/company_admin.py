@@ -2,6 +2,7 @@ import logging
 import pandas as pd
 import os, json
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, status, Form, Body, Request
+from fastapi.responses import FileResponse
 from app.deps.auth import require_role, get_keycloak_admin, get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
@@ -750,6 +751,88 @@ async def get_admin_uploaded_documents(
         "success": True,
         "data": result
     }
+
+
+@company_admin_router.get("/documents/all")
+async def get_all_user_documents(
+    user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    """
+    Get all documents for the current user (both private and role-based).
+    
+    For company admins:
+    - Returns private documents (upload_type="document") 
+    - Returns all documents in folders created by this admin (upload_type=folder_name)
+    
+    For company users:
+    - Returns private documents (upload_type="document")
+    - Returns documents from folders assigned via roles:
+      1. Get user's assigned_roles and added_by_admin_id
+      2. Find roles with matching name, company_id, and added_by_admin_id
+      3. Get folders from those roles
+      4. Find documents with upload_type in folder names and user_id = added_by_admin_id
+    """
+    email = user.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Email not found in token")
+
+    repo = CompanyRepository(db)
+    result = await repo.get_all_user_documents(email)
+    
+    return {
+        "success": True,
+        "data": result
+    }
+
+
+@company_admin_router.get("/documents/download")
+async def download_document(
+    file_path: str = Query(..., description="Path to the document file"),
+    user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    """
+    Download/view a document file. Verifies the user has access to the document
+    before serving it.
+    """
+    email = user.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Email not found in token")
+
+    repo = CompanyRepository(db)
+    
+    # Verify user has access to this document
+    user_data = await repo.get_all_user_documents(email)
+    user_documents = user_data.get("documents", [])
+    
+    # Check if the file_path belongs to one of the user's accessible documents
+    document_found = any(doc.get("path") == file_path for doc in user_documents)
+    
+    if not document_found:
+        raise HTTPException(status_code=403, detail="You don't have access to this document")
+    
+    # Verify file exists
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Get file name for download
+    file_name = os.path.basename(file_path)
+    
+    # Determine media type based on file extension
+    media_type = "application/octet-stream"
+    if file_path.lower().endswith('.pdf'):
+        media_type = "application/pdf"
+    elif file_path.lower().endswith(('.doc', '.docx')):
+        media_type = "application/msword"
+    elif file_path.lower().endswith('.txt'):
+        media_type = "text/plain"
+    
+    return FileResponse(
+        path=file_path,
+        filename=file_name,
+        media_type=media_type
+    )
 
 
 @company_admin_router.post("/users")

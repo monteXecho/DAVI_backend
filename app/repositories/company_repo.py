@@ -2192,6 +2192,133 @@ class CompanyRepository:
             "pass_ids": pass_ids,
         }
 
+    async def get_all_user_documents(self, email: str):
+        """
+        Get all documents for a user (both private and role-based).
+        
+        For company admins:
+        - Returns private documents (upload_type="document") 
+        - Returns all documents in folders created by this admin (upload_type=folder_name)
+        
+        For company users:
+        - Returns private documents (upload_type="document")
+        - Returns documents from folders assigned via roles:
+          1. Get user's assigned_roles and added_by_admin_id
+          2. Find roles with matching name, company_id, and added_by_admin_id
+          3. Get folders from those roles
+          4. Find documents with upload_type in folder names and user_id = added_by_admin_id
+        """
+        # Check if user is admin or company user
+        admin_user = await self.admins.find_one({"email": email})
+        company_user = await self.users.find_one({"email": email})
+        
+        if not admin_user and not company_user:
+            return {
+                "documents": [],
+                "user_type": "unknown"
+            }
+        
+        formatted_documents = []
+        
+        if admin_user:
+            # Company admin: get private documents + all documents in folders created by this admin
+            admin_id = admin_user["user_id"]
+            company_id = admin_user["company_id"]
+            
+            # Get private documents
+            private_docs_query = {
+                "user_id": admin_id,
+                "company_id": company_id,
+                "upload_type": "document"
+            }
+            private_docs_cursor = self.documents.find(private_docs_query)
+            private_docs = [d async for d in private_docs_cursor]
+            
+            # Get all role-based documents (documents in folders created by this admin)
+            # These have upload_type = folder_name (not "document")
+            role_based_docs_query = {
+                "user_id": admin_id,
+                "company_id": company_id,
+                "upload_type": {"$ne": "document"}
+            }
+            role_based_docs_cursor = self.documents.find(role_based_docs_query)
+            role_based_docs = [d async for d in role_based_docs_cursor]
+            
+            # Combine and format
+            all_docs = private_docs + role_based_docs
+            for doc in all_docs:
+                upload_type = doc.get("upload_type", "document")
+                formatted_documents.append({
+                    "file_name": doc.get("file_name", ""),
+                    "upload_type": upload_type,
+                    "path": doc.get("path", ""),
+                    "is_private": upload_type == "document"
+                })
+            
+            user_type = "admin"
+            
+        else:
+            # Company user: get private documents + documents from assigned roles
+            user_id = company_user["user_id"]
+            company_id = company_user["company_id"]
+            assigned_roles = company_user.get("assigned_roles", [])
+            added_by_admin_id = company_user.get("added_by_admin_id")
+            
+            # Get private documents
+            private_docs_query = {
+                "user_id": user_id,
+                "company_id": company_id,
+                "upload_type": "document"
+            }
+            private_docs_cursor = self.documents.find(private_docs_query)
+            private_docs = [d async for d in private_docs_cursor]
+            
+            # Get role-based documents
+            role_based_docs = []
+            if assigned_roles and added_by_admin_id:
+                # Find roles with matching name, company_id, and added_by_admin_id
+                roles_query = {
+                    "company_id": company_id,
+                    "added_by_admin_id": added_by_admin_id,
+                    "name": {"$in": assigned_roles}
+                }
+                roles_cursor = self.roles.find(roles_query)
+                roles = [r async for r in roles_cursor]
+                
+                # Collect all folder names from these roles
+                folder_names = set()
+                for role in roles:
+                    folders = role.get("folders", [])
+                    folder_names.update(folders)
+                
+                # Find documents with upload_type in folder names and user_id = added_by_admin_id
+                if folder_names:
+                    role_based_docs_query = {
+                        "user_id": added_by_admin_id,
+                        "company_id": company_id,
+                        "upload_type": {"$in": list(folder_names)}
+                    }
+                    role_based_docs_cursor = self.documents.find(role_based_docs_query)
+                    role_based_docs = [d async for d in role_based_docs_cursor]
+            
+            # Combine and format
+            all_docs = private_docs + role_based_docs
+            for doc in all_docs:
+                upload_type = doc.get("upload_type", "document")
+                formatted_documents.append({
+                    "file_name": doc.get("file_name", ""),
+                    "upload_type": upload_type,
+                    "path": doc.get("path", ""),
+                    "is_private": upload_type == "document"
+                })
+            
+            user_type = "company_user"
+
+        return {
+            "documents": formatted_documents,
+            "user_type": user_type
+        }
+
     async def get_admin_with_documents_by_id(
         self,
         company_id: str,

@@ -1,0 +1,37 @@
+# Example Nginx configuration for DAVI backend
+# Place this in your Nginx configuration (e.g., /etc/nginx/sites-available/davi-backend)
+# or include it in your main nginx.conf
+
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    # Increase client body size limit to allow large file uploads (e.g., 100MB)
+    # Default is 1MB, which causes 413 errors for files > 1MB
+    client_max_body_size 100M;
+    
+    # Increase buffer sizes for large uploads
+    client_body_buffer_size 128k;
+    
+    # Increase timeouts for large file uploads
+    proxy_connect_timeout 300;
+    proxy_send_timeout 300;
+    proxy_read_timeout 300;
+    send_timeout 300;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # Increase buffer sizes for proxy
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+        
+        # Disable request buffering for large uploads (stream directly)
+        proxy_request_buffering off;
+    }
+}

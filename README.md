@@ -345,6 +345,17 @@ The application uses Rich for enhanced console logging. Log levels:
    - Verify upload directory exists
    - Ensure sufficient disk space
 
+5. **413 Payload Too Large Error (Production)**
+   - **Root Cause**: Reverse proxy (Nginx) has a default `client_max_body_size` of 1MB
+   - **Solution**: Update your Nginx configuration to allow larger uploads:
+     ```nginx
+     client_max_body_size 100M;  # or your desired limit
+     proxy_request_buffering off;  # Stream large uploads directly
+     ```
+   - See `nginx.conf.example` for a complete configuration example
+   - After updating Nginx config, reload: `sudo nginx -s reload` or `sudo systemctl reload nginx`
+   - **Note**: This only affects production deployments with a reverse proxy. Local development typically doesn't have this limit.
+
 ## License
 
 © 2025 by MijnDAVI. All rights reserved.
