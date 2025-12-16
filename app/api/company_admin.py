@@ -491,10 +491,10 @@ async def get_guest_workspaces(
     # Self workspace: for admins, it's their own; for users, it's their normal admin workspace.
     if user_type == "company_admin":
         self_owner_id = base_user["user_id"]
-        self_label = "My admin workspace"
+        self_label = "MIJN ADMIN WERKRUIMTE"
     else:
         self_owner_id = base_user.get("added_by_admin_id", base_user["user_id"])
-        self_label = "My workspace"
+        self_label = "MIJN WERKRUIMTE"
 
     response = {
         "self": {
