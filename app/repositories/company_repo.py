@@ -372,11 +372,22 @@ class CompanyRepository:
             for user in users:
                 for role_name in user.get("assigned_roles", []):
                     user_info = {
+                        "id": user.get("user_id", ""),
                         "name": user.get("name", ""),
-                        "email": user.get("email", "")
+                        "email": user.get("email", ""),
+                        "user_id": user.get("user_id", "")
                     }
-                    if user_info not in role_users_map[role_name]:
+                    # Check if user already exists (by user_id) to avoid duplicates
+                    existing_user = next((u for u in role_users_map[role_name] if u.get("user_id") == user_info["user_id"]), None)
+                    if not existing_user:
                         role_users_map[role_name].append(user_info)
+            
+            # Create a map of folder_name -> all roles that have this folder
+            folder_roles_map = defaultdict(set)
+            for role in roles:
+                role_name = role["name"]
+                for folder_name in role.get("folders", []):
+                    folder_roles_map[folder_name].add(role_name)
             
             result = {}
             for role in roles:
@@ -386,8 +397,21 @@ class CompanyRepository:
                 for folder_name in role_folders_map[role_name]:
                     folder_docs = folder_docs_map.get(folder_name, [])
                     
+                    # For each document, get users from ALL roles that have this folder
                     for doc in folder_docs:
-                        doc["assigned_to"] = role_users_map.get(role_name, [])
+                        all_users_for_folder = []
+                        seen_user_ids = set()
+                        
+                        # Get users from all roles that have this folder
+                        for role_with_folder in folder_roles_map.get(folder_name, []):
+                            users_in_role = role_users_map.get(role_with_folder, [])
+                            for user in users_in_role:
+                                user_id = user.get("user_id") or user.get("id")
+                                if user_id and user_id not in seen_user_ids:
+                                    seen_user_ids.add(user_id)
+                                    all_users_for_folder.append(user)
+                        
+                        doc["assigned_to"] = all_users_for_folder
                     
                     folder_entry = {
                         "name": folder_name,

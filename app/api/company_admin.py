@@ -1,7 +1,8 @@
 import logging
 import pandas as pd
 import os, json
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, status, Form, Body, Request
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, status, Form, Body
+from fastapi import Request
 from fastapi.responses import FileResponse
 from app.deps.auth import require_role, get_keycloak_admin, get_current_user
 from app.deps.db import get_db
@@ -597,6 +598,7 @@ async def get_guest_workspaces(
 
 @company_admin_router.get("/user")
 async def get_login_user(
+    request: Request,
     user=Depends(get_current_user),
     db=Depends(get_db)
 ):
@@ -607,22 +609,65 @@ async def get_login_user(
     if not email:
         raise HTTPException(status_code=400, detail="Missing email in authentication token")
 
+    repo = CompanyRepository(db)
+    
+    # Helper function for backward compatibility
+    def _to_bool(value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes")
+        return bool(value)
+    
+    def _get_guest_permission(entry: dict, new_field: str, old_field: str = None) -> bool:
+        value = entry.get(new_field)
+        if value is not None:
+            return _to_bool(value)
+        if old_field:
+            old_value = entry.get(old_field)
+            if old_value is not None:
+                return _to_bool(old_value)
+        return False
+
     if "company_admin" in roles:
         admin_record = await db.company_admins.find_one({"email": email})
         if not admin_record:
             raise HTTPException(status_code=404, detail="Admin not found in backend")
 
+        company_id = admin_record.get("company_id")
+        real_user_id = admin_record.get("user_id")
+        acting_owner_id = request.headers.get("X-Acting-Owner-Id")
+        
+        # Check if in guest mode
+        guest_permissions = None
+        if acting_owner_id and acting_owner_id != real_user_id:
+            guest_entry = await repo.get_guest_access(
+                company_id=company_id,
+                guest_user_id=real_user_id,
+                owner_admin_id=acting_owner_id,
+            )
+            if guest_entry:
+                guest_permissions = {
+                    "can_role_write": _get_guest_permission(guest_entry, "can_role_write"),
+                    "can_user_write": _get_guest_permission(guest_entry, "can_user_write", "can_user_read"),
+                    "can_document_write": _get_guest_permission(guest_entry, "can_document_write", "can_document_read"),
+                    "can_folder_write": _get_guest_permission(guest_entry, "can_folder_write"),
+                }
+
         return {
             "type": "company_admin",
             "email": admin_record["email"],
             "name": admin_record.get("name"),
-            "company_id": admin_record.get("company_id"),
-            "user_id": admin_record.get("user_id"),
+            "company_id": company_id,
+            "user_id": real_user_id,
             "modules": admin_record.get("modules", {}),
             
             "is_teamlid": admin_record.get("is_teamlid", False),
             "teamlid_permissions": admin_record.get("teamlid_permissions", {}),
-            "assigned_teamlid_by_name": admin_record.get("assigned_teamlid_by_name", None)
+            "assigned_teamlid_by_name": admin_record.get("assigned_teamlid_by_name", None),
+            "guest_permissions": guest_permissions
         }
 
     elif "company_user" in roles:
@@ -631,7 +676,28 @@ async def get_login_user(
             raise HTTPException(status_code=404, detail="User not found")
 
         company_id = user_record["company_id"]
+        real_user_id = user_record.get("user_id")
         assigned_roles = user_record.get("assigned_roles", [])
+        added_by_admin_id = user_record.get("added_by_admin_id")
+        
+        # Get acting owner from header
+        acting_owner_id = request.headers.get("X-Acting-Owner-Id", added_by_admin_id)
+        
+        # Check guest permissions
+        guest_permissions = None
+        if acting_owner_id:
+            guest_entry = await repo.get_guest_access(
+                company_id=company_id,
+                guest_user_id=real_user_id,
+                owner_admin_id=acting_owner_id,
+            )
+            if guest_entry:
+                guest_permissions = {
+                    "can_role_write": _get_guest_permission(guest_entry, "can_role_write"),
+                    "can_user_write": _get_guest_permission(guest_entry, "can_user_write", "can_user_read"),
+                    "can_document_write": _get_guest_permission(guest_entry, "can_document_write", "can_document_read"),
+                    "can_folder_write": _get_guest_permission(guest_entry, "can_folder_write"),
+                }
 
         final_modules = {
             "Documenten chat": {"enabled": False},
@@ -644,13 +710,14 @@ async def get_login_user(
                 "email": user_record["email"],
                 "name": user_record.get("name"),
                 "company_id": company_id,
-                "user_id": user_record.get("user_id"),
+                "user_id": real_user_id,
                 "roles": assigned_roles,
                 "modules": final_modules,
 
                 "is_teamlid": user_record.get("is_teamlid", False),
                 "teamlid_permissions": user_record.get("teamlid_permissions", {}),
-                "assigned_teamlid_by_name": user_record.get("assigned_teamlid_by_name", None)
+                "assigned_teamlid_by_name": user_record.get("assigned_teamlid_by_name", None),
+                "guest_permissions": guest_permissions
             }
 
         roles_collection = db.company_roles
@@ -679,13 +746,14 @@ async def get_login_user(
             "email": user_record["email"],
             "name": user_record.get("name"),
             "company_id": company_id,
-            "user_id": user_record.get("user_id"),
+            "user_id": real_user_id,
             "roles": assigned_roles,
             "modules": final_modules,
 
             "is_teamlid": user_record.get("is_teamlid", False),
             "teamlid_permissions": user_record.get("teamlid_permissions", {}),
-            "assigned_teamlid_by_name": user_record.get("assigned_teamlid_by_name", None)
+            "assigned_teamlid_by_name": user_record.get("assigned_teamlid_by_name", None),
+            "guest_permissions": guest_permissions
         }
 
     else:
