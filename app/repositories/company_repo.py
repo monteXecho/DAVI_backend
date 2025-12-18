@@ -4,6 +4,7 @@ import copy
 import os
 import re
 import io
+import glob
 import aiofiles
 import pandas as pd
 import shutil
@@ -422,6 +423,31 @@ class CompanyRepository:
                 if role_data["folders"]:
                     result[role_name] = role_data
             
+            # Also include documents for folders that are not assigned to any role
+            # These folders exist but aren't in any role's folder list
+            folders_in_roles_set = set()
+            for role in roles:
+                for folder_name in role.get("folders", []):
+                    folders_in_roles_set.add(folder_name)
+            
+            # Find folders with documents that aren't assigned to any role
+            unassigned_folders_docs = {}
+            for folder_name, folder_docs in folder_docs_map.items():
+                if folder_name not in folders_in_roles_set and folder_docs:
+                    # Create a special entry for unassigned folders
+                    if "_unassigned" not in result:
+                        result["_unassigned"] = {"folders": []}
+                    
+                    # Add users (empty array since no roles assigned)
+                    for doc in folder_docs:
+                        doc["assigned_to"] = []
+                    
+                    folder_entry = {
+                        "name": folder_name,
+                        "documents": folder_docs
+                    }
+                    result["_unassigned"]["folders"].append(folder_entry)
+            
             return result
             
         except Exception as e:
@@ -618,7 +644,46 @@ class CompanyRepository:
 
         # Loop through matched role/folder pairs
         for role_name, folder_name in zip(role_names, folder_names):
+            
+            # Handle unassigned folders (empty role_name)
+            if not role_name or role_name.strip() == "":
+                # Delete all documents for this folder (upload_type matches folder_name)
+                delete_docs_result = await self.documents.delete_many({
+                    "company_id": company_id,
+                    "user_id": admin_id,
+                    "upload_type": folder_name
+                })
+                
+                total_documents_deleted += delete_docs_result.deleted_count
+                
+                # Remove folder from filesystem - check all possible paths
+                # Documents might be in different role folders
+                pattern = os.path.join(
+                    UPLOAD_ROOT,
+                    "roleBased",
+                    company_id,
+                    admin_id,
+                    "*",
+                    folder_name
+                )
+                for path in glob.glob(pattern):
+                    if os.path.exists(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                
+                # Delete the folder record itself
+                await self.folders.delete_one({
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "name": folder_name
+                })
+                
+                deleted_folders.append({
+                    "role_name": None,
+                    "folder_name": folder_name
+                })
+                continue
 
+            # Handle folders assigned to roles
             # Find the role that contains this folder
             role = await self.roles.find_one({
                 "company_id": company_id,
@@ -628,44 +693,134 @@ class CompanyRepository:
             })
 
             if not role:
+                # Role not found or folder not in role - try to delete documents and folder anyway
+                # This handles cases where the folder exists but role assignment is inconsistent
+                logger.warning(f"Role '{role_name}' with folder '{folder_name}' not found, attempting cleanup anyway")
+                
+                # Try to delete documents for this folder
+                delete_docs_result = await self.documents.delete_many({
+                    "company_id": company_id,
+                    "user_id": admin_id,
+                    "upload_type": folder_name
+                })
+                
+                if delete_docs_result.deleted_count > 0:
+                    total_documents_deleted += delete_docs_result.deleted_count
+                    logger.info(f"Deleted {delete_docs_result.deleted_count} documents for folder '{folder_name}' despite role mismatch")
+                
+                # Try to remove folder from filesystem
+                pattern = os.path.join(
+                    UPLOAD_ROOT,
+                    "roleBased",
+                    company_id,
+                    admin_id,
+                    "*",
+                    folder_name
+                )
+                for path in glob.glob(pattern):
+                    if os.path.exists(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                
+                base_path = os.path.join(
+                    UPLOAD_ROOT,
+                    "roleBased",
+                    company_id,
+                    admin_id,
+                    folder_name
+                )
+                if os.path.exists(base_path):
+                    shutil.rmtree(base_path, ignore_errors=True)
+                
+                # Try to remove folder from any roles that might have it
+                await self.roles.update_many(
+                    {
+                        "company_id": company_id,
+                        "added_by_admin_id": admin_id,
+                        "folders": folder_name
+                    },
+                    {"$pull": {"folders": folder_name}}
+                )
+                
+                # Try to delete folder record
+                folder_delete_result = await self.folders.delete_one({
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "name": folder_name
+                })
+                
+                if folder_delete_result.deleted_count > 0 or delete_docs_result.deleted_count > 0:
+                    deleted_folders.append({
+                        "role_name": role_name,
+                        "folder_name": folder_name
+                    })
+                
                 continue
 
             # Delete all documents belonging to this role/folder
             delete_docs_result = await self.documents.delete_many({
                 "company_id": company_id,
                 "user_id": admin_id,
-                "upload_type": role_name,
+                "upload_type": folder_name,
                 "path": {"$regex": f"/{folder_name}/"}
             })
 
             total_documents_deleted += delete_docs_result.deleted_count
 
-            # Remove folder from filesystem
+            # Remove folder from filesystem - check all possible paths
+            # The folder might exist in multiple locations
+            pattern = os.path.join(
+                UPLOAD_ROOT,
+                "roleBased",
+                company_id,
+                admin_id,
+                "*",
+                folder_name
+            )
+            for path in glob.glob(pattern):
+                if os.path.exists(path):
+                    shutil.rmtree(path, ignore_errors=True)
+            
+            # Also check the direct path (without role name in path)
             base_path = os.path.join(
                 UPLOAD_ROOT,
                 "roleBased",
                 company_id,
                 admin_id,
-                role_name,
                 folder_name
             )
-
             if os.path.exists(base_path):
                 shutil.rmtree(base_path, ignore_errors=True)
 
-            # Remove folder name from the role document array
-            await self.roles.update_one(
-                {"_id": role["_id"]},
+            # Remove folder name from ALL roles that have this folder
+            # (in case the folder is assigned to multiple roles)
+            await self.roles.update_many(
+                {
+                    "company_id": company_id,
+                    "added_by_admin_id": admin_id,
+                    "folders": folder_name
+                },
                 {"$pull": {"folders": folder_name}}
             )
+
+            # Delete the folder record itself from the folders collection
+            await self.folders.delete_one({
+                "company_id": company_id,
+                "admin_id": admin_id,
+                "name": folder_name
+            })
 
             deleted_folders.append({
                 "role_name": role_name,
                 "folder_name": folder_name
             })
 
-        if not deleted_folders:
+        # Only raise 404 if we didn't delete anything (no documents, no folders)
+        if not deleted_folders and total_documents_deleted == 0:
             raise HTTPException(status_code=404, detail="No matching folders found")
+        
+        # If we deleted documents but no folders were recorded, that's still a partial success
+        if not deleted_folders and total_documents_deleted > 0:
+            logger.warning(f"Deleted {total_documents_deleted} documents but no folders were recorded in deleted_folders")
 
         return {
             "status": "deleted",
