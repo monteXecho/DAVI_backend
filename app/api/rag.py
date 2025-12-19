@@ -12,7 +12,7 @@ logger = logging.getLogger("uvicorn")
 
 
 # ------------------------------------------------------------
-# 🔹 INTERNAL ASYNC HELPER
+#  INTERNAL ASYNC HELPER
 # ------------------------------------------------------------
 async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id: str):
     """
@@ -52,7 +52,7 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
 
 
 # ------------------------------------------------------------
-# 🔹 INTERNAL SYNC HELPER (NO EVENT LOOP)
+#  INTERNAL SYNC HELPER (NO EVENT LOOP)
 # ------------------------------------------------------------
 def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str):
     """
@@ -94,7 +94,7 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str):
 
 
 # ------------------------------------------------------------
-# 🔹 PUBLIC ENTRY POINT
+#  PUBLIC ENTRY POINT
 # ------------------------------------------------------------
 async def rag_index_files(user_id: str, file_paths: List[str], company_id: str):
     """
@@ -111,7 +111,7 @@ async def rag_index_files(user_id: str, file_paths: List[str], company_id: str):
 
 
 # ------------------------------------------------------------
-# 🔹 QUERY ENDPOINT (ALWAYS ASYNC)
+#  QUERY ENDPOINT (ALWAYS ASYNC)
 # ------------------------------------------------------------
 async def rag_query(pass_ids: str, question: str, file_names: List[str], company_id: str):
     """

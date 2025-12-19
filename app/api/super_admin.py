@@ -16,11 +16,9 @@ logger = logging.getLogger(__name__)
 
 super_admin_router = APIRouter(prefix="/super-admin", tags=["Super Admin"])
 
-# MUST match your upload root
 UPLOAD_ROOT = "/app/uploads"
 UPLOAD_SUBFOLDERS = ["documents", "bkr", "vgc", "3-uurs"]
 
-# helper to delete files (runs sync)
 def _delete_user_files_sync(user_id: str):
     deleted_paths = []
     for sub in UPLOAD_SUBFOLDERS:
@@ -28,16 +26,13 @@ def _delete_user_files_sync(user_id: str):
         if os.path.exists(path):
             shutil.rmtree(path)
             deleted_paths.append(path)
-    # also attempt to remove empty parent folders if desired
     return deleted_paths
 
 
-# helper to delete keycloak user by email (blocking, run in threadpool)
 def _delete_keycloak_user_by_email_sync(kc_admin, email: str):
     """Return True if at least one Keycloak user was deleted."""
-    # attempt to find Keycloak users with this email
     try:
-        users = kc_admin.get_users({"email": email})  # blocking call
+        users = kc_admin.get_users({"email": email}) 
     except Exception as e:
         raise RuntimeError(f"Keycloak lookup failed for {email}: {e}")
 
@@ -46,12 +41,11 @@ def _delete_keycloak_user_by_email_sync(kc_admin, email: str):
 
     deleted_any = False
     for u in users:
-        # different keycloak client versions use 'id' or 'userId'
         user_id = u.get("id") or u.get("userId")
         if not user_id:
             continue
         try:
-            kc_admin.delete_user(user_id)  # blocking call
+            kc_admin.delete_user(user_id)  
             deleted_any = True
         except Exception as e:
             logger.warning(f"Failed to delete Keycloak user id={user_id} for email={email}: {e}")
@@ -88,7 +82,6 @@ async def add_company_admin(
     repo = CompanyRepository(db)
     modules = {m.name: m.dict() for m in payload.modules}
     
-    # Use super_admin's user ID (sub from JWT) as the admin_id who is adding this admin
     admin_id = user.get("sub", "super_admin")
 
     try:
@@ -99,7 +92,6 @@ async def add_company_admin(
     if not result:
         raise HTTPException(404, "Company not found")
 
-    # NOTE: Documents are *not* created here.
     return {
         "status": "admin_created",
         "admin": result

@@ -829,7 +829,6 @@ class CompanyRepository:
         }
 
 
-
     async def add_users_from_email_file(
         self,
         company_id: str,
