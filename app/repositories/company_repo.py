@@ -435,8 +435,8 @@ class CompanyRepository:
             for folder_name, folder_docs in folder_docs_map.items():
                 if folder_name not in folders_in_roles_set and folder_docs:
                     # Create a special entry for unassigned folders
-                    if "_unassigned" not in result:
-                        result["_unassigned"] = {"folders": []}
+                    if "Geen rol toegewezen" not in result:
+                        result["Geen rol toegewezen"] = {"folders": []}
                     
                     # Add users (empty array since no roles assigned)
                     for doc in folder_docs:
@@ -446,7 +446,7 @@ class CompanyRepository:
                         "name": folder_name,
                         "documents": folder_docs
                     }
-                    result["_unassigned"]["folders"].append(folder_entry)
+                    result["Geen rol toegewezen"]["folders"].append(folder_entry)
             
             return result
             
@@ -644,7 +644,7 @@ class CompanyRepository:
 
         # Loop through matched role/folder pairs
         for role_name, folder_name in zip(role_names, folder_names):
-            
+
             # Handle unassigned folders (empty role_name)
             if not role_name or role_name.strip() == "":
                 # Delete all documents for this folder (upload_type matches folder_name)
@@ -2148,7 +2148,7 @@ class CompanyRepository:
                 f"Folder '{safe_folder}' not found when updating document count. "
                 f"Company: {company_id}, Admin: {admin_id}. "
                 f"Document was uploaded successfully but folder count was not updated."
-            )
+        )
 
         return {
             "success": True,
@@ -2655,15 +2655,42 @@ class CompanyRepository:
             if not admin_doc:
                 raise HTTPException(status_code=404, detail="Admin not found")
 
+            # Check if admin has Teamlid in assigned_roles and it's being removed
+            # Note: For admins, Teamlid is not typically in assigned_roles, but we check is_teamlid flag
+            # If the admin is a teamlid and we're updating them, we need to check if Teamlid should be removed
+            # Since admins don't have assigned_roles in the same way, we check if is_teamlid should be cleared
+            # This would typically be handled through the delete_role_from_user endpoint, but we handle it here too
+            # for consistency when updating through WijzigenTab
+            
+            # If Teamlid is in the assigned_roles list and admin is a teamlid, remove teamlid status
+            teamlid_should_be_removed = "Teamlid" not in assigned_roles and admin_doc.get("is_teamlid", False)
+            
+            update_op = {
+                "$set": {
+                    "name": name,
+                    "email": email,
+                    "updated_at": now,
+                }
+            }
+            
+            if teamlid_should_be_removed:
+                update_op["$set"]["is_teamlid"] = False
+                update_op["$unset"] = {
+                    "teamlid_permissions": "",
+                    "assigned_teamlid_by_id": "",
+                    "assigned_teamlid_by_name": "",
+                    "assigned_teamlid_at": ""
+                }
+                
+                # Remove all guest_access entries for this admin
+                await self.guest_access.delete_many({
+                    "company_id": company_id,
+                    "guest_user_id": user_id
+                })
+
             await self.admins.update_one(
                 {"company_id": company_id, "user_id": user_id},
-                {
-                    "$set": {
-                        "name": name,
-                        "email": email,
-                        "updated_at": now,
-                    }
-                },
+                update_op,
             )
             
             return True
@@ -2683,29 +2710,61 @@ class CompanyRepository:
             added_roles = new_roles - old_roles
             removed_roles = old_roles - new_roles
 
+            # Check if Teamlid role is being removed
+            # Teamlid might not be in assigned_roles in DB, but is shown in UI based on is_teamlid flag
+            # So we check: if user has is_teamlid=True AND Teamlid is not in new_roles, then it's being removed
+            user_is_teamlid = user_doc.get("is_teamlid", False)
+            teamlid_in_new_roles = "Teamlid" in new_roles
+            teamlid_removed = user_is_teamlid and not teamlid_in_new_roles
+            
+            # Prepare update operation
+            update_op = {
+                "$set": {
+                    "name": name,
+                    "email": email,
+                    "assigned_roles": list(new_roles),
+                    "updated_at": now,
+                }
+            }
+            
+            # If Teamlid is being removed, clean up all teamlid-related data
+            if teamlid_removed:
+                update_op["$set"]["is_teamlid"] = False
+                update_op["$unset"] = {
+                    "teamlid_permissions": "",
+                    "assigned_teamlid_by_id": "",
+                    "assigned_teamlid_by_name": "",
+                    "assigned_teamlid_at": ""
+                }
+                
+                # Remove all guest_access entries for this user
+                await self.guest_access.delete_many({
+                    "company_id": company_id,
+                    "guest_user_id": user_id
+                })
+
             await self.users.update_one(
                 {"company_id": company_id, "user_id": user_id},
-                {
-                    "$set": {
-                        "name": name,
-                        "email": email,
-                        "assigned_roles": list(new_roles),
-                        "updated_at": now,
-                    }
-                },
+                update_op,
             )
 
             if added_roles:
-                await self.roles.update_many(
-                    {"company_id": company_id, "name": {"$in": list(added_roles)}},
-                    {"$inc": {"assigned_user_count": 1}},
-                )
+                # Don't update role counts for Teamlid (it's not a real role)
+                real_added_roles = [r for r in added_roles if r != "Teamlid"]
+                if real_added_roles:
+                    await self.roles.update_many(
+                        {"company_id": company_id, "name": {"$in": real_added_roles}},
+                        {"$inc": {"assigned_user_count": 1}},
+                    )
 
             if removed_roles:
-                await self.roles.update_many(
-                    {"company_id": company_id, "name": {"$in": list(removed_roles)}},
-                    {"$inc": {"assigned_user_count": -1}},
-                )
+                # Don't update role counts for Teamlid (it's not a real role)
+                real_removed_roles = [r for r in removed_roles if r != "Teamlid"]
+                if real_removed_roles:
+                    await self.roles.update_many(
+                        {"company_id": company_id, "name": {"$in": real_removed_roles}},
+                        {"$inc": {"assigned_user_count": -1}},
+                    )
 
             return True
 

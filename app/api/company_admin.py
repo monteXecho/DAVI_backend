@@ -1,6 +1,7 @@
 import logging
 import pandas as pd
 import os, json
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, status, Form, Body
 from fastapi import Request
 from fastapi.responses import FileResponse
@@ -1181,11 +1182,111 @@ async def delete_role_from_user(
     db=Depends(get_db)
 ):
     roleName = payload.role_name
-
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
+    repo = CompanyRepository(db)
 
-    role = await CompanyRepository(db).get_role_by_name(
+    # Special handling for Teamlid role removal
+    if roleName == "Teamlid":
+        try:
+            # Get all affected users (both company_users and company_admins)
+            affected_users = []
+            affected_admins = []
+            
+            # Find affected company users
+            company_users = await db.company_users.find({
+                "user_id": {"$in": payload.user_ids},
+                "company_id": company_id,
+                "is_teamlid": True
+            }).to_list(None)
+            affected_users = [u["user_id"] for u in company_users]
+            
+            # Find affected company admins
+            company_admins = await db.company_admins.find({
+                "user_id": {"$in": payload.user_ids},
+                "company_id": company_id,
+                "is_teamlid": True
+            }).to_list(None)
+            affected_admins = [a["user_id"] for a in company_admins]
+            
+            all_affected_user_ids = list(set(affected_users + affected_admins))
+            
+            if not all_affected_user_ids:
+                return {
+                    "status": "success",
+                    "removedRole": roleName,
+                    "affectedUsers": payload.user_ids,
+                    "modifiedCount": 0,
+                    "message": "No users with Teamlid role found to remove."
+                }
+            
+            # Remove "Teamlid" from assigned_roles if present (for company_users)
+            if affected_users:
+                await db.company_users.update_many(
+                    {
+                        "user_id": {"$in": affected_users},
+                        "company_id": company_id
+                    },
+                    {
+                        "$pull": {"assigned_roles": "Teamlid"},
+                        "$set": {
+                            "is_teamlid": False,
+                            "updated_at": datetime.utcnow()
+                        },
+                        "$unset": {
+                            "teamlid_permissions": "",
+                            "assigned_teamlid_by_id": "",
+                            "assigned_teamlid_by_name": "",
+                            "assigned_teamlid_at": ""
+                        }
+                    }
+                )
+            
+            # Remove teamlid status from company admins
+            if affected_admins:
+                await db.company_admins.update_many(
+                    {
+                        "user_id": {"$in": affected_admins},
+                        "company_id": company_id
+                    },
+                    {
+                        "$set": {
+                            "is_teamlid": False,
+                            "updated_at": datetime.utcnow()
+                        },
+                        "$unset": {
+                            "teamlid_permissions": "",
+                            "assigned_teamlid_by_id": "",
+                            "assigned_teamlid_by_name": "",
+                            "assigned_teamlid_at": ""
+                        }
+                    }
+                )
+            
+            # Remove all guest_access entries for these users
+            # This removes all teamlid permissions across all workspaces
+            guest_access_result = await db.company_guest_access.delete_many({
+                "company_id": company_id,
+                "guest_user_id": {"$in": all_affected_user_ids}
+            })
+            
+            modified_count = len(all_affected_user_ids)
+            
+            return {
+                "status": "success",
+                "removedRole": roleName,
+                "affectedUsers": payload.user_ids,
+                "modifiedCount": modified_count,
+                "guestAccessRemoved": guest_access_result.deleted_count,
+                "message": f"Teamlid role and all related permissions removed from {modified_count} user(s)."
+            }
+            
+        except Exception as e:
+            logger.error(f"Error removing Teamlid role: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Could not remove Teamlid role: {str(e)}")
+    
+    # Regular role removal
+    role = await repo.get_role_by_name(
         company_id=company_id,
         admin_id=admin_id,
         role_name=roleName
@@ -1206,7 +1307,6 @@ async def delete_role_from_user(
         )
 
         if result.modified_count > 0:
-            repo = CompanyRepository(db)
             await repo._update_role_user_counts(company_id, admin_id, [roleName], -result.modified_count)
 
         return {
@@ -1217,7 +1317,7 @@ async def delete_role_from_user(
         }
 
     except Exception as e:
-        print("Error removing role:", e)
+        logger.error(f"Error removing role: {str(e)}")
         raise HTTPException(status_code=500, detail="Could not remove role from users.")
 
 
