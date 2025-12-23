@@ -115,12 +115,29 @@ async def ask_question(
         logger.info(f"Payload to RAG: {payload}")
 
         file_names = [doc["file_name"] for doc in user_documents]
-        rag_result = await rag_query(
-            pass_ids=user_data["pass_ids"],
-            question=request.question,
-            file_names=file_names,
-            company_id=company_id
-        )
+        try:
+            rag_result = await rag_query(
+                pass_ids=user_data["pass_ids"],
+                question=request.question,
+                file_names=file_names,
+                company_id=company_id
+            )
+        except RuntimeError as rag_error:
+            # Provide user-friendly error message for RAG service issues
+            error_detail = str(rag_error)
+            if "404" in error_detail or "not found" in error_detail.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "RAG query service is not available. "
+                        "The query pipeline is not configured. "
+                        "Please contact your administrator to configure the RAG service pipeline."
+                    )
+                )
+            raise HTTPException(
+                status_code=503,
+                detail=f"RAG query service error: {error_detail}"
+            )
 
         # ------------------------------------------------------------------
         # Parse RAG result

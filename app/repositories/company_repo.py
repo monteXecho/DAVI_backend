@@ -2323,25 +2323,58 @@ class CompanyRepository:
         user_id = user["user_id"]
         company_id = user["company_id"]
 
-        query = {"user_id": user_id}
-        owned_docs_cursor = self.documents.find(query)
-        owned_docs = [d async for d in owned_docs_cursor]
+        # Get private documents (upload_type="document")
+        private_docs_query = {
+            "user_id": user_id,
+            "company_id": company_id,
+            "upload_type": "document"
+        }
+        private_docs_cursor = self.documents.find(private_docs_query)
+        private_docs = [d async for d in private_docs_cursor]
 
         role_based_docs = []
-        if user_type == "company_user":
+        if user_type == "admin":
+            # For company admins: get all documents in folders created by this admin
+            # These have upload_type = folder_name (not "document")
+            folder_docs_query = {
+                "user_id": user_id,
+                "company_id": company_id,
+                "upload_type": {"$ne": "document"}
+            }
+            folder_docs_cursor = self.documents.find(folder_docs_query)
+            role_based_docs = [d async for d in folder_docs_cursor]
+        else:
+            # For company users: get documents from folders assigned via roles
             assigned_roles = user.get("assigned_roles", [])
             added_by_admin_id = user.get("added_by_admin_id")
 
             if assigned_roles and added_by_admin_id:
-                role_query = {
-                    "user_id": added_by_admin_id,
+                # Find roles with matching name, company_id, and added_by_admin_id
+                roles_query = {
                     "company_id": company_id,
-                    "upload_type": {"$in": assigned_roles},
+                    "added_by_admin_id": added_by_admin_id,
+                    "name": {"$in": assigned_roles}
                 }
-                role_cursor = self.documents.find(role_query)
-                role_based_docs = [d async for d in role_cursor]
+                roles_cursor = self.roles.find(roles_query)
+                roles = [r async for r in roles_cursor]
+                
+                # Collect all folder names from these roles
+                folder_names = set()
+                for role in roles:
+                    folders = role.get("folders", [])
+                    folder_names.update(folders)
+                
+                # Find documents with upload_type in folder names and user_id = added_by_admin_id
+                if folder_names:
+                    role_based_docs_query = {
+                        "user_id": added_by_admin_id,
+                        "company_id": company_id,
+                        "upload_type": {"$in": list(folder_names)}
+                    }
+                    role_based_docs_cursor = self.documents.find(role_based_docs_query)
+                    role_based_docs = [d async for d in role_based_docs_cursor]
 
-        all_docs = owned_docs + role_based_docs
+        all_docs = private_docs + role_based_docs
         formatted_docs = [
             {
                 "file_name": doc["file_name"],
@@ -2357,9 +2390,23 @@ class CompanyRepository:
             upload_type = doc.get("upload_type", "document")
 
             if upload_type == "document":
+                # Private documents: format is "user_id--filename"
                 pid = f"{user_id}--{fn}"
             else:
-                pid = f"{company_id}-{user.get('added_by_admin_id', user_id)}--{fn}"
+                # Role-based/folder documents: format must match indexing format
+                # When indexing, file_id is "company_id-admin_id" (see company_admin.py line 1678)
+                # So pass_id should be "company_id-admin_id--filename"
+                if user_type == "admin":
+                    # For admin's own folder documents, admin_id is user_id
+                    pid = f"{company_id}-{user_id}--{fn}"
+                else:
+                    # For company user's role-based documents, use added_by_admin_id
+                    added_by_admin_id = user.get("added_by_admin_id")
+                    if added_by_admin_id:
+                        pid = f"{company_id}-{added_by_admin_id}--{fn}"
+                    else:
+                        # Fallback (shouldn't happen for role-based docs)
+                        pid = f"{company_id}-{user_id}--{fn}"
             pass_ids.append(pid)
 
         return {
