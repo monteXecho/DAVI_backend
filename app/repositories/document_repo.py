@@ -37,15 +37,32 @@ class DocumentRepository:
         user_id: str,
         file_name: str,
         upload_type: str,
-        path: str
+        path: str,
+        storage_path: Optional[str] = None,
+        source: str = "manual_upload"
     ) -> Optional[Dict[str, Any]]:
+        """
+        Add a document record to MongoDB.
+        
+        Args:
+            company_id: Company identifier
+            user_id: User identifier
+            file_name: Name of the file
+            upload_type: Type of upload ("document" for private, folder name for role-based)
+            path: Local file path (for backward compatibility) or storage path
+            storage_path: Optional canonical storage path (e.g., Nextcloud path)
+            source: Source of the document ("manual_upload" or "imported")
+        """
         doc = {
             "company_id": company_id,
             "user_id": user_id,
             "file_name": file_name,
             "upload_type": upload_type,
-            "path": path,
+            "path": path,  # Keep for backward compatibility
             "created_at": datetime.utcnow(),
+            # Storage metadata (Scenario E1, A1 support)
+            "storage_path": storage_path,  # Canonical path in Nextcloud
+            "source": source,  # "manual_upload" or "imported"
         }
         try:
             await self.collection.insert_one(doc)

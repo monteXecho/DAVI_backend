@@ -16,6 +16,14 @@ from pymongo.errors import DuplicateKeyError
 from collections import defaultdict
 from typing import List
 
+# Storage provider for Nextcloud integration
+try:
+    from app.storage.providers import get_storage_provider, StorageError
+except ImportError:
+    # Storage provider not available
+    get_storage_provider = None
+    StorageError = Exception
+
 logger = logging.getLogger(__name__)
 
 BASE_DOC_URL = "https://your-backend.com/documents/download"
@@ -567,17 +575,38 @@ class CompanyRepository:
         company_id: str,
         admin_id: str
     ) -> dict:
+        """
+        Get folders for a company/admin.
+        
+        Returns both folder names (for backward compatibility) and full folder objects
+        with metadata (origin, indexed, sync_enabled, storage_path).
+        """
         # Get existing folders for this company
         existing_folders = await self.folders.find(
             {"company_id": company_id, "admin_id": admin_id}
         ).to_list(length=None)
 
-        # Extract just the folder names
+        # Extract folder names (for backward compatibility)
         folder_names = [folder.get("name", "") for folder in existing_folders]
+        
+        # Return full folder objects with metadata
+        folder_objects = [
+            {
+                "name": folder.get("name", ""),
+                "origin": folder.get("origin", "davi"),  # "davi" or "imported"
+                "indexed": folder.get("indexed", False),
+                "sync_enabled": folder.get("sync_enabled", False),
+                "storage_provider": folder.get("storage_provider"),
+                "storage_path": folder.get("storage_path"),
+                "document_count": folder.get("document_count", 0),
+            }
+            for folder in existing_folders
+        ]
 
         return {
             "success": True,
-            "folders": folder_names,
+            "folders": folder_names,  # Backward compatibility
+            "folders_metadata": folder_objects,  # Full metadata
             "total": len(folder_names)
         }
 
@@ -585,8 +614,23 @@ class CompanyRepository:
         self,
         company_id: str,
         admin_id: str,
-        folder_names: List[str]
+        folder_names: List[str],
+        storage_provider=None  # Optional storage provider for Nextcloud sync
     ) -> dict:
+        """
+        Create folders in DAVI and optionally sync to Nextcloud.
+        
+        Scenario A1: DAVI → Nextcloud
+        - Creates folder records in MongoDB
+        - Creates corresponding folders in Nextcloud
+        - Stores canonical storage paths
+        
+        Args:
+            company_id: Company identifier
+            admin_id: Admin user identifier
+            folder_names: List of folder names to create
+            storage_provider: Optional StorageProvider instance for Nextcloud sync
+        """
         existing_folders = await self.folders.find(
             {"company_id": company_id, "admin_id": admin_id}
         ).to_list(length=None)
@@ -608,6 +652,21 @@ class CompanyRepository:
             for folder_name in new_folders:
                 # Normalize folder name to match upload logic (strip "/ " to be consistent)
                 normalized_name = folder_name.strip("/ ")
+                
+                # Build storage path: company_id/admin_id/folder_name
+                storage_path = f"{company_id}/{admin_id}/{normalized_name}"
+                
+                # Create folder in Nextcloud if storage provider is available
+                storage_created = False
+                if storage_provider:
+                    try:
+                        storage_created = await storage_provider.create_folder(storage_path)
+                        logger.info(f"Created Nextcloud folder: {storage_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to create Nextcloud folder {storage_path}: {e}")
+                        # Continue with MongoDB creation even if Nextcloud fails
+                        # This allows DAVI to function even if Nextcloud is temporarily unavailable
+                
                 folder_doc = {
                     "company_id": company_id,
                     "admin_id": admin_id,
@@ -615,7 +674,13 @@ class CompanyRepository:
                     "document_count": 0,
                     "created_at": datetime.utcnow(),
                     "updated_at": datetime.utcnow(),
-                    "status": "active"
+                    "status": "active",
+                    # Storage metadata (Scenario A1 support)
+                    "storage_provider": "nextcloud" if storage_provider else None,
+                    "storage_path": storage_path if storage_provider else None,
+                    "origin": "davi",  # Created in DAVI
+                    "indexed": False,  # Will be indexed when documents are added
+                    "sync_enabled": True if storage_provider else False
                 }
                 folder_documents.append(folder_doc)
             
@@ -2105,11 +2170,12 @@ class CompanyRepository:
                     logger.error(f"  final_verify: {final_verify}")
                     raise HTTPException(status_code=500, detail=f"Path construction error: duplicate folder name in file path")
 
+        # Check for existing document (check by file_name and upload_type)
         existing_doc = await self.documents.find_one({
             "company_id": company_id,
             "user_id": admin_id,
             "upload_type": safe_folder,
-            "path": file_path
+            "file_name": file_name
         })
 
         if existing_doc:
@@ -2118,23 +2184,98 @@ class CompanyRepository:
                 detail=f"Het document '{file_name}' bestaat al in de map '{safe_folder}'."
             )
 
+        # Get storage provider and folder's storage_path for Nextcloud upload
+        storage_provider = None
+        storage_path = None
+        if get_storage_provider:
+            try:
+                storage_provider = get_storage_provider()
+                # Get folder's storage_path from database
+                if folder_exists and folder_exists.get("storage_path"):
+                    folder_storage_path = folder_exists["storage_path"]
+                    # Build storage path for the file: folder_storage_path/file_name
+                    storage_path = f"{folder_storage_path}/{file_name}"
+                    logger.info(f"Uploading to Nextcloud: {storage_path}")
+                elif storage_provider:
+                    # Folder doesn't have storage_path (e.g., created before Nextcloud integration)
+                    # Create one based on company_id/admin_id/folder_name and update folder record
+                    folder_storage_path = f"{company_id}/{admin_id}/{final_folder_name}"
+                    storage_path = f"{folder_storage_path}/{file_name}"
+                    logger.info(f"Folder has no storage_path, using default: {storage_path}")
+                    
+                    # Update folder record with storage_path for future uploads
+                    if folder_exists:
+                        await self.folders.update_one(
+                            {"_id": folder_exists["_id"]},
+                            {
+                                "$set": {
+                                    "storage_path": folder_storage_path,
+                                    "storage_provider": "nextcloud",
+                                    "sync_enabled": True
+                                }
+                            }
+                        )
+                        logger.info(f"Updated folder '{final_folder_name}' with storage_path: {folder_storage_path}")
+            except Exception as e:
+                logger.warning(f"Storage provider not available: {e}, falling back to local storage")
+                storage_provider = None
+
+        # Read file content once
+        await file.seek(0)  # Reset file pointer
+        content = await file.read()
+        
+        # Upload to Nextcloud if storage provider is available
+        if storage_provider and storage_path:
+            try:
+                # Ensure folder exists in Nextcloud
+                folder_storage_path = storage_path.rsplit("/", 1)[0]
+                if not await storage_provider.folder_exists(folder_storage_path):
+                    await storage_provider.create_folder(folder_storage_path)
+                    logger.info(f"Created Nextcloud folder: {folder_storage_path}")
+                
+                # Upload file to Nextcloud
+                # upload_file can handle bytes directly
+                await storage_provider.upload_file(storage_path, content, content_length=len(content) if isinstance(content, bytes) else None)
+                logger.info(f"Successfully uploaded to Nextcloud: {storage_path}")
+            except StorageError as e:
+                logger.error(f"Failed to upload to Nextcloud: {e}, falling back to local storage")
+                storage_path = None  # Don't save storage_path if upload failed
+            except Exception as e:
+                logger.error(f"Unexpected error uploading to Nextcloud: {e}, falling back to local storage")
+                storage_path = None
+
+        # Save to local disk for backward compatibility and RAG indexing
+        # (RAG service may need local file access)
         try:
+            os.makedirs(base_path, exist_ok=True)
             async with aiofiles.open(file_path, "wb") as f:
-                content = await file.read()
                 await f.write(content)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"File save failed: {str(e)}")
+            logger.error(f"Failed to save file locally: {e}")
+            # If Nextcloud upload succeeded, we can continue; otherwise fail
+            if not storage_path:
+                raise HTTPException(status_code=500, detail=f"File save failed: {str(e)}")
 
-        doc_record = {
-            "company_id": company_id,
-            "user_id": admin_id,
-            "file_name": file_name,
-            "upload_type": safe_folder,
-            "path": file_path,
-            "uploaded_at": datetime.utcnow(),
-        }
+        # Use DocumentRepository to add document with storage_path
+        from app.repositories.document_repo import DocumentRepository
+        document_repo = DocumentRepository(self.db)
+        
+        doc_record = await document_repo.add_document(
+            company_id=company_id,
+            user_id=admin_id,
+            file_name=file_name,
+            upload_type=safe_folder,
+            path=file_path,  # Keep local path for backward compatibility
+            storage_path=storage_path,  # Nextcloud path
+            source="manual_upload"
+        )
 
-        await self.documents.insert_one(doc_record)
+        if not doc_record:
+            # Document already exists (race condition)
+            raise HTTPException(
+                status_code=409,
+                detail=f"Het document '{file_name}' bestaat al in de map '{safe_folder}'."
+            )
 
         # Update folder document count - check if folder exists first
         folder_update_result = await self.folders.update_one(
@@ -2155,7 +2296,168 @@ class CompanyRepository:
             "status": "uploaded",
             "folder": safe_folder,
             "file_name": file_name,
-            "path": file_path,
+            "path": file_path,  # Local path for backward compatibility
+            "storage_path": storage_path,  # Nextcloud path if uploaded
+        }
+
+    async def sync_documents_from_nextcloud(
+        self,
+        company_id: str,
+        admin_id: str,
+        folder_id: Optional[str] = None
+    ) -> dict:
+        """
+        Sync documents from Nextcloud to DAVI for imported folders.
+        
+        Only syncs folders with origin="imported" (folders imported from Nextcloud).
+        When a user uploads a document to an imported folder in Nextcloud, this method
+        syncs those documents to DAVI.
+        
+        Args:
+            company_id: Company identifier
+            admin_id: Admin identifier
+            folder_id: Optional specific folder ID to sync (if None, syncs all imported folders)
+            
+        Returns:
+            Dictionary with sync results
+        """
+        if not get_storage_provider:
+            raise HTTPException(
+                status_code=400,
+                detail="Storage provider not available"
+            )
+        
+        try:
+            storage_provider = get_storage_provider()
+        except StorageError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Nextcloud storage not configured: {e}"
+            )
+        
+        # Find imported folders
+        folder_query = {
+            "company_id": company_id,
+            "admin_id": admin_id,
+            "origin": "imported",  # Only sync imported folders
+            "storage_path": {"$exists": True, "$ne": None}  # Must have storage_path
+        }
+        
+        if folder_id:
+            folder_query["_id"] = folder_id
+        
+        imported_folders = await self.folders.find(folder_query).to_list(length=None)
+        
+        if not imported_folders:
+            return {
+                "success": True,
+                "synced_folders": 0,
+                "new_documents": 0,
+                "skipped_documents": 0,
+                "errors": [],
+                "message": "No imported folders found to sync"
+            }
+        
+        synced_folders = 0
+        new_documents = 0
+        skipped_documents = 0
+        errors = []
+        
+        from app.repositories.document_repo import DocumentRepository
+        document_repo = DocumentRepository(self.db)
+        
+        for folder in imported_folders:
+            folder_name = folder.get("name")
+            storage_path = folder.get("storage_path")
+            
+            if not storage_path:
+                errors.append(f"Folder '{folder_name}' has no storage_path")
+                continue
+            
+            try:
+                # List files in Nextcloud folder
+                nextcloud_files = await storage_provider.list_files(storage_path, recursive=False)
+                
+                if not nextcloud_files:
+                    logger.info(f"No files found in Nextcloud folder: {storage_path}")
+                    continue
+                
+                # Get existing documents for this folder
+                existing_docs = await self.documents.find({
+                    "company_id": company_id,
+                    "user_id": admin_id,
+                    "upload_type": folder_name
+                }).to_list(length=None)
+                
+                existing_file_names = {doc.get("file_name") for doc in existing_docs if doc.get("file_name")}
+                
+                # Process each file from Nextcloud
+                for file_info in nextcloud_files:
+                    file_name = file_info["name"]
+                    file_storage_path = file_info["path"]
+                    
+                    # Skip if document already exists
+                    if file_name in existing_file_names:
+                        skipped_documents += 1
+                        continue
+                    
+                    try:
+                        # Download file from Nextcloud for local storage (RAG indexing needs local files)
+                        file_content = await storage_provider.download_file(file_storage_path)
+                        file_bytes = file_content.read() if hasattr(file_content, 'read') else file_content
+                        
+                        # Save file locally for RAG indexing
+                        # Use same path structure as upload_document_for_folder
+                        local_base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, folder_name)
+                        os.makedirs(local_base_path, exist_ok=True)
+                        local_file_path = os.path.join(local_base_path, file_name)
+                        
+                        async with aiofiles.open(local_file_path, "wb") as f:
+                            await f.write(file_bytes)
+                        
+                        # Create document record
+                        doc_record = await document_repo.add_document(
+                            company_id=company_id,
+                            user_id=admin_id,
+                            file_name=file_name,
+                            upload_type=folder_name,
+                            path=local_file_path,  # Local path for RAG
+                            storage_path=file_storage_path,  # Nextcloud path
+                            source="nextcloud_sync"  # Mark as synced from Nextcloud
+                        )
+                        
+                        if doc_record:
+                            new_documents += 1
+                            logger.info(f"Synced document from Nextcloud: {file_name} in folder {folder_name}")
+                        else:
+                            # Document already exists (race condition)
+                            skipped_documents += 1
+                            
+                    except Exception as e:
+                        error_msg = f"Failed to sync file '{file_name}' from folder '{folder_name}': {str(e)}"
+                        logger.error(error_msg)
+                        errors.append(error_msg)
+                
+                synced_folders += 1
+                
+                # Update folder document count
+                await self.folders.update_one(
+                    {"_id": folder["_id"]},
+                    {"$set": {"document_count": len(nextcloud_files), "updated_at": datetime.utcnow()}}
+                )
+                
+            except Exception as e:
+                error_msg = f"Failed to sync folder '{folder_name}': {str(e)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+        
+        return {
+            "success": True,
+            "synced_folders": synced_folders,
+            "new_documents": new_documents,
+            "skipped_documents": skipped_documents,
+            "errors": errors,
+            "message": f"Synced {synced_folders} folder(s), added {new_documents} new document(s)"
         }
 
     async def delete_roles_by_admin(self, company_id: str, admin_id: str) -> int:

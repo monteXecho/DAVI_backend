@@ -69,3 +69,17 @@ class GuestWorkspaceOut(BaseModel):
     ownerId: str
     label: str
     permissions: Optional[GuestWorkspacePermissions] = None
+
+
+class ImportFoldersPayload(BaseModel):
+    """Payload for importing folders from Nextcloud into DAVI."""
+    folder_paths: List[str]  # List of folder paths to import (relative to Nextcloud root)
+    import_root: Optional[str] = None  # Optional root path in Nextcloud to list from
+
+
+class FolderImportItem(BaseModel):
+    """Represents a folder available for import from Nextcloud."""
+    path: str  # Full path relative to storage root
+    name: str  # Folder name
+    depth: int  # Depth level (0 = root level)
+    imported: bool = False  # Whether this folder is already imported in DAVI

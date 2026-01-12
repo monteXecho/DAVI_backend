@@ -1,3 +1,7 @@
+networks:
+  davi_network:
+    external: true
+
 services:
   app:
     build: .
@@ -20,6 +24,9 @@ services:
       - DB_NAME=davi_db
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - davi_network
 
   mongodb:
     image: mongo:6.0
@@ -29,3 +36,5 @@ services:
     #   - "27017:27017"
     volumes:
       - ./mongo-data:/data/db
+    networks:
+      - default

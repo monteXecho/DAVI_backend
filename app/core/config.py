@@ -3,18 +3,15 @@ from dotenv import load_dotenv
 
 load_dotenv(".env.local")
 
-ELASTIC_HOST = os.getenv("ELASTIC_HOST", "http://localhost:9200")
-ELASTIC_USER = os.getenv("ELASTIC_USER", "elastic")
-ELASTIC_PASSWORD = os.getenv("ELASTIC_PASSWORD", "elastic")
-ELASTIC_INDEX = os.getenv("ELASTIC_INDEX", "haystack_test")
-OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1024"))
-LLM_API_URL = os.getenv("LLM_API_URL", "http://localhost:11434")
 KEYCLOAK_PUBLIC_KEY = os.getenv("KEYCLOAK_PUBLIC_KEY ", "")
 
-AVAILABLE_MODELS = [
-    'granite-3.2-8b-instruct@q8_0',
-    'granite-3.2-8b-instruct@f16',
-    'llama-3.3-70b-versatile',
-    'OpenAI'
-]
+
+# Nextcloud Storage Configuration
+# These are used for the storage abstraction layer
+# DAVI uses Nextcloud as the storage backend while maintaining
+# logical folder structure and permissions in MongoDB
+NEXTCLOUD_URL = os.getenv("NEXTCLOUD_URL", "http://davi_nextcloud:80")
+NEXTCLOUD_USERNAME = os.getenv("NEXTCLOUD_USERNAME", "davi")
+NEXTCLOUD_PASSWORD = os.getenv("NEXTCLOUD_PASSWORD", "rbKbe-ppcpE-mzEQ5-KLk29-aJs29")
+NEXTCLOUD_ROOT_PATH = os.getenv("NEXTCLOUD_ROOT_PATH", "/DAVI")

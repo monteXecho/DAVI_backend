@@ -1,0 +1,70 @@
+version: "3.9"
+
+# Production Docker Compose for DAVI Backend + Nextcloud Integration
+# This configuration ensures proper networking between DAVI and Nextcloud
+
+networks:
+  davi_network:
+    driver: bridge
+    name: davi_network
+
+services:
+  app:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi_app
+    # Production command - no reload, multiple workers
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 --limit-max-requests 1000 --timeout-keep-alive 5
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/code/app
+      - ./requirements.txt:/code/requirements.txt
+      - /var/opt/DAVI_backend/uploads:/app/uploads
+      - /var/opt/DAVI_backend/output/highlighted:/code/output/highlighted
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      # MongoDB connection (using service name for Docker network)
+      - MONGO_URI=mongodb://davi_user:${MONGO_PASSWORD}@mongodb:27017/davi_db?authSource=admin
+      - DB_NAME=davi_db
+      # Nextcloud configuration (loaded from .env.local via config.py)
+      # These are read by app/core/config.py, but can be overridden here
+      - NEXTCLOUD_URL=${NEXTCLOUD_URL:-http://davi_nextcloud:80}
+      - NEXTCLOUD_USERNAME=${NEXTCLOUD_USERNAME:-davi}
+      - NEXTCLOUD_PASSWORD=${NEXTCLOUD_PASSWORD}
+      - NEXTCLOUD_ROOT_PATH=${NEXTCLOUD_ROOT_PATH:-/DAVI}
+    networks:
+      - davi_network
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import requests; requests.get('http://localhost:8000/docs', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  mongodb:
+    image: mongo:6.0
+    container_name: davi_mongodb
+    restart: unless-stopped
+    # Only bind to localhost for security
+    ports:
+      - "127.0.0.1:27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USERNAME}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+      - MONGO_INITDB_DATABASE=davi_db
+    volumes:
+      - /var/opt/DAVI_backend/mongo-data:/data/db
+      - /var/backups/davi-mongo:/data/backups
+    networks:
+      - davi_network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

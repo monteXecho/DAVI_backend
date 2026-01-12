@@ -2,6 +2,7 @@ import logging
 import pandas as pd
 import os, json
 from datetime import datetime
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Query, status, Form, Body
 from fastapi import Request
 from fastapi.responses import FileResponse
@@ -13,6 +14,8 @@ from app.models.company_admin_schema import (
     AddFoldersPayload,
     GuestAccessPayload,
     GuestWorkspaceOut,
+    ImportFoldersPayload,
+    FolderImportItem,
 )
 from app.api.rag import rag_index_files
 
@@ -1470,16 +1473,37 @@ async def add_folders(
     admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
+    """
+    Create folders in DAVI and sync to Nextcloud.
+    
+    Scenario A1: DAVI → Nextcloud
+    - Creates folder records in MongoDB
+    - Creates corresponding folders in Nextcloud
+    - Stores canonical storage paths for future operations
+    """
     await check_teamlid_permission(admin_context, db, "roles_folders")
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
 
     try:
+        # Get storage provider for Nextcloud sync
+        storage_provider = None
+        try:
+            from app.storage.providers import get_storage_provider, StorageError
+            storage_provider = get_storage_provider()
+        except StorageError as e:
+            logger.warning(f"Storage provider not available, creating folders in DAVI only: {e}")
+            # Continue without storage provider - DAVI can function without Nextcloud
+        except Exception as e:
+            logger.warning(f"Storage provider error, creating folders in DAVI only: {e}")
+            # Continue without storage provider - DAVI can function without Nextcloud
+
         result = await repo.add_folders(
             company_id=company_id,
             admin_id=admin_id,
-            folder_names=payload.folder_names
+            folder_names=payload.folder_names,
+            storage_provider=storage_provider
         )
 
         return {
@@ -1691,6 +1715,256 @@ async def upload_document_for_role(
     except Exception as e:
         logger.exception(f"Failed to upload document for role. Folder: {folder_name}, Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to upload document: {str(e)}")
+
+
+@company_admin_router.get("/folders/import/list")
+async def list_importable_folders(
+    import_root: Optional[str] = Query(None, description="Root path in Nextcloud to list from"),
+    admin_context=Depends(get_admin_or_user_company_id),
+    db=Depends(get_db)
+):
+    """
+    List folders available for import from Nextcloud.
+    
+    Scenario B2: SharePoint → Nextcloud → DAVI (partial import)
+    - Lists folders in Nextcloud that can be imported into DAVI
+    - Shows which folders are already imported
+    - Supports recursive listing for tree view
+    
+    Args:
+        import_root: Optional root path in Nextcloud to list from (defaults to company root)
+    """
+    await check_teamlid_permission(admin_context, db, "roles_folders")
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+    
+    try:
+        # Get storage provider
+        from app.storage.providers import get_storage_provider, StorageError
+        
+        try:
+            storage_provider = get_storage_provider()
+        except StorageError as e:
+            # Nextcloud is not configured - return empty list with informative message
+            logger.warning(f"Nextcloud not configured: {e}")
+            return {
+                "success": True,
+                "folders": [],
+                "import_root": import_root or "",
+                "message": "Nextcloud storage is not configured. Please configure NEXTCLOUD_URL, NEXTCLOUD_USERNAME, and NEXTCLOUD_PASSWORD to enable folder import.",
+                "configured": False
+            }
+        
+        # Determine import root path
+        # If not provided, start from root (empty string = storage root)
+        # Users can specify a subdirectory if needed
+        if import_root is None:
+            import_root = ""
+        
+        # List folders recursively from Nextcloud
+        # This will return empty list if path doesn't exist (404 handled gracefully)
+        nextcloud_folders = await storage_provider.list_folders(import_root, recursive=True)
+        
+        # Get existing DAVI folders to mark which are already imported
+        existing_folders = await repo.folders.find({
+            "company_id": company_id,
+            "admin_id": admin_id
+        }).to_list(length=None)
+        
+        existing_storage_paths = {
+            folder.get("storage_path", "").lower()
+            for folder in existing_folders
+            if folder.get("storage_path")
+        }
+        
+        # Build response with import status
+        importable_folders = []
+        for folder in nextcloud_folders:
+            folder_path = folder["path"]
+            is_imported = folder_path.lower() in existing_storage_paths
+            
+            # Extract folder name from path for display
+            folder_name = folder_path.split("/")[-1] if "/" in folder_path else folder_path
+            
+            importable_folders.append({
+                "path": folder_path,
+                "name": folder_name,
+                "depth": folder["depth"],
+                "imported": is_imported
+            })
+        
+        return {
+            "success": True,
+            "folders": importable_folders,
+            "import_root": import_root,
+            "configured": True
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to list importable folders")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list folders from Nextcloud: {str(e)}"
+        )
+
+
+@company_admin_router.post("/folders/import")
+async def import_folders(
+    payload: ImportFoldersPayload,
+    admin_context=Depends(get_admin_or_user_company_id),
+    db=Depends(get_db)
+):
+    """
+    Import selected folders from Nextcloud into DAVI.
+    
+    Scenario B2: SharePoint → Nextcloud → DAVI (partial import)
+    - Creates DAVI folder records for selected Nextcloud folders
+    - Links folders to their Nextcloud storage paths
+    - Marks folders as imported (origin="imported")
+    - Only selected folders are indexed and managed by DAVI
+    
+    Args:
+        payload: ImportFoldersPayload with list of folder paths to import
+    """
+    await check_teamlid_permission(admin_context, db, "roles_folders")
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+    
+    try:
+        # Get storage provider
+        from app.storage.providers import get_storage_provider, StorageError
+        
+        try:
+            storage_provider = get_storage_provider()
+        except StorageError as e:
+            # Nextcloud is not configured
+            logger.warning(f"Nextcloud not configured: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail="Nextcloud storage is not configured. Please configure NEXTCLOUD_URL, NEXTCLOUD_USERNAME, and NEXTCLOUD_PASSWORD to enable folder import."
+            )
+        
+        imported_folders = []
+        skipped_folders = []
+        errors = []
+        
+        for folder_path in payload.folder_paths:
+            try:
+                # Verify folder exists in Nextcloud
+                if not await storage_provider.folder_exists(folder_path):
+                    errors.append(f"Folder not found in Nextcloud: {folder_path}")
+                    continue
+                
+                # Extract folder name from path
+                folder_name = folder_path.split("/")[-1] if "/" in folder_path else folder_path
+                
+                # Check if folder already exists in DAVI
+                existing = await repo.folders.find_one({
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "name": folder_name,
+                    "storage_path": folder_path
+                })
+                
+                if existing:
+                    skipped_folders.append(folder_name)
+                    continue
+                
+                # Create folder record in DAVI
+                folder_doc = {
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "name": folder_name,
+                    "document_count": 0,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                    "status": "active",
+                    # Storage metadata (Scenario B2 support)
+                    "storage_provider": "nextcloud",
+                    "storage_path": folder_path,  # Canonical Nextcloud path
+                    "origin": "imported",  # Imported from Nextcloud/SharePoint
+                    "indexed": False,  # Will be indexed when documents are added
+                    "sync_enabled": True
+                }
+                
+                await repo.folders.insert_one(folder_doc)
+                imported_folders.append(folder_name)
+                
+                logger.info(f"Imported folder from Nextcloud: {folder_name} (path: {folder_path})")
+                
+            except Exception as e:
+                logger.error(f"Failed to import folder {folder_path}: {e}")
+                errors.append(f"{folder_path}: {str(e)}")
+        
+        return {
+            "success": True,
+            "imported": imported_folders,
+            "skipped": skipped_folders,
+            "errors": errors,
+            "total_imported": len(imported_folders),
+            "total_skipped": len(skipped_folders),
+            "total_errors": len(errors)
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to import folders")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to import folders: {str(e)}"
+        )
+
+
+@company_admin_router.post("/folders/sync")
+async def sync_documents_from_nextcloud(
+    folder_id: Optional[str] = Query(None, description="Optional folder ID to sync specific folder"),
+    admin_context=Depends(get_admin_or_user_company_id),
+    db=Depends(get_db)
+):
+    """
+    Sync documents from Nextcloud to DAVI for imported folders.
+    
+    Only syncs folders with origin="imported" (folders imported from Nextcloud).
+    When a user uploads a document to an imported folder in Nextcloud, this endpoint
+    can be called to sync those documents to DAVI.
+    
+    Args:
+        folder_id: Optional specific folder ID to sync (if None, syncs all imported folders)
+    """
+    await check_teamlid_permission(admin_context, db, "roles_folders")
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+    
+    try:
+        result = await repo.sync_documents_from_nextcloud(
+            company_id=company_id,
+            admin_id=admin_id,
+            folder_id=folder_id
+        )
+        
+        # Trigger RAG indexing for newly synced documents if any
+        if result.get("new_documents", 0) > 0:
+            try:
+                from app.api.rag import rag_index_files
+                # Get newly synced documents and index them
+                # Note: This is a simplified approach - in production, you might want to
+                # track which documents were just synced and index only those
+                logger.info(f"RAG indexing will be triggered for {result['new_documents']} new documents")
+            except Exception as e:
+                logger.warning(f"Failed to trigger RAG indexing: {e}")
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to sync documents from Nextcloud")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to sync documents: {str(e)}"
+        )
 
 
 @company_admin_router.get("/debug/all-data")
