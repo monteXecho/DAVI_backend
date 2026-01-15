@@ -4,8 +4,8 @@ import asyncio
 import logging
 from typing import List
 
-RAG_INDEX_URL = "http://localhost:1416/davi_indexing/run"
-RAG_QUERY_URL = "http://localhost:1416/davi_query/run"
+RAG_INDEX_URL = "http://host.docker.internal:1416/davi_indexing/run"
+RAG_QUERY_URL = "http://host.docker.internal:1416/davi_query/run"
 
 
 logger = logging.getLogger("uvicorn")

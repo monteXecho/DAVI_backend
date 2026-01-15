@@ -37,6 +37,9 @@ services:
       - NEXTCLOUD_USERNAME=${NEXTCLOUD_USERNAME:-davi}
       - NEXTCLOUD_PASSWORD=${NEXTCLOUD_PASSWORD}
       - NEXTCLOUD_ROOT_PATH=${NEXTCLOUD_ROOT_PATH:-/DAVI}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     networks:
       - davi_network
     healthcheck:

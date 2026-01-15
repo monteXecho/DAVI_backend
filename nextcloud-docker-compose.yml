@@ -33,23 +33,3 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-
-  # Optional: Uncomment if using MySQL/MariaDB instead of SQLite
-  # nextcloud_db:
-  #   image: mariadb:10.11
-  #   container_name: davi_nextcloud_db
-  #   restart: unless-stopped
-  #   environment:
-  #     - MYSQL_ROOT_PASSWORD=${NEXTCLOUD_DB_ROOT_PASSWORD}
-  #     - MYSQL_DATABASE=nextcloud
-  #     - MYSQL_USER=nextcloud
-  #     - MYSQL_PASSWORD=${NEXTCLOUD_DB_PASSWORD}
-  #   volumes:
-  #     - /var/opt/nextcloud/db:/var/lib/mysql
-  #   networks:
-  #     - davi_network
-  #   healthcheck:
-  #     test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
