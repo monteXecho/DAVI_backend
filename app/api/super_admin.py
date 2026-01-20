@@ -7,7 +7,7 @@ from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.repositories.document_repo import DocumentRepository
 from app.models.company_admin_schema import CompanyCreate, CompanyAddAdmin, CompanyAdminModules, CompanyReAssignAdmin
-from app.deps.auth import keycloak_admin, ensure_role_exists
+from app.deps.auth import ensure_role_exists
 
 from fastapi.concurrency import run_in_threadpool
 

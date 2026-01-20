@@ -1779,10 +1779,48 @@ async def list_importable_folders(
         }
         
         # Build response with import status
+        # Show all folders, but mark structural folders as non-selectable:
+        # - {company_id} (just the company_id itself) - visible but not importable
+        # - {company_id}/{company_id} (company_id folder inside company_id) - visible but not importable
+        # All other folders can be imported, regardless of depth
         importable_folders = []
+        normalized_company_id = company_id.lower()
+        
         for folder in nextcloud_folders:
             folder_path = folder["path"]
-            is_imported = folder_path.lower() in existing_storage_paths
+            
+            # Normalize path for comparison (remove trailing slashes, lowercase)
+            normalized_path = folder_path.lower().rstrip("/")
+            
+            # Skip empty paths
+            if not normalized_path:
+                continue
+            
+            # Split path into components for checking
+            path_parts = [p for p in normalized_path.split("/") if p]  # Remove empty parts
+            
+            # Skip if path is empty after splitting
+            if not path_parts:
+                continue
+            
+            # Check if this is a structural folder (should be visible but not importable)
+            is_structural = False
+            # 1. Just the company_id itself (1 part, equals company_id)
+            if len(path_parts) == 1 and path_parts[0] == normalized_company_id:
+                is_structural = True
+                logger.debug(f"Marking structural folder as non-importable: {folder_path} (company_id)")
+            # 2. company_id/company_id (2 parts, both equal company_id)
+            elif len(path_parts) == 2 and path_parts[0] == normalized_company_id and path_parts[1] == normalized_company_id:
+                is_structural = True
+                logger.debug(f"Marking structural folder as non-importable: {folder_path} (company_id/company_id)")
+            # 3. company_id/admin_id (2 parts, first is company_id, second is admin_id - structural path)
+            # Only actual folders (3+ levels: company_id/admin_id/folder_name) should be importable
+            elif len(path_parts) == 2 and path_parts[0] == normalized_company_id:
+                is_structural = True
+                logger.debug(f"Marking structural folder as non-importable: {folder_path} (company_id/admin_id)")
+            
+            # Check if folder is already imported
+            is_imported = normalized_path in existing_storage_paths
             
             # Extract folder name from path for display
             folder_name = folder_path.split("/")[-1] if "/" in folder_path else folder_path
@@ -1791,7 +1829,8 @@ async def list_importable_folders(
                 "path": folder_path,
                 "name": folder_name,
                 "depth": folder["depth"],
-                "imported": is_imported
+                "imported": is_imported,
+                "selectable": not is_structural  # Structural folders are not selectable
             })
         
         return {
@@ -1850,8 +1889,45 @@ async def import_folders(
         skipped_folders = []
         errors = []
         
+        # Normalize company_id for comparison
+        normalized_company_id = company_id.lower()
+        
         for folder_path in payload.folder_paths:
             try:
+                # Normalize path for comparison
+                normalized_path = folder_path.lower().rstrip("/")
+                
+                # Split path into components for checking
+                path_parts = [p for p in normalized_path.split("/") if p]  # Remove empty parts
+                
+                # Prevent importing only the specific structural folders
+                # Skip if path is empty
+                if not path_parts:
+                    errors.append(f"Cannot import empty folder path: {folder_path}")
+                    logger.warning(f"Attempted to import empty folder path: {folder_path}")
+                    continue
+                
+                # Skip if path is just the company_id (structural folder)
+                if len(path_parts) == 1 and path_parts[0] == normalized_company_id:
+                    errors.append(f"Cannot import structural folder: {folder_path} (company_id)")
+                    logger.warning(f"Attempted to import structural folder: {folder_path}")
+                    continue
+                
+                # Skip if path is {company_id}/{company_id} (structural folder)
+                if len(path_parts) == 2 and path_parts[0] == normalized_company_id and path_parts[1] == normalized_company_id:
+                    errors.append(f"Cannot import structural folder: {folder_path} (company_id/company_id)")
+                    logger.warning(f"Attempted to import structural folder: {folder_path}")
+                    continue
+                
+                # Skip if path is {company_id}/{admin_id} (structural folder - only 2 levels)
+                # Only actual folders (3+ levels: company_id/admin_id/folder_name) should be importable
+                if len(path_parts) == 2 and path_parts[0] == normalized_company_id:
+                    errors.append(f"Cannot import structural folder: {folder_path} (company_id/admin_id)")
+                    logger.warning(f"Attempted to import structural folder: {folder_path}")
+                    continue
+                
+                # All other folders are allowed (3+ levels deep)
+                
                 # Verify folder exists in Nextcloud
                 if not await storage_provider.folder_exists(folder_path):
                     errors.append(f"Folder not found in Nextcloud: {folder_path}")
@@ -1923,14 +1999,17 @@ async def sync_documents_from_nextcloud(
     db=Depends(get_db)
 ):
     """
-    Sync documents from Nextcloud to DAVI for imported folders.
+    Sync documents from Nextcloud to DAVI for folders that exist in Nextcloud.
     
-    Only syncs folders with origin="imported" (folders imported from Nextcloud).
-    When a user uploads a document to an imported folder in Nextcloud, this endpoint
+    Syncs folders that have a storage_path in Nextcloud, including:
+    - Folders with origin="imported" (folders imported from Nextcloud)
+    - Folders with origin="davi" (folders created in DAVI that were synced to Nextcloud)
+    
+    When a user uploads a document to any folder in Nextcloud, this endpoint
     can be called to sync those documents to DAVI.
     
     Args:
-        folder_id: Optional specific folder ID to sync (if None, syncs all imported folders)
+        folder_id: Optional specific folder ID to sync (if None, syncs all folders with storage_path)
     """
     await check_teamlid_permission(admin_context, db, "roles_folders")
     repo = CompanyRepository(db)
@@ -1945,15 +2024,17 @@ async def sync_documents_from_nextcloud(
         )
         
         # Trigger RAG indexing for newly synced documents if any
-        if result.get("new_documents", 0) > 0:
+        synced_file_paths = result.get("synced_file_paths", [])
+        if synced_file_paths:
             try:
                 from app.api.rag import rag_index_files
-                # Get newly synced documents and index them
-                # Note: This is a simplified approach - in production, you might want to
-                # track which documents were just synced and index only those
-                logger.info(f"RAG indexing will be triggered for {result['new_documents']} new documents")
+                # Index all newly synced documents
+                file_id = f"{company_id}-{admin_id}"
+                await rag_index_files(file_id, synced_file_paths, company_id)
+                logger.info(f"RAG indexing triggered for {len(synced_file_paths)} newly synced document(s)")
             except Exception as e:
-                logger.warning(f"Failed to trigger RAG indexing: {e}")
+                logger.error(f"RAG indexing failed for synced documents: {e}")
+                # Don't fail the sync operation if indexing fails
         
         return result
         

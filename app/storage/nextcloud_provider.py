@@ -306,6 +306,35 @@ class NextcloudStorageProvider(StorageProvider):
                 f"Failed to delete file {path}: {response.status_code} {response.text}"
             )
     
+    async def delete_folder(self, path: str) -> bool:
+        """
+        Delete a folder from Nextcloud using WebDAV DELETE.
+        
+        Args:
+            path: Logical path to the folder (relative to storage root)
+            
+        Returns:
+            True if folder was deleted, False if it didn't exist
+        """
+        full_path = self._get_full_path(path)
+        # Ensure path ends with / for folders in WebDAV
+        if not full_path.endswith("/"):
+            full_path = full_path + "/"
+        
+        response = await self._make_request("DELETE", full_path)
+        
+        if response.status_code in (204, 404):
+            deleted = response.status_code == 204
+            if deleted:
+                logger.info(f"Deleted Nextcloud folder: {path}")
+            else:
+                logger.debug(f"Folder not found in Nextcloud (may have been already deleted): {path}")
+            return deleted
+        else:
+            raise StorageError(
+                f"Failed to delete folder {path}: {response.status_code} {response.text}"
+            )
+    
     async def list_folders(
         self,
         path: str,

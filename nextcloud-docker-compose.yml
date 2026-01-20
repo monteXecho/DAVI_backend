@@ -10,7 +10,7 @@ networks:
 
 services:
   nextcloud:
-    image: nextcloud:29
+    image: nextcloud:32
     container_name: davi_nextcloud
     restart: unless-stopped
     ports:
@@ -18,6 +18,11 @@ services:
     environment:
       - NEXTCLOUD_ADMIN_USER=admin
       - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD:-admin123}
+      - OVERWRITEHOST=clouddavi.nl
+      - OVERWRITEPROTOCOL=https
+      - OVERWRITECLIURL=https://clouddavi.nl
+      - TRUSTED_PROXIES=127.0.0.1
+      - FORWARDED_FOR_HEADERS=HTTP_X_FORWARDED_FOR
       # Optional: Use external database
       # - MYSQL_HOST=nextcloud_db
       # - MYSQL_DATABASE=nextcloud

@@ -522,6 +522,14 @@ class CompanyRepository:
     ) -> int:
 
         deleted_count = 0
+        
+        # Get storage provider once (if available)
+        storage_provider = None
+        if get_storage_provider:
+            try:
+                storage_provider = get_storage_provider()
+            except (StorageError, Exception) as e:
+                logger.debug(f"Storage provider not available for deletion sync: {e}")
 
         for doc_info in documents_to_delete:
             file_name = doc_info.get("fileName")
@@ -547,13 +555,28 @@ class CompanyRepository:
                     continue
 
                 file_path = document.get("path")
+                storage_path = document.get("storage_path")
 
+                # Delete from local filesystem
                 if file_path and os.path.exists(file_path):
                     try:
                         os.remove(file_path)
                         logger.info(f"Deleted physical file: {file_path}")
                     except Exception as e:
                         logger.warning(f"Failed to delete physical file {file_path}: {str(e)}")
+
+                # Delete from Nextcloud if storage_path exists
+                if storage_path and storage_provider:
+                    try:
+                        deleted_from_nextcloud = await storage_provider.delete_file(storage_path)
+                        if deleted_from_nextcloud:
+                            logger.info(f"Deleted file from Nextcloud: {storage_path}")
+                        else:
+                            logger.warning(f"File not found in Nextcloud (may have been already deleted): {storage_path}")
+                    except StorageError as e:
+                        logger.warning(f"Failed to delete file from Nextcloud {storage_path}: {str(e)}")
+                    except Exception as e:
+                        logger.warning(f"Error deleting file from Nextcloud {storage_path}: {str(e)}")
 
                 delete_result = await self.documents.delete_one({"_id": document["_id"]})
                 if delete_result.deleted_count > 0:
@@ -706,6 +729,14 @@ class CompanyRepository:
 
         deleted_folders = []
         total_documents_deleted = 0
+        
+        # Get storage provider once (if available)
+        storage_provider = None
+        if get_storage_provider:
+            try:
+                storage_provider = get_storage_provider()
+            except (StorageError, Exception) as e:
+                logger.debug(f"Storage provider not available for folder deletion sync: {e}")
 
         # Loop through matched role/folder pairs
         for role_name, folder_name in zip(role_names, folder_names):
@@ -734,6 +765,28 @@ class CompanyRepository:
                 for path in glob.glob(pattern):
                     if os.path.exists(path):
                         shutil.rmtree(path, ignore_errors=True)
+                
+                # Get folder record to check for storage_path before deleting
+                folder_record = await self.folders.find_one({
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "name": folder_name
+                })
+                
+                # Delete from Nextcloud if storage_path exists
+                if folder_record and storage_provider:
+                    storage_path = folder_record.get("storage_path")
+                    if storage_path:
+                        try:
+                            deleted_from_nextcloud = await storage_provider.delete_folder(storage_path)
+                            if deleted_from_nextcloud:
+                                logger.info(f"Deleted folder from Nextcloud: {storage_path}")
+                            else:
+                                logger.warning(f"Folder not found in Nextcloud (may have been already deleted): {storage_path}")
+                        except StorageError as e:
+                            logger.warning(f"Failed to delete folder from Nextcloud {storage_path}: {str(e)}")
+                        except Exception as e:
+                            logger.warning(f"Error deleting folder from Nextcloud {storage_path}: {str(e)}")
                 
                 # Delete the folder record itself
                 await self.folders.delete_one({
@@ -806,6 +859,28 @@ class CompanyRepository:
                     {"$pull": {"folders": folder_name}}
                 )
                 
+                # Get folder record to check for storage_path before deleting
+                folder_record = await self.folders.find_one({
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "name": folder_name
+                })
+                
+                # Delete from Nextcloud if storage_path exists
+                if folder_record and storage_provider:
+                    storage_path = folder_record.get("storage_path")
+                    if storage_path:
+                        try:
+                            deleted_from_nextcloud = await storage_provider.delete_folder(storage_path)
+                            if deleted_from_nextcloud:
+                                logger.info(f"Deleted folder from Nextcloud: {storage_path}")
+                            else:
+                                logger.warning(f"Folder not found in Nextcloud (may have been already deleted): {storage_path}")
+                        except StorageError as e:
+                            logger.warning(f"Failed to delete folder from Nextcloud {storage_path}: {str(e)}")
+                        except Exception as e:
+                            logger.warning(f"Error deleting folder from Nextcloud {storage_path}: {str(e)}")
+                
                 # Try to delete folder record
                 folder_delete_result = await self.folders.delete_one({
                     "company_id": company_id,
@@ -867,6 +942,28 @@ class CompanyRepository:
                 {"$pull": {"folders": folder_name}}
             )
 
+            # Get folder record to check for storage_path before deleting
+            folder_record = await self.folders.find_one({
+                "company_id": company_id,
+                "admin_id": admin_id,
+                "name": folder_name
+            })
+            
+            # Delete from Nextcloud if storage_path exists
+            if folder_record and storage_provider:
+                storage_path = folder_record.get("storage_path")
+                if storage_path:
+                    try:
+                        deleted_from_nextcloud = await storage_provider.delete_folder(storage_path)
+                        if deleted_from_nextcloud:
+                            logger.info(f"Deleted folder from Nextcloud: {storage_path}")
+                        else:
+                            logger.warning(f"Folder not found in Nextcloud (may have been already deleted): {storage_path}")
+                    except StorageError as e:
+                        logger.warning(f"Failed to delete folder from Nextcloud {storage_path}: {str(e)}")
+                    except Exception as e:
+                        logger.warning(f"Error deleting folder from Nextcloud {storage_path}: {str(e)}")
+            
             # Delete the folder record itself from the folders collection
             await self.folders.delete_one({
                 "company_id": company_id,
@@ -2307,16 +2404,17 @@ class CompanyRepository:
         folder_id: Optional[str] = None
     ) -> dict:
         """
-        Sync documents from Nextcloud to DAVI for imported folders.
+        Sync documents from Nextcloud to DAVI for folders that exist in Nextcloud.
         
-        Only syncs folders with origin="imported" (folders imported from Nextcloud).
-        When a user uploads a document to an imported folder in Nextcloud, this method
+        Syncs folders with origin="imported" (folders imported from Nextcloud) OR
+        origin="davi" (folders created in DAVI that were synced to Nextcloud).
+        When a user uploads a document to any folder in Nextcloud, this method
         syncs those documents to DAVI.
         
         Args:
             company_id: Company identifier
             admin_id: Admin identifier
-            folder_id: Optional specific folder ID to sync (if None, syncs all imported folders)
+            folder_id: Optional specific folder ID to sync (if None, syncs all folders with storage_path)
             
         Returns:
             Dictionary with sync results
@@ -2335,38 +2433,130 @@ class CompanyRepository:
                 detail=f"Nextcloud storage not configured: {e}"
             )
         
-        # Find imported folders
+        # Find folders that exist in Nextcloud (both imported and DAVI-created)
+        # Both types can have files uploaded to them in Nextcloud
         folder_query = {
             "company_id": company_id,
             "admin_id": admin_id,
-            "origin": "imported",  # Only sync imported folders
-            "storage_path": {"$exists": True, "$ne": None}  # Must have storage_path
+            "storage_path": {"$exists": True, "$ne": None}  # Must have storage_path (exists in Nextcloud)
+            # Note: We sync both "imported" and "davi" folders since files can be uploaded
+            # to either type in Nextcloud
         }
         
         if folder_id:
             folder_query["_id"] = folder_id
         
-        imported_folders = await self.folders.find(folder_query).to_list(length=None)
+        # Find all folders with storage_path (both imported and DAVI-created)
+        folders_to_sync = await self.folders.find(folder_query).to_list(length=None)
         
-        if not imported_folders:
+        if not folders_to_sync:
             return {
                 "success": True,
                 "synced_folders": 0,
                 "new_documents": 0,
                 "skipped_documents": 0,
                 "errors": [],
-                "message": "No imported folders found to sync"
+                "message": "No folders with storage_path found to sync"
             }
         
         synced_folders = 0
         new_documents = 0
+        deleted_from_davi = 0
+        deleted_folders_count = 0
         skipped_documents = 0
         errors = []
+        synced_file_paths = []  # Track file paths for RAG indexing
         
         from app.repositories.document_repo import DocumentRepository
         document_repo = DocumentRepository(self.db)
         
-        for folder in imported_folders:
+        # First, detect folders deleted from Nextcloud (only if syncing all folders, not a specific one)
+        if not folder_id:
+            # List all folders in Nextcloud root
+            try:
+                nextcloud_folders_list = await storage_provider.list_folders("", recursive=True)
+                nextcloud_folder_paths = {f["path"].lower().rstrip("/") for f in nextcloud_folders_list}
+                
+                # Get all folders with storage_path (not just the ones being synced)
+                all_folders_query = {
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "storage_path": {"$exists": True, "$ne": None}
+                }
+                all_folders = await self.folders.find(all_folders_query).to_list(length=None)
+                
+                # Compare with DAVI folders that have storage_path
+                for folder in all_folders:
+                    storage_path = folder.get("storage_path")
+                    if storage_path:
+                        # Normalize paths for comparison
+                        normalized_storage_path = storage_path.lower().rstrip("/")
+                        
+                        # If folder exists in DAVI but not in Nextcloud, it was deleted
+                        if normalized_storage_path not in nextcloud_folder_paths:
+                            folder_name = folder.get("name")
+                            logger.info(f"Folder '{folder_name}' (path: {storage_path}) was deleted from Nextcloud, removing from DAVI")
+                            
+                            try:
+                                # Delete all documents in this folder first
+                                docs_to_delete = await self.documents.find({
+                                    "company_id": company_id,
+                                    "user_id": admin_id,
+                                    "upload_type": folder_name
+                                }).to_list(length=None)
+                                
+                                for doc in docs_to_delete:
+                                    file_path = doc.get("path")
+                                    if file_path and os.path.exists(file_path):
+                                        try:
+                                            os.remove(file_path)
+                                        except Exception as e:
+                                            logger.warning(f"Failed to delete local file {file_path}: {str(e)}")
+                                
+                                # Delete all documents from database
+                                delete_docs_result = await self.documents.delete_many({
+                                    "company_id": company_id,
+                                    "user_id": admin_id,
+                                    "upload_type": folder_name
+                                })
+                                
+                                # Delete local folder
+                                local_base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, folder_name)
+                                if os.path.exists(local_base_path):
+                                    try:
+                                        shutil.rmtree(local_base_path, ignore_errors=True)
+                                        logger.info(f"Deleted local folder: {local_base_path}")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to delete local folder {local_base_path}: {str(e)}")
+                                
+                                # Remove folder from all roles
+                                await self.roles.update_many(
+                                    {
+                                        "company_id": company_id,
+                                        "added_by_admin_id": admin_id,
+                                        "folders": folder_name
+                                    },
+                                    {"$pull": {"folders": folder_name}}
+                                )
+                                
+                                # Delete folder record
+                                await self.folders.delete_one({"_id": folder["_id"]})
+                                
+                                deleted_folders_count += 1
+                                logger.info(f"Deleted folder '{folder_name}' from DAVI (removed from Nextcloud)")
+                                
+                            except Exception as e:
+                                error_msg = f"Failed to delete folder '{folder_name}' that was removed from Nextcloud: {str(e)}"
+                                logger.error(error_msg)
+                                errors.append(error_msg)
+            except Exception as e:
+                logger.warning(f"Failed to list folders from Nextcloud for deletion detection: {str(e)}")
+                errors.append(f"Failed to detect deleted folders: {str(e)}")
+        
+        # Re-fetch folders_to_sync after deletions (in case some were removed)
+        folders_to_sync = await self.folders.find(folder_query).to_list(length=None)
+        
+        for folder in folders_to_sync:
             folder_name = folder.get("name")
             storage_path = folder.get("storage_path")
             
@@ -2378,10 +2568,6 @@ class CompanyRepository:
                 # List files in Nextcloud folder
                 nextcloud_files = await storage_provider.list_files(storage_path, recursive=False)
                 
-                if not nextcloud_files:
-                    logger.info(f"No files found in Nextcloud folder: {storage_path}")
-                    continue
-                
                 # Get existing documents for this folder
                 existing_docs = await self.documents.find({
                     "company_id": company_id,
@@ -2389,9 +2575,59 @@ class CompanyRepository:
                     "upload_type": folder_name
                 }).to_list(length=None)
                 
+                # Create sets for comparison
+                nextcloud_file_names = {file_info["name"] for file_info in nextcloud_files} if nextcloud_files else set()
                 existing_file_names = {doc.get("file_name") for doc in existing_docs if doc.get("file_name")}
                 
-                # Process each file from Nextcloud
+                # Detect files deleted from Nextcloud (exist in DAVI but not in Nextcloud)
+                files_to_delete = existing_file_names - nextcloud_file_names
+                folder_deleted_count = 0
+                
+                for file_name in files_to_delete:
+                    # Find the document
+                    doc_to_delete = next((doc for doc in existing_docs if doc.get("file_name") == file_name), None)
+                    if not doc_to_delete:
+                        continue
+                    
+                    try:
+                        file_path = doc_to_delete.get("path")
+                        
+                        # Delete from local filesystem
+                        if file_path and os.path.exists(file_path):
+                            try:
+                                os.remove(file_path)
+                                logger.info(f"Deleted local file (removed from Nextcloud): {file_path}")
+                            except Exception as e:
+                                logger.warning(f"Failed to delete local file {file_path}: {str(e)}")
+                        
+                        # Delete from DAVI database
+                        delete_result = await self.documents.delete_one({"_id": doc_to_delete["_id"]})
+                        if delete_result.deleted_count > 0:
+                            folder_deleted_count += 1
+                            deleted_from_davi += 1
+                            logger.info(f"Deleted document from DAVI (removed from Nextcloud): {file_name} in folder {folder_name}")
+                            
+                            # Update folder document count
+                            await self.folders.update_one(
+                                {"company_id": company_id, 'admin_id': admin_id, "name": folder_name},
+                                {"$inc": {"document_count": -1}}
+                            )
+                    except Exception as e:
+                        error_msg = f"Failed to delete file '{file_name}' that was removed from Nextcloud: {str(e)}"
+                        logger.error(error_msg)
+                        errors.append(error_msg)
+                
+                if not nextcloud_files:
+                    logger.info(f"No files found in Nextcloud folder: {storage_path}")
+                    synced_folders += 1
+                    # Update folder document count to 0
+                    await self.folders.update_one(
+                        {"_id": folder["_id"]},
+                        {"$set": {"document_count": 0, "updated_at": datetime.utcnow()}}
+                    )
+                    continue
+                
+                # Process each file from Nextcloud (add new files)
                 for file_info in nextcloud_files:
                     file_name = file_info["name"]
                     file_storage_path = file_info["path"]
@@ -2428,6 +2664,7 @@ class CompanyRepository:
                         
                         if doc_record:
                             new_documents += 1
+                            synced_file_paths.append(local_file_path)  # Track for RAG indexing
                             logger.info(f"Synced document from Nextcloud: {file_name} in folder {folder_name}")
                         else:
                             # Document already exists (race condition)
@@ -2455,9 +2692,12 @@ class CompanyRepository:
             "success": True,
             "synced_folders": synced_folders,
             "new_documents": new_documents,
+            "deleted_documents": deleted_from_davi,
+            "deleted_folders": deleted_folders_count,
             "skipped_documents": skipped_documents,
+            "synced_file_paths": synced_file_paths,  # File paths for RAG indexing
             "errors": errors,
-            "message": f"Synced {synced_folders} folder(s), added {new_documents} new document(s)"
+            "message": f"Synced {synced_folders} folder(s), added {new_documents} new document(s), deleted {deleted_from_davi} document(s) and {deleted_folders_count} folder(s) removed from Nextcloud"
         }
 
     async def delete_roles_by_admin(self, company_id: str, admin_id: str) -> int:

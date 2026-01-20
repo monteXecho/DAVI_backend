@@ -3,7 +3,7 @@ from pydantic import EmailStr
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.models.company_admin_schema import RegisterRequest
-from app.deps.auth import keycloak_admin, ensure_role_exists
+from app.deps.auth import get_keycloak_admin, ensure_role_exists
 from keycloak.exceptions import KeycloakGetError
 import traceback
 import re
@@ -15,6 +15,7 @@ auth_router = APIRouter(prefix="/auth", tags=["Auth"])
 async def register_user(
     payload: RegisterRequest,
     db=Depends(get_db),
+    kc_admin=Depends(get_keycloak_admin),
 ):
     try:
         repo = CompanyRepository(db)
@@ -35,7 +36,21 @@ async def register_user(
         # -------------------------------------------------------------
         # 2. Check if email already exists in Keycloak
         # -------------------------------------------------------------
-        existing_users = keycloak_admin.get_users(query={"email": payload.email})
+        try:
+            existing_users = kc_admin.get_users(query={"email": payload.email})
+        except KeycloakGetError as kc_err:
+            # Typically means:
+            # - service-account client lacks realm-management roles (view-users/query-users)
+            # - reverse proxy / WAF blocks /admin endpoints
+            if kc_err.response_code == 403:
+                raise HTTPException(
+                    status_code=502,
+                    detail="KEYCLOAK_FORBIDDEN: service-account lacks permissions (realm-management) or /admin endpoints are blocked by proxy/WAF",
+                )
+            raise HTTPException(
+                status_code=502,
+                detail=f"KEYCLOAK_ERROR ({kc_err.response_code}): {kc_err.error_message}",
+            )
         if existing_users:
             raise HTTPException(
                 status_code=409,
@@ -60,7 +75,7 @@ async def register_user(
         # 4. Create user in Keycloak
         # -------------------------------------------------------------
         try:
-            user_id = keycloak_admin.create_user({
+            user_id = kc_admin.create_user({
                 "username": username,
                 "email": payload.email,
                 "firstName": first_name,
@@ -97,7 +112,7 @@ async def register_user(
             )
 
         kc_role = ensure_role_exists(role_name)
-        keycloak_admin.assign_realm_roles(user_id=user_id, roles=[kc_role])
+        kc_admin.assign_realm_roles(user_id=user_id, roles=[kc_role])
 
         # -------------------------------------------------------------
         # 6. Update MongoDB user → set full name

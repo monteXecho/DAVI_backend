@@ -50,6 +50,22 @@ class StorageProvider(ABC):
         pass
     
     @abstractmethod
+    async def delete_folder(self, path: str) -> bool:
+        """
+        Delete a folder from storage.
+        
+        Args:
+            path: Full path to the folder (relative to storage root)
+            
+        Returns:
+            True if folder was deleted, False if it didn't exist
+            
+        Raises:
+            StorageError: If deletion fails
+        """
+        pass
+    
+    @abstractmethod
     async def upload_file(
         self,
         file_path: str,

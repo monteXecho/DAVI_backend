@@ -41,11 +41,11 @@ async def handle_large_requests(request: Request, call_next):
             )
         raise
 
-# HIGHLIGHTED_DIR = os.path.join("/var/opt/DAVI_backend/output/highlighted")
-# app.mount("/highlighted", StaticFiles(directory=HIGHLIGHTED_DIR), name="highlighted")
-
-
+# Create output directory if it doesn't exist
 HIGHLIGHTED_DIR = os.path.join(os.getcwd(), "output", "highlighted")
+os.makedirs(HIGHLIGHTED_DIR, exist_ok=True)
+
+# Mount highlighted directory for static file serving
 app.mount("/highlighted", StaticFiles(directory=HIGHLIGHTED_DIR), name="highlighted")
 
 

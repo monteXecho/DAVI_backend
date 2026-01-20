@@ -37,36 +37,99 @@ def prepare_highlighted_dir(output_dir: str):
         os.makedirs(output_dir, exist_ok=True)
 
 
-def highlight_documents(documents, output_dir: str):
-    base_upload_dir = "/var/opt/DAVI_backend/uploads/documents"
-
+def highlight_documents(documents, output_dir: str, user_documents: list):
+    """
+    Highlight documents returned from RAG query.
+    
+    Args:
+        documents: List of document dicts with content and meta from RAG
+        output_dir: Directory to save highlighted PDFs
+        user_documents: List of user documents with path info (from get_user_with_documents)
+    """
+    # Create a map of file_name -> path for quick lookup
+    file_path_map = {doc.get("file_name"): doc.get("path", "") for doc in user_documents}
+    
     for doc in documents:
         snippet = doc["content"]
         meta = doc["meta"]
         file_id = meta.get("file_id")
-        actual_file_name = meta.get("file_path")
-
+        actual_file_name = meta.get("file_path") or meta.get("file_name")
+        
         if not file_id:
             logger.warning("Missing file_id in document meta.")
             continue
-
+        
+        # Try to get the actual file path from the document path map
+        # The file_name in meta might be just the filename or the full file_path
+        file_name_from_meta = meta.get("file_name", "")
+        abs_input_path = None
+        
+        # Strategy 1: Check if original_file_path exists and is valid
         original_path = meta.get("original_file_path", "")
-        if original_path.startswith('/app/uploads/documents/'):
-            relative_path = original_path[len('/app/uploads/documents/'):]
+        if original_path and os.path.exists(original_path):
+            abs_input_path = original_path
+            logger.info(f"Using original_file_path: {abs_input_path}")
         else:
-            relative_path = original_path
-
-        abs_input_path = os.path.join(base_upload_dir, relative_path)
-        logger.info(f"----- abs_input_path -----: {abs_input_path}")
-        output_path = os.path.join(output_dir, actual_file_name)
-
-        if not os.path.exists(abs_input_path):
-            logger.error(f"File not found for highlighting: {abs_input_path}")
+            # Strategy 2: Use file_path from meta if it exists and is valid
+            file_path_from_meta = meta.get("file_path", "")
+            if file_path_from_meta and os.path.exists(file_path_from_meta):
+                abs_input_path = file_path_from_meta
+                logger.info(f"Using file_path from meta: {abs_input_path}")
+            else:
+                # Strategy 3: Look up in user_documents by file_name
+                # Try different variations of the file name
+                possible_names = [
+                    actual_file_name,
+                    file_name_from_meta,
+                    os.path.basename(actual_file_name) if actual_file_name else None,
+                    os.path.basename(file_path_from_meta) if file_path_from_meta else None
+                ]
+                
+                for name in possible_names:
+                    if name and name in file_path_map:
+                        candidate_path = file_path_map[name]
+                        if candidate_path and os.path.exists(candidate_path):
+                            abs_input_path = candidate_path
+                            logger.info(f"Found path from user_documents map: {abs_input_path}")
+                            break
+                
+                # Strategy 4: Try constructing path from original_file_path if it has a pattern
+                if not abs_input_path and original_path:
+                    # If original_path looks like it's from /var/opt, try /app/uploads equivalent
+                    if '/var/opt/DAVI_backend/uploads/documents' in original_path:
+                        relative = original_path.replace('/var/opt/DAVI_backend/uploads/documents', '').lstrip('/')
+                        candidate = os.path.join('/app/uploads/documents', relative)
+                        if os.path.exists(candidate):
+                            abs_input_path = candidate
+                            logger.info(f"Constructed path from /var/opt pattern: {abs_input_path}")
+                    # If it starts with /app/uploads/documents, try /var/opt equivalent
+                    elif original_path.startswith('/app/uploads/documents'):
+                        relative = original_path.replace('/app/uploads/documents', '').lstrip('/')
+                        candidate = os.path.join('/var/opt/DAVI_backend/uploads/documents', relative)
+                        if os.path.exists(candidate):
+                            abs_input_path = candidate
+                            logger.info(f"Constructed path from /app/uploads pattern: {abs_input_path}")
+        
+        if not abs_input_path:
+            logger.error(f"File not found for highlighting. file_id: {file_id}, file_name: {actual_file_name}, original_path: {original_path}")
             continue
-
+        
+        if not os.path.exists(abs_input_path):
+            logger.error(f"File path does not exist: {abs_input_path}")
+            continue
+        
+        # Use the actual file name (not full path) for output
+        output_file_name = os.path.basename(abs_input_path)
+        output_path = os.path.join(output_dir, output_file_name)
+        
+        logger.info(f"Highlighting: {abs_input_path} -> {output_path}")
+        
         try:
             find_and_highlight(abs_input_path, snippet, meta.get("page_number", 1), output_path)
             meta["highlighted_path"] = output_path
+            # Update file_path to just the filename for the frontend
+            meta["file_path"] = output_file_name
+            logger.info(f"Successfully highlighted: {output_file_name}")
         except Exception as e:
             logger.error(f"Failed to process {abs_input_path}: {e}")
 
@@ -172,7 +235,7 @@ async def ask_question(
         # ------------------------------------------------------------------
         output_dir = os.path.join("output", "highlighted")
         await run_in_threadpool(prepare_highlighted_dir, output_dir)
-        await run_in_threadpool(highlight_documents, normalized_docs, output_dir)
+        await run_in_threadpool(highlight_documents, normalized_docs, output_dir, user_documents)
 
         # ------------------------------------------------------------------
         # Build response
