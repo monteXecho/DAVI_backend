@@ -23,7 +23,8 @@ from app.api.rag import rag_index_files
 logger = logging.getLogger("uvicorn")
 KEYCLOAK_HOST = os.getenv("KEYCLOAK_HOST", "host.docker.internal")
 
-company_admin_router = APIRouter(prefix="/company-admin", tags=["Company Admin"])
+# Router without prefix - prefix will be added by main router
+company_admin_router = APIRouter(tags=["Company Admin"])
 
 
 def _can_write_users(perms: dict) -> bool:
@@ -218,9 +219,6 @@ async def get_admin_or_user_company_id(
 
     company_id = base_user["company_id"]
     real_user_id = base_user["user_id"]
-    
-    # Get Keycloak access token for Nextcloud authentication
-    access_token = user.get("_raw_token")
 
     if user_type == "company_admin":
         acting_admin_id = real_user_id
@@ -287,7 +285,6 @@ async def get_admin_or_user_company_id(
         "user_email": user_email,
         "user_type": user_type,
         "guest_permissions": guest_permissions,
-        "_access_token": access_token,  # Keycloak access token for Nextcloud authentication
     }
 
 
@@ -1521,24 +1518,11 @@ async def add_folders(
     admin_id = admin_context["admin_id"]
 
     try:
-        # Get storage provider for Nextcloud sync using Keycloak SSO
+        # Get storage provider for Nextcloud sync
         storage_provider = None
         try:
             from app.storage.providers import get_storage_provider, StorageError
-            from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_ROOT_PATH
-            
-            user_email = admin_context.get("admin_email") or admin_context.get("user_email")
-            access_token = admin_context.get("_access_token")
-            
-            if user_email and access_token:
-                storage_provider = get_storage_provider(
-                    username=user_email,  # Email from Keycloak = Nextcloud username
-                    access_token=access_token,  # Keycloak access token
-                    url=NEXTCLOUD_URL,
-                    root_path=NEXTCLOUD_ROOT_PATH
-                )
-            else:
-                logger.warning(f"Keycloak token not available for {user_email}, creating folders in DAVI only")
+            storage_provider = get_storage_provider()
         except StorageError as e:
             logger.warning(f"Storage provider not available, creating folders in DAVI only: {e}")
             # Continue without storage provider - DAVI can function without Nextcloud
@@ -1792,29 +1776,11 @@ async def list_importable_folders(
     admin_id = admin_context["admin_id"]
     
     try:
-        # Get storage provider using Keycloak SSO
+        # Get storage provider
         from app.storage.providers import get_storage_provider, StorageError
-        from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_ROOT_PATH
-        
-        user_email = admin_context.get("admin_email") or admin_context.get("user_email")
-        access_token = admin_context.get("_access_token")
-        
-        if not user_email or not access_token:
-            return {
-                "success": True,
-                "folders": [],
-                "import_root": import_root or "",
-                "message": "Keycloak access token not available. Cannot connect to Nextcloud.",
-                "configured": False
-            }
         
         try:
-            storage_provider = get_storage_provider(
-                username=user_email,  # Email from Keycloak = Nextcloud username
-                access_token=access_token,  # Keycloak access token
-                url=NEXTCLOUD_URL,
-                root_path=NEXTCLOUD_ROOT_PATH
-            )
+            storage_provider = get_storage_provider()
         except StorageError as e:
             # Nextcloud is not configured - return empty list with informative message
             logger.warning(f"Nextcloud not configured: {e}")
@@ -1822,7 +1788,7 @@ async def list_importable_folders(
                 "success": True,
                 "folders": [],
                 "import_root": import_root or "",
-                "message": "Nextcloud storage is not configured. Please configure NEXTCLOUD_URL to enable folder import.",
+                "message": "Nextcloud storage is not configured. Please configure NEXTCLOUD_URL, NEXTCLOUD_USERNAME, and NEXTCLOUD_PASSWORD to enable folder import.",
                 "configured": False
             }
         
@@ -1942,32 +1908,17 @@ async def import_folders(
     admin_id = admin_context["admin_id"]
     
     try:
-        # Get storage provider using Keycloak SSO
+        # Get storage provider
         from app.storage.providers import get_storage_provider, StorageError
-        from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_ROOT_PATH
-        
-        user_email = admin_context.get("admin_email") or admin_context.get("user_email")
-        access_token = admin_context.get("_access_token")
-        
-        if not user_email or not access_token:
-            raise HTTPException(
-                status_code=400,
-                detail="Keycloak access token not available. Cannot connect to Nextcloud."
-            )
         
         try:
-            storage_provider = get_storage_provider(
-                username=user_email,  # Email from Keycloak = Nextcloud username
-                access_token=access_token,  # Keycloak access token
-                url=NEXTCLOUD_URL,
-                root_path=NEXTCLOUD_ROOT_PATH
-            )
+            storage_provider = get_storage_provider()
         except StorageError as e:
             # Nextcloud is not configured
             logger.warning(f"Nextcloud not configured: {e}")
             raise HTTPException(
                 status_code=400,
-                detail="Nextcloud storage is not configured. Please configure NEXTCLOUD_URL to enable folder import."
+                detail="Nextcloud storage is not configured. Please configure NEXTCLOUD_URL, NEXTCLOUD_USERNAME, and NEXTCLOUD_PASSWORD to enable folder import."
             )
         
         imported_folders = []
@@ -2101,38 +2052,11 @@ async def sync_documents_from_nextcloud(
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
     
-    # Get storage provider using Keycloak SSO
-    from app.storage.providers import get_storage_provider, StorageError
-    from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_ROOT_PATH
-    
-    user_email = admin_context.get("admin_email") or admin_context.get("user_email")
-    access_token = admin_context.get("_access_token")
-    
-    if not user_email or not access_token:
-        raise HTTPException(
-            status_code=400,
-            detail="Keycloak access token not available. Cannot connect to Nextcloud."
-        )
-    
-    try:
-        storage_provider = get_storage_provider(
-            username=user_email,  # Email from Keycloak = Nextcloud username
-            access_token=access_token,  # Keycloak access token
-            url=NEXTCLOUD_URL,
-            root_path=NEXTCLOUD_ROOT_PATH
-        )
-    except StorageError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Nextcloud storage not configured: {e}"
-        )
-    
     try:
         result = await repo.sync_documents_from_nextcloud(
             company_id=company_id,
             admin_id=admin_id,
-            folder_id=folder_id,
-            storage_provider=storage_provider
+            folder_id=folder_id
         )
         
         # Trigger RAG indexing for newly synced documents if any

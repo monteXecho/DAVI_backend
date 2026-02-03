@@ -73,6 +73,11 @@ async def upload_document(
         if not user_id or not company_id:
             raise HTTPException(status_code=400, detail="User record missing user_id or company_id")
 
+        # Check documents limit
+        allowed, error_msg = await company_repo.check_documents_limit(company_id)
+        if not allowed:
+            raise HTTPException(status_code=403, detail=error_msg)
+
         # Build absolute save path
         upload_folder = os.path.join(UPLOAD_FOLDERS[upload_type], user_id)
         os.makedirs(upload_folder, exist_ok=True)
@@ -136,9 +141,9 @@ async def upload_document(
             "company_id": company_id,
             "path": file_path,
         }
-
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("Unhandled exception during file upload")
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+

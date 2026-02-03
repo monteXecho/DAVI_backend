@@ -1,12 +1,12 @@
 import os
 import shutil
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from app.deps.auth import require_role, get_keycloak_admin
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.repositories.document_repo import DocumentRepository
-from app.models.company_admin_schema import CompanyCreate, CompanyAddAdmin, CompanyAdminModules, CompanyReAssignAdmin
+from app.models.company_admin_schema import CompanyCreate, CompanyAddAdmin, CompanyAdminModules, CompanyReAssignAdmin, CompanyModulesUpdate
 from app.deps.auth import ensure_role_exists
 
 from fastapi.concurrency import run_in_threadpool
@@ -62,6 +62,27 @@ async def get_companies(
     return companies
 
 
+@super_admin_router.get("/roles/count")
+async def get_roles_count(
+    user=Depends(require_role("super_admin")),
+    db=Depends(get_db),
+):
+    """
+    Get roles count per company for super admin dashboard.
+    Returns a dictionary mapping company_id to roles count.
+    """
+    roles_collection = db.company_roles
+    roles_cursor = roles_collection.find({}, {"company_id": 1})
+    
+    roles_count_by_company = {}
+    async for role in roles_cursor:
+        company_id = role.get("company_id")
+        if company_id:
+            roles_count_by_company[company_id] = roles_count_by_company.get(company_id, 0) + 1
+    
+    return roles_count_by_company
+
+
 @super_admin_router.post("/companies")
 async def add_company(
     payload: CompanyCreate,
@@ -71,6 +92,96 @@ async def add_company(
     repo = CompanyRepository(db)
     return await repo.create_company(payload.name)
 
+
+@super_admin_router.put("/companies/{company_id}/limits")
+async def update_company_limits(
+    company_id: str,
+    max_users: int = Query(None),
+    max_admins: int = Query(None),
+    max_documents: int = Query(None),
+    max_roles: int = Query(None),
+    user=Depends(require_role("super_admin")),
+    db=Depends(get_db),
+):
+    """Update resource limits for a company. Use -1 for infinite."""
+    repo = CompanyRepository(db)
+    
+    # Verify company exists
+    company = await repo.companies.find_one({"company_id": company_id})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    
+    try:
+        # Convert and validate all parameters
+        # FastAPI Query() will convert strings to int, but we need to handle None
+        update_params = {}
+        if max_users is not None:
+            try:
+                update_params['max_users'] = int(max_users)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"Invalid max_users value: {max_users}")
+        
+        if max_admins is not None:
+            try:
+                update_params['max_admins'] = int(max_admins)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"Invalid max_admins value: {max_admins}")
+        
+        if max_documents is not None:
+            try:
+                update_params['max_documents'] = int(max_documents)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"Invalid max_documents value: {max_documents}")
+        
+        if max_roles is not None:
+            try:
+                update_params['max_roles'] = int(max_roles)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"Invalid max_roles value: {max_roles}")
+        
+        if not update_params:
+            raise HTTPException(status_code=400, detail="No limits provided to update")
+        
+        logger.info(f"Updating company {company_id} limits: {update_params}")
+        
+        limits = await repo.update_company_limits(
+            company_id=company_id,
+            **update_params
+        )
+        return {
+            "status": "success",
+            "company_id": company_id,
+            "limits": limits
+        }
+    except Exception as e:
+        logger.exception("Failed to update company limits")
+        raise HTTPException(status_code=500, detail=f"Failed to update limits: {str(e)}")
+
+@super_admin_router.put("/companies/{company_id}/modules")
+async def update_company_modules(
+    company_id: str,
+    payload: CompanyModulesUpdate,
+    user=Depends(require_role("super_admin")),
+    db=Depends(get_db),
+):
+    """Update module permissions for a company."""
+    repo = CompanyRepository(db)
+    
+    # Verify company exists
+    company = await repo.companies.find_one({"company_id": company_id})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    
+    try:
+        updated_modules = await repo.update_company_modules(company_id, payload.modules)
+        return {
+            "status": "success",
+            "company_id": company_id,
+            "modules": updated_modules
+        }
+    except Exception as e:
+        logger.exception("Failed to update company modules")
+        raise HTTPException(status_code=500, detail=f"Failed to update modules: {str(e)}")
 
 @super_admin_router.post("/companies/{company_id}/admins")
 async def add_company_admin(

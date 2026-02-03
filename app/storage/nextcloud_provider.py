@@ -31,21 +31,21 @@ class NextcloudStorageProvider(StorageProvider):
         self,
         url: str,
         username: str,
-        password: str,
+        access_token: str,
         root_path: str = "/DAVI"
     ):
         """
-        Initialize Nextcloud storage provider.
+        Initialize Nextcloud storage provider with Keycloak SSO.
         
         Args:
             url: Nextcloud server URL (e.g., "https://nextcloud.example.com")
-            username: Nextcloud username
-            password: Nextcloud password or app password
+            username: Nextcloud username (email from Keycloak)
+            access_token: Keycloak access token for OIDC authentication
             root_path: Root path in Nextcloud where DAVI files are stored
         """
         self.base_url = url.rstrip("/")
         self.username = username
-        self.password = password
+        self.access_token = access_token
         self.root_path = root_path.strip("/")
         
         # WebDAV endpoint is typically at /remote.php/dav/files/{username}/
@@ -54,7 +54,7 @@ class NextcloudStorageProvider(StorageProvider):
         # Full path including root
         self.storage_root = f"{self.webdav_base}/{self.root_path}".rstrip("/")
         
-        logger.info(f"NextcloudStorageProvider initialized: {self.base_url}, root={self.root_path}")
+        logger.info(f"NextcloudStorageProvider initialized with Keycloak SSO: {self.base_url}, user={self.username}, root={self.root_path}")
     
     def _get_full_path(self, path: str) -> str:
         """
@@ -134,9 +134,10 @@ class NextcloudStorageProvider(StorageProvider):
             # Relative path - should not happen but handle gracefully
             url = f"{self.base_url}/{path}"
         
-        auth = (self.username, self.password)
+        # Use Bearer token authentication (Keycloak OIDC)
         request_headers = {
             "Content-Type": "application/octet-stream",
+            "Authorization": f"Bearer {self.access_token}",
             **(headers or {})
         }
         
@@ -147,8 +148,7 @@ class NextcloudStorageProvider(StorageProvider):
                     method=method,
                     url=url,
                     content=content,
-                    headers=request_headers,
-                    auth=auth
+                    headers=request_headers
                 )
                 
                 # Log non-2xx responses for debugging

@@ -72,6 +72,8 @@ async def get_current_user(token: Annotated[str, Depends(oauth_2_scheme)]):
             options={"verify_exp": True},
             audience="account",
         )
+        # Include raw token for Nextcloud authentication
+        payload["_raw_token"] = token
         return payload
 
     except jwt.ExpiredSignatureError:

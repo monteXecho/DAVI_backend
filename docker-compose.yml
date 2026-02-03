@@ -25,7 +25,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
-      - default
       - davi_network
 
   mongodb:
@@ -37,4 +36,4 @@ services:
     volumes:
       - ./mongo-data:/data/db
     networks:
-      - default
+      - davi_network

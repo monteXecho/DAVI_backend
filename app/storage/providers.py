@@ -8,7 +8,7 @@ maintaining DAVI as the logical source of truth.
 
 from abc import ABC, abstractmethod
 from typing import List, Optional, BinaryIO
-from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_USERNAME, NEXTCLOUD_PASSWORD, NEXTCLOUD_ROOT_PATH
+from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_ROOT_PATH
 
 
 class StorageProvider(ABC):
@@ -179,31 +179,50 @@ class StorageError(Exception):
     pass
 
 
-def get_storage_provider() -> StorageProvider:
+def get_storage_provider(
+    username: Optional[str] = None,
+    access_token: Optional[str] = None,
+    url: Optional[str] = None,
+    root_path: Optional[str] = None
+) -> StorageProvider:
     """
-    Factory function to get the configured storage provider.
+    Factory function to get the configured storage provider with Keycloak SSO.
     
-    Currently returns NextcloudStorageProvider. In the future,
-    this could be extended to support multiple providers based on
-    configuration.
+    Args:
+        username: Nextcloud username (email from Keycloak). If not provided, will raise error.
+        access_token: Keycloak access token for OIDC authentication. Required.
+        url: Nextcloud server URL. If not provided, uses NEXTCLOUD_URL from config.
+        root_path: Root path in Nextcloud. If not provided, uses NEXTCLOUD_ROOT_PATH from config.
     
     Returns:
         Configured StorageProvider instance
+    
+    Raises:
+        StorageError: If required parameters are missing
     """
     # Import here to avoid circular import
     from app.storage.nextcloud_provider import NextcloudStorageProvider
     
-    # For now, always use Nextcloud
-    # In the future, this could check config to select provider
-    if not NEXTCLOUD_URL or not NEXTCLOUD_USERNAME or not NEXTCLOUD_PASSWORD:
+    provider_url = url or NEXTCLOUD_URL
+    provider_username = username
+    provider_access_token = access_token
+    provider_root_path = root_path or NEXTCLOUD_ROOT_PATH
+    
+    if not provider_url:
         raise StorageError(
             "Nextcloud storage is not configured. "
-            "Please set NEXTCLOUD_URL, NEXTCLOUD_USERNAME, and NEXTCLOUD_PASSWORD environment variables."
+            "Please set NEXTCLOUD_URL environment variable."
+        )
+    
+    if not provider_username or not provider_access_token:
+        raise StorageError(
+            "Nextcloud authentication requires username and access_token. "
+            "Both must be provided when calling get_storage_provider()."
         )
     
     return NextcloudStorageProvider(
-        url=NEXTCLOUD_URL,
-        username=NEXTCLOUD_USERNAME,
-        password=NEXTCLOUD_PASSWORD,
-        root_path=NEXTCLOUD_ROOT_PATH
+        url=provider_url,
+        username=provider_username,
+        access_token=provider_access_token,
+        root_path=provider_root_path
     )

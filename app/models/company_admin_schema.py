@@ -29,6 +29,9 @@ class CompanyCreate(BaseModel):
 class CompanyUpdateModules(BaseModel):
     modules: List[ModuleConfig]
 
+class CompanyModulesUpdate(BaseModel):
+    modules: dict  # Dictionary mapping module names to their config
+
 
 class CompanyAddAdmin(BaseModel):
     name: str
