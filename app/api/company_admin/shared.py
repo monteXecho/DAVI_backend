@@ -6,8 +6,8 @@ all company admin domain routers.
 """
 
 import logging
-from fastapi import Depends
-from app.deps.auth import get_current_user, get_keycloak_admin
+from fastapi import Depends, Request, HTTPException
+from app.deps.auth import get_current_user, get_keycloak_admin, require_role
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 
@@ -70,7 +70,7 @@ async def get_repository(db=Depends(get_db)) -> CompanyRepository:
 
 async def check_teamlid_permission(
     admin_context: dict,
-    repo: CompanyRepository,
+    db,
     permission_type: str
 ):
     """
@@ -78,6 +78,7 @@ async def check_teamlid_permission(
     Supports multiple teamlid roles by checking guest_access collection based on acting workspace.
     Works for both company_admin and company_user.
     """
+    repo = CompanyRepository(db)
     user_email = admin_context.get("admin_email") or admin_context.get("user_email")
     if not user_email:
         return True 
@@ -94,8 +95,6 @@ async def check_teamlid_permission(
     if user_type == "company_admin":
         user_record = await repo.find_admin_by_email(user_email)
     else:
-        from motor.motor_asyncio import AsyncIOMotorDatabase
-        db = repo.db
         user_record = await db.company_users.find_one({"email": user_email})
     
     if not user_record:
@@ -117,11 +116,250 @@ async def check_teamlid_permission(
         can_folder_write = _get_guest_permission(guest_entry, "can_folder_write")
         
         if permission_type == "users":
-            return can_user_write
-        elif permission_type == "roles" or permission_type == "folders":
-            return can_role_write or can_folder_write
+            if not can_user_write:
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om gebruikers te beheren."
+                )
+        elif permission_type == "roles_folders":
+            if not can_role_write and not can_folder_write:
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om rollen of mappen te beheren."
+                )
         elif permission_type == "documents":
-            return can_document_write
+            if not can_document_write:
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om documenten te beheren."
+                )
+        return True
+    else:
+        if user_type == "company_user":
+            raise HTTPException(
+                status_code=403,
+                detail="Geen gasttoegang gevonden voor deze werkruimte. Selecteer een teamlid rol om toegang te krijgen."
+            )
+        
+        perms = user_record.get("teamlid_permissions", {})
+        
+        if permission_type == "users":
+            if not _can_write_users(perms):
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om gebruikers te beheren."
+                )
+        elif permission_type == "roles_folders":
+            if not _can_write_roles_folders(perms):
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om rollen of mappen te beheren."
+                )
+        elif permission_type == "documents":
+            if not _can_write_documents(perms):
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om documenten te beheren."
+                )
     
-    return False
+    return True
+
+
+async def get_admin_or_user_company_id(
+    request: Request,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """
+    Extract and validate the authenticated user's company_id.
+    Supports both company_admin and company_user (with teamlid permissions).
+
+    Additionally:
+      - Reads X-Acting-Owner-Id header.
+      - If present and different from the real user_id, verifies guest access.
+      - Returns 'admin_id' as the WORKSPACE owner (acting admin),
+        plus 'real_admin_id' and 'guest_permissions' if in guest mode.
+    """
+    repo = CompanyRepository(db)
+
+    user_email = user.get("email")
+    if not user_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing email in authentication token",
+        )
+
+    roles = user.get("realm_access", {}).get("roles", [])
+    
+    if "company_admin" in roles:
+        base_user = await db.company_admins.find_one({"email": user_email})
+        user_type = "company_admin"
+    elif "company_user" in roles:
+        base_user = await db.company_users.find_one({"email": user_email})
+        user_type = "company_user"
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="User must be company_admin or company_user",
+        )
+
+    if not base_user:
+        raise HTTPException(
+            status_code=403,
+            detail="User not found in company database",
+        )
+
+    company_id = base_user["company_id"]
+    real_user_id = base_user["user_id"]
+    
+    # Get Keycloak access token for Nextcloud authentication
+    access_token = user.get("_raw_token")
+
+    if user_type == "company_admin":
+        acting_admin_id = real_user_id
+        default_owner_id = real_user_id
+    else:
+        default_owner_id = base_user.get("added_by_admin_id")
+        if not default_owner_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Company user must be added by an admin",
+            )
+        acting_admin_id = default_owner_id
+
+    guest_permissions = None
+
+    acting_owner_header = request.headers.get("X-Acting-Owner-Id")
+    is_guest_mode = request.headers.get("X-Acting-Owner-Is-Guest", "false").lower() == "true"
+    
+    needs_guest_check = False
+    if acting_owner_header:
+        if acting_owner_header != default_owner_id:
+            needs_guest_check = True
+        elif user_type == "company_user" and is_guest_mode:
+            needs_guest_check = True
+    
+    if needs_guest_check:
+        guest_entry = await repo.get_guest_access(
+            company_id=company_id,
+            guest_user_id=real_user_id,
+            owner_admin_id=acting_owner_header,
+        )
+        if guest_entry:
+            guest_permissions = {
+                "role_write": _get_guest_permission(guest_entry, "can_role_write"),
+                "user_write": _get_guest_permission(guest_entry, "can_user_write", "can_user_read"),
+                "document_write": _get_guest_permission(guest_entry, "can_document_write", "can_document_read"),
+                "folder_write": _get_guest_permission(guest_entry, "can_folder_write"),
+            }
+        else:
+            if (
+                base_user.get("is_teamlid")
+                and base_user.get("assigned_teamlid_by_id") == acting_owner_header
+            ):
+                teamlid_perms = base_user.get("teamlid_permissions", {})
+                guest_permissions = {
+                    "role_write": teamlid_perms.get("role_folder_modify_permission", False),
+                    "user_write": teamlid_perms.get("user_create_modify_permission", False),
+                    "document_write": teamlid_perms.get("document_modify_permission", False),
+                    "folder_write": teamlid_perms.get("role_folder_modify_permission", False),
+                }
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail="No guest access for this workspace",
+                )
+
+        acting_admin_id = acting_owner_header
+
+    return {
+        "company_id": company_id,
+        "admin_id": acting_admin_id,
+        "real_admin_id": real_user_id,
+        "admin_email": user_email, 
+        "user_email": user_email,
+        "user_type": user_type,
+        "guest_permissions": guest_permissions,
+        "_access_token": access_token,  # Keycloak access token for Nextcloud authentication
+    }
+
+
+async def get_admin_company_id(
+    request: Request,
+    user=Depends(require_role("company_admin")),
+    db=Depends(get_db),
+):
+    """
+    Extract and validate the authenticated admin's company_id.
+    DEPRECATED: Use get_admin_or_user_company_id for support of company users with teamlid permissions.
+
+    Additionally:
+      - Reads X-Acting-Owner-Id header.
+      - If present and different from the real admin_id, verifies guest access.
+      - Returns 'admin_id' as the WORKSPACE owner (acting admin),
+        plus 'real_admin_id' and 'guest_permissions' if in guest mode.
+    """
+    repo = CompanyRepository(db)
+
+    admin_email = user.get("email")
+    if not admin_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing email in authentication token",
+        )
+
+    admin_record = await repo.find_admin_by_email(admin_email)
+    if not admin_record:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin not found in backend database",
+        )
+
+    full_admin = await db.company_admins.find_one({"email": admin_email})
+    if not full_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin not registered in company database",
+        )
+
+    company_id = full_admin["company_id"]
+    real_user_id = full_admin["user_id"]
+    
+    # Get Keycloak access token for Nextcloud authentication
+    access_token = user.get("_raw_token")
+
+    acting_owner_header = request.headers.get("X-Acting-Owner-Id")
+    acting_admin_id = real_user_id
+    guest_permissions = None
+
+    if acting_owner_header and acting_owner_header != real_user_id:
+        guest_entry = await repo.get_guest_access(
+            company_id=company_id,
+            guest_user_id=real_user_id,
+            owner_admin_id=acting_owner_header,
+        )
+        if guest_entry:
+            guest_permissions = {
+                "role_write": _get_guest_permission(guest_entry, "can_role_write"),
+                "user_write": _get_guest_permission(guest_entry, "can_user_write", "can_user_read"),
+                "document_write": _get_guest_permission(guest_entry, "can_document_write", "can_document_read"),
+                "folder_write": _get_guest_permission(guest_entry, "can_folder_write"),
+            }
+            acting_admin_id = acting_owner_header
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="No guest access for this workspace",
+            )
+
+    return {
+        "company_id": company_id,
+        "admin_id": acting_admin_id,
+        "real_admin_id": real_user_id,
+        "admin_email": admin_email,
+        "user_email": admin_email,
+        "user_type": "company_admin",
+        "guest_permissions": guest_permissions,
+        "_access_token": access_token,
+    }
 
