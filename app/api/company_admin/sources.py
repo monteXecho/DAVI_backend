@@ -14,7 +14,7 @@ import logging
 import os
 import httpx
 import aiofiles
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form
 from app.deps.auth import get_current_user
@@ -107,9 +107,38 @@ async def list_sources(
                 source["id"] = str(source["_id"])
                 del source["_id"]
         
+        # Calculate last sync time (most recent last_updated from active URL sources)
+        last_sync = None
+        active_url_sources = [s for s in sources if s.get("type") == "url" and s.get("status") == "active"]
+        if active_url_sources:
+            last_updated_times = []
+            for s in active_url_sources:
+                last_upd = s.get("last_updated")
+                if last_upd:
+                    # Handle both datetime objects and ISO strings
+                    if isinstance(last_upd, datetime):
+                        last_updated_times.append(last_upd)
+                    elif isinstance(last_upd, str):
+                        try:
+                            last_updated_times.append(datetime.fromisoformat(last_upd.replace('Z', '+00:00')))
+                        except:
+                            pass
+            if last_updated_times:
+                last_sync = max(last_updated_times)
+        
+        # Calculate next sync time (2:10 AM next day)
+        next_sync = None
+        now = datetime.utcnow()
+        next_sync_dt = now.replace(hour=2, minute=10, second=0, microsecond=0)
+        if next_sync_dt < now:
+            next_sync_dt += timedelta(days=1)
+        next_sync = next_sync_dt
+        
         return {
             "success": True,
-            "sources": sources
+            "sources": sources,
+            "last_sync": last_sync.isoformat() if last_sync else None,
+            "next_sync": next_sync.isoformat() if next_sync else None
         }
     except Exception as e:
         logger.exception("Failed to list sources")
@@ -465,11 +494,21 @@ async def sync_sources(
                 )
                 failed_count += 1
         
+        # Get the most recent last_updated time after sync
+        sync_time = datetime.utcnow()
+        
+        # Calculate next sync time (2:10 AM next day)
+        next_sync_dt = sync_time.replace(hour=2, minute=10, second=0, microsecond=0)
+        if next_sync_dt < sync_time:
+            next_sync_dt += timedelta(days=1)
+        
         return {
             "success": True,
             "synced_count": synced_count,
             "failed_count": failed_count,
-            "message": f"Synced {synced_count} source(s), {failed_count} failed"
+            "message": f"Synced {synced_count} source(s), {failed_count} failed",
+            "last_sync": sync_time.isoformat(),
+            "next_sync": next_sync_dt.isoformat()
         }
         
     except Exception as e:
