@@ -35,7 +35,6 @@ services:
       # These are read by app/core/config.py, but can be overridden here
       - NEXTCLOUD_URL=${NEXTCLOUD_URL:-http://davi_nextcloud:80}
       - NEXTCLOUD_USERNAME=${NEXTCLOUD_USERNAME:-davi}
-      - NEXTCLOUD_PASSWORD=${NEXTCLOUD_PASSWORD}
       - NEXTCLOUD_ROOT_PATH=${NEXTCLOUD_ROOT_PATH:-/DAVI}
     env_file:
       - .env

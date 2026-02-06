@@ -6,25 +6,50 @@ Handles all document-related endpoints:
 - GET /documents/private - Get private documents
 - GET /documents/all - Get all user documents
 - GET /documents/download - Download a document
+- POST /documents/upload - Upload a private document (for company users)
 - POST /documents/delete - Delete documents from folders
 - POST /documents/delete/private - Delete private documents
 """
 
 import logging
 import os
-from fastapi import APIRouter, Depends, HTTPException, Query
+import shutil
+from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, status
 from fastapi.responses import FileResponse
+from fastapi.concurrency import run_in_threadpool
 from app.deps.auth import get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
+from app.repositories.document_repo import DocumentRepository
 from app.models.company_user_schema import DeleteDocumentsPayload
 from app.api.company_admin.shared import (
     get_admin_or_user_company_id,
     check_teamlid_permission
 )
+from app.api.rag import rag_index_files
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+UPLOAD_ROOT = "/app/uploads"
+UPLOAD_FOLDERS = {
+    "document": os.path.join(UPLOAD_ROOT, "documents"),
+}
+
+# Ensure upload folders exist
+for folder in UPLOAD_FOLDERS.values():
+    os.makedirs(folder, exist_ok=True)
+
+
+def save_uploaded_file(file: UploadFile, save_path: str):
+    """Save an uploaded file to disk."""
+    try:
+        file.file.seek(0)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise IOError(f"Failed to save file: {e}")
 
 
 @router.get("/documents", summary="Get all uploaded documents by admin")
@@ -93,6 +118,113 @@ async def get_all_user_documents(
         "success": True,
         "data": result
     }
+
+
+@router.post("/documents/upload", status_code=status.HTTP_200_OK)
+async def upload_private_document(
+    file: UploadFile = File(...),
+    upload_type: str = Query(default="document", description="Upload type (default: 'document')"),
+    user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    """
+    Upload a private document for the current user.
+    This endpoint allows both company admins and company users to upload private documents.
+    """
+    try:
+        if upload_type not in UPLOAD_FOLDERS:
+            raise HTTPException(status_code=400, detail="Invalid upload type")
+
+        email = user.get("email")
+        if not email:
+            raise HTTPException(status_code=401, detail="Email not found in token")
+
+        company_repo = CompanyRepository(db)
+        document_repo = DocumentRepository(db)
+
+        # Fetch user info
+        user_data = await company_repo.get_user_with_documents(email)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found in DB")
+
+        user_id = user_data.get("user_id")
+        company_id = user_data.get("company_id")
+        if not user_id or not company_id:
+            raise HTTPException(status_code=400, detail="User record missing user_id or company_id")
+
+        # Check documents limit
+        allowed, error_msg = await company_repo.check_documents_limit(company_id)
+        if not allowed:
+            raise HTTPException(status_code=403, detail=error_msg)
+
+        # Build absolute save path
+        upload_folder = os.path.join(UPLOAD_FOLDERS[upload_type], user_id)
+        os.makedirs(upload_folder, exist_ok=True)
+        file_path = os.path.abspath(os.path.join(upload_folder, file.filename))
+
+        # Check for duplicate document BEFORE saving the file
+        if await document_repo.document_exists(company_id, user_id, file.filename, upload_type):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Document '{file.filename}' already exists for this user and type.",
+            )
+
+        # Save file
+        try:
+            await run_in_threadpool(save_uploaded_file, file, file_path)
+        except Exception as e:
+            logger.error(f"File save failed: {e}")
+            raise HTTPException(status_code=500, detail=f"File could not be saved: {e}")
+
+        # Validate saved file
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            logger.error(f"File not found or empty after save: {file_path}")
+            raise HTTPException(status_code=500, detail="File save failed (not found or empty)")
+
+        # Store metadata
+        doc_record = await document_repo.add_document(
+            company_id=company_id,
+            user_id=user_id,
+            file_name=file.filename,
+            upload_type=upload_type,
+            path=file_path,
+        )
+
+        if not doc_record:
+            # Clean up the saved file if metadata insertion fails
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception as cleanup_error:
+                logger.error(f"Failed to cleanup file after duplicate detection: {cleanup_error}")
+            
+            raise HTTPException(
+                status_code=409,
+                detail=f"Document '{file.filename}' already exists for this user and type.",
+            )
+
+        logger.info(f"File '{file.filename}' uploaded by {email} (user_id={user_id}, company_id={company_id})")
+
+        # Trigger RAG indexing
+        try:
+            await rag_index_files(user_id, [file_path], company_id)
+            logger.info(f"RAG indexing triggered for '{file.filename}'")
+        except Exception as e:
+            logger.error(f"RAG indexing failed for '{file.filename}': {e}")
+
+        return {
+            "success": True,
+            "file": file.filename,
+            "upload_type": upload_type,
+            "user_id": user_id,
+            "company_id": company_id,
+            "path": file_path,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled exception during file upload")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 
 @router.get("/documents/download")

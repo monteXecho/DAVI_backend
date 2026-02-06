@@ -10,6 +10,7 @@ Handles all role-related endpoints:
 """
 
 import logging
+import os
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
@@ -157,9 +158,23 @@ async def upload_document_for_role(
         # Trigger RAG indexing for the uploaded file
         from app.api.rag import rag_index_files
         try:
-            await rag_index_files([result["path"]], company_id, admin_id)
+            # rag_index_files signature: (user_id: str, file_paths: List[str], company_id: str, is_role_based: bool)
+            # For role-based documents, is_role_based=True so file_id format will be {company_id}-{admin_id}--{filename}
+            file_path = result.get("path")
+            if file_path:
+                # Ensure file_path is a string, not a list or other type
+                if isinstance(file_path, list):
+                    file_path = file_path[0] if file_path else None
+                if isinstance(file_path, str) and os.path.exists(file_path):
+                    logger.info(f"Triggering RAG indexing for role-based document: {file_path}")
+                    await rag_index_files(admin_id, [file_path], company_id, is_role_based=True)
+                    logger.info(f"RAG indexing triggered successfully for role-based document '{result.get('file_name')}'")
+                else:
+                    logger.warning(f"File path does not exist for RAG indexing: {file_path} (type: {type(file_path)})")
+            else:
+                logger.warning(f"No file path in result for RAG indexing. Result keys: {list(result.keys())}")
         except Exception as e:
-            logger.warning(f"RAG indexing failed for {result['path']}: {e}")
+            logger.error(f"RAG indexing failed for {result.get('path', 'unknown')}: {e}", exc_info=True)
 
         return {
             "success": True,

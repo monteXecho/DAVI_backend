@@ -9,6 +9,7 @@ from app.api.super_admin import super_admin_router
 from app.api.super_admin_stats import super_admin_stats_router
 from app.api.auth import auth_router
 from app.api.company_admin import company_admin_router
+from app.api.webchat import webchat_router
 
 app = FastAPI(
     title="MijnDAVI API",
@@ -124,5 +125,11 @@ app.include_router(super_admin_router)
 app.include_router(super_admin_stats_router)
 app.include_router(auth_router)
 app.include_router(company_admin_router)
+app.include_router(webchat_router)
+
+# Log registered routes for debugging
+import logging
+logger = logging.getLogger("uvicorn")
+logger.info(f"Registered company_admin routes: {[r.path for r in company_admin_router.routes]}")
 
 ##  uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

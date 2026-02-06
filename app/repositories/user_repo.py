@@ -561,13 +561,20 @@ class UserRepository(BaseRepository):
         # Get is_teamlid flag
         is_teamlid = user.get("is_teamlid", False)
         
+        # Get company-level modules for role assignment (what modules are enabled at company level)
+        from app.repositories.modules_repo import ModulesRepository
+        from app.repositories.constants import serialize_modules
+        modules_repo = ModulesRepository(self.db)
+        company_modules = await modules_repo.get_company_modules(company_id)
+        
         return {
             "user_id": user_id,
             "company_id": company_id,
             "user_type": user_type,
             "documents": formatted_docs,
             "pass_ids": pass_ids,
-            "modules": modules_obj,  # Return as object, not array
+            "modules": modules_obj,  # Return as object, not array (user's aggregated modules)
+            "company_modules": serialize_modules(company_modules),  # Company-level modules for role assignment
             "name": user.get("name", ""),
             "email": user.get("email", ""),
             "is_teamlid": is_teamlid,  # Required for workspace switcher
@@ -578,37 +585,102 @@ class UserRepository(BaseRepository):
         """
         Get all documents for a user.
         
+        For company users, this includes:
+        - Private documents (upload_type="document") uploaded by the user
+        - Documents from folders assigned via their assigned roles
+        
         Args:
             email: User email
             
         Returns:
             Dictionary with user details and all documents
         """
-        user = await self.users.find_one({"email": email})
+        # Check if user is an admin first
+        user = await self.admins.find_one({"email": email})
+        user_type = "admin"
+        if not user:
+            user = await self.users.find_one({"email": email})
+            user_type = "company_user"
+        
         if not user:
             return {"documents": []}
         
         user_id = user.get("user_id")
         company_id = user.get("company_id")
         
-        docs_cursor = self.documents.find({
+        # Get private documents (upload_type="document")
+        private_docs_query = {
             "user_id": user_id,
-            "company_id": company_id
-        })
-        
-        documents = []
-        async for doc in docs_cursor:
-            documents.append({
+            "company_id": company_id,
+            "upload_type": "document"
+        }
+        private_docs_cursor = self.documents.find(private_docs_query)
+        private_docs = []
+        async for doc in private_docs_cursor:
+            private_docs.append({
                 "file_name": doc.get("file_name", ""),
                 "path": doc.get("path", ""),
                 "upload_type": doc.get("upload_type", "document"),
                 "storage_path": doc.get("storage_path"),
             })
         
+        role_based_docs = []
+        if user_type == "admin":
+            # For company admins: get all documents in folders created by this admin
+            folder_docs_query = {
+                "user_id": user_id,
+                "company_id": company_id,
+                "upload_type": {"$ne": "document"}
+            }
+            folder_docs_cursor = self.documents.find(folder_docs_query)
+            async for doc in folder_docs_cursor:
+                role_based_docs.append({
+                    "file_name": doc.get("file_name", ""),
+                    "path": doc.get("path", ""),
+                    "upload_type": doc.get("upload_type", ""),
+                    "storage_path": doc.get("storage_path"),
+                })
+        else:
+            # For company users: get documents from folders assigned via roles
+            assigned_roles = user.get("assigned_roles", [])
+            added_by_admin_id = user.get("added_by_admin_id")
+            
+            if assigned_roles and added_by_admin_id:
+                roles_query = {
+                    "company_id": company_id,
+                    "added_by_admin_id": added_by_admin_id,
+                    "name": {"$in": assigned_roles}
+                }
+                roles_cursor = self.roles.find(roles_query)
+                roles = [r async for r in roles_cursor]
+                
+                folder_names = set()
+                for role in roles:
+                    folders = role.get("folders", [])
+                    folder_names.update(folders)
+                
+                if folder_names:
+                    role_based_docs_query = {
+                        "user_id": added_by_admin_id,
+                        "company_id": company_id,
+                        "upload_type": {"$in": list(folder_names)}
+                    }
+                    role_based_docs_cursor = self.documents.find(role_based_docs_query)
+                    async for doc in role_based_docs_cursor:
+                        role_based_docs.append({
+                            "file_name": doc.get("file_name", ""),
+                            "path": doc.get("path", ""),
+                            "upload_type": doc.get("upload_type", ""),
+                            "storage_path": doc.get("storage_path"),
+                        })
+        
+        # Combine private and role-based documents
+        all_documents = private_docs + role_based_docs
+        
         return {
             "user_id": user_id,
             "company_id": company_id,
-            "documents": documents,
+            "documents": all_documents,
         }
     
     async def update_user(

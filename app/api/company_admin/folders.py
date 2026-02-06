@@ -606,8 +606,9 @@ async def sync_documents_from_nextcloud(
         if result.get("synced_file_paths"):
             from app.api.rag import rag_index_files
             try:
-                # rag_index_files expects (user_id, file_paths, company_id)
-                await rag_index_files(admin_id, result["synced_file_paths"], company_id)
+                # rag_index_files expects (user_id, file_paths, company_id, is_role_based)
+                # Synced documents from Nextcloud are role-based, so is_role_based=True
+                await rag_index_files(admin_id, result["synced_file_paths"], company_id, is_role_based=True)
             except Exception as e:
                 logger.warning(f"RAG indexing failed for synced files: {e}")
         
