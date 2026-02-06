@@ -54,10 +54,15 @@ class NextcloudSyncRepository(BaseRepository):
                 detail="Storage provider not available"
             )
         
+        # Sync both imported folders (from Nextcloud) and DAVI-created folders (synced to Nextcloud)
         folder_query = {
             "company_id": company_id,
             "admin_id": admin_id,
-            "storage_path": {"$exists": True, "$ne": None}
+            "storage_path": {"$exists": True, "$ne": None},
+            "$or": [
+                {"origin": "imported"},  # Folders imported from Nextcloud
+                {"origin": "davi", "sync_enabled": True}  # Folders created in DAVI that should sync to Nextcloud
+            ]
         }
         
         if folder_id:
@@ -87,15 +92,20 @@ class NextcloudSyncRepository(BaseRepository):
         document_repo = DocumentRepository(self.db)
         
         # Detect folders deleted from Nextcloud (only if syncing all folders)
+        # IMPORTANT: Only delete folders with origin="imported" (from Nextcloud), not origin="davi" (created in DAVI)
+        # If a DAVI-created folder doesn't exist in Nextcloud, it might have failed to create, so don't delete it
         if not folder_id:
             try:
                 nextcloud_folders_list = await storage_provider.list_folders("", recursive=True)
-                nextcloud_folder_paths = {f["path"].lower().rstrip("/") for f in nextcloud_folders_list}
+                # Normalize paths: list_folders returns paths relative to storage root (without root_path prefix)
+                # So we can compare directly with stored storage_path
+                nextcloud_folder_paths = {f.get("path", "").lower().rstrip("/") for f in nextcloud_folders_list}
                 
                 all_folders_query = {
                     "company_id": company_id,
                     "admin_id": admin_id,
-                    "storage_path": {"$exists": True, "$ne": None}
+                    "storage_path": {"$exists": True, "$ne": None},
+                    "origin": "imported"  # Only check imported folders, not DAVI-created ones
                 }
                 all_folders = await self.folders.find(all_folders_query).to_list(length=None)
                 
@@ -106,7 +116,7 @@ class NextcloudSyncRepository(BaseRepository):
                         
                         if normalized_storage_path not in nextcloud_folder_paths:
                             folder_name = folder.get("name")
-                            logger.info(f"Folder '{folder_name}' (path: {storage_path}) was deleted from Nextcloud, removing from DAVI")
+                            logger.info(f"Imported folder '{folder_name}' (path: {storage_path}) was deleted from Nextcloud, removing from DAVI")
                             
                             try:
                                 docs_to_delete = await self.documents.find({
@@ -162,6 +172,28 @@ class NextcloudSyncRepository(BaseRepository):
         # Re-fetch folders_to_sync after deletions
         folders_to_sync = await self.folders.find(folder_query).to_list(length=None)
         
+        logger.info(
+            f"Found {len(folders_to_sync)} folder(s) to sync for company_id={company_id}, admin_id={admin_id}. "
+            f"Query: {folder_query}"
+        )
+        
+        if not folders_to_sync:
+            logger.warning(
+                f"No folders found to sync. Query was: {folder_query}. "
+                f"This might mean no folders have storage_path set, or they don't have origin='imported' or (origin='davi' and sync_enabled=True)"
+            )
+            return {
+                "success": True,
+                "synced_folders": 0,
+                "new_documents": 0,
+                "deleted_documents": 0,
+                "deleted_folders": 0,
+                "skipped_documents": 0,
+                "synced_file_paths": [],
+                "errors": [f"No folders found to sync. Make sure folders have storage_path and are either imported (origin='imported') or have sync_enabled=True"],
+                "message": "No folders with storage_path found to sync"
+            }
+        
         for folder in folders_to_sync:
             folder_name = folder.get("name")
             storage_path = folder.get("storage_path")
@@ -171,7 +203,44 @@ class NextcloudSyncRepository(BaseRepository):
                 continue
             
             try:
-                nextcloud_files = await storage_provider.list_files(storage_path, recursive=False)
+                logger.info(
+                    f"Syncing folder '{folder_name}' (id: {folder.get('_id')}) "
+                    f"from Nextcloud path: '{storage_path}' "
+                    f"(origin: {folder.get('origin')}, sync_enabled: {folder.get('sync_enabled')})"
+                )
+                
+                # First, verify the folder exists in Nextcloud
+                try:
+                    folder_exists = await storage_provider.folder_exists(storage_path)
+                    if not folder_exists:
+                        logger.warning(
+                            f"⚠️  Folder '{folder_name}' (path: {storage_path}) does not exist in Nextcloud. "
+                            f"This might be a path issue or the folder was deleted. Skipping sync."
+                        )
+                        errors.append(f"Folder '{folder_name}' does not exist in Nextcloud (path: {storage_path})")
+                        continue
+                    logger.info(f"✅ Folder '{folder_name}' exists in Nextcloud")
+                except Exception as check_error:
+                    logger.warning(f"Could not verify folder existence for '{folder_name}': {check_error}. Will try to list files anyway.")
+                
+                try:
+                    nextcloud_files = await storage_provider.list_files(storage_path, recursive=False)
+                    logger.info(f"✅ Successfully listed files from Nextcloud. Found {len(nextcloud_files) if nextcloud_files else 0} file(s) in folder '{folder_name}'")
+                except Exception as list_error:
+                    error_msg = f"❌ Failed to list files from Nextcloud folder '{folder_name}' (path: {storage_path}): {str(list_error)}"
+                    logger.error(error_msg)
+                    # Check if it's a 401 error - might be a permission issue
+                    if "401" in str(list_error) or "NotAuthenticated" in str(list_error):
+                        logger.error(
+                            f"🔒 Authentication failed for folder '{folder_name}'. "
+                            f"This suggests the Bearer token works for root but not for subfolders. "
+                            f"Check Nextcloud permissions or folder ownership."
+                        )
+                    errors.append(error_msg)
+                    continue  # Skip this folder and continue with next one
+                
+                if not nextcloud_files:
+                    logger.warning(f"No files found in Nextcloud folder '{folder_name}' (path: {storage_path}). This might be normal if the folder is empty.")
                 
                 existing_docs = await self.documents.find({
                     "company_id": company_id,
@@ -179,8 +248,16 @@ class NextcloudSyncRepository(BaseRepository):
                     "upload_type": folder_name
                 }).to_list(length=None)
                 
+                logger.debug(f"Found {len(existing_docs)} existing document(s) in DAVI for folder '{folder_name}'")
+                
                 nextcloud_file_names = {file_info["name"] for file_info in nextcloud_files} if nextcloud_files else set()
                 existing_file_names = {doc.get("file_name") for doc in existing_docs if doc.get("file_name")}
+                
+                logger.info(
+                    f"Folder '{folder_name}': {len(nextcloud_file_names)} file(s) in Nextcloud, "
+                    f"{len(existing_file_names)} file(s) in DAVI. "
+                    f"New files to sync: {len(nextcloud_file_names - existing_file_names)}"
+                )
                 
                 # Detect files deleted from Nextcloud
                 files_to_delete = existing_file_names - nextcloud_file_names
@@ -230,13 +307,18 @@ class NextcloudSyncRepository(BaseRepository):
                     file_name = file_info["name"]
                     file_storage_path = file_info["path"]
                     
+                    logger.debug(f"Processing file: {file_name} (path: {file_storage_path})")
+                    
                     if file_name in existing_file_names:
                         skipped_documents += 1
+                        logger.debug(f"Skipping file '{file_name}' - already exists in DAVI")
                         continue
                     
                     try:
+                        logger.info(f"Downloading file '{file_name}' from Nextcloud path: {file_storage_path}")
                         file_content = await storage_provider.download_file(file_storage_path)
                         file_bytes = file_content.read() if hasattr(file_content, 'read') else file_content
+                        logger.info(f"Downloaded {len(file_bytes) if isinstance(file_bytes, bytes) else 'unknown'} bytes for file '{file_name}'")
                         
                         local_base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, folder_name)
                         os.makedirs(local_base_path, exist_ok=True)
@@ -279,7 +361,7 @@ class NextcloudSyncRepository(BaseRepository):
                 logger.error(error_msg)
                 errors.append(error_msg)
         
-        return {
+        summary = {
             "success": True,
             "synced_folders": synced_folders,
             "new_documents": new_documents,
@@ -290,4 +372,16 @@ class NextcloudSyncRepository(BaseRepository):
             "errors": errors,
             "message": f"Synced {synced_folders} folder(s), added {new_documents} new document(s), deleted {deleted_from_davi} document(s) and {deleted_folders_count} folder(s) removed from Nextcloud"
         }
+        
+        logger.info(
+            f"✅ Sync completed for company_id={company_id}, admin_id={admin_id}: "
+            f"{synced_folders} folder(s) synced, {new_documents} new document(s), "
+            f"{deleted_from_davi} deleted document(s), {deleted_folders_count} deleted folder(s), "
+            f"{skipped_documents} skipped document(s), {len(errors)} error(s)"
+        )
+        
+        if errors:
+            logger.warning(f"Sync had {len(errors)} error(s): {errors}")
+        
+        return summary
 

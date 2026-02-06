@@ -212,8 +212,47 @@ async def get_admin_or_user_company_id(
     company_id = base_user["company_id"]
     real_user_id = base_user["user_id"]
     
+    # Track user activity for online user detection
+    # Update last_activity timestamp (non-blocking, don't fail if it errors)
+    try:
+        from datetime import datetime
+        now = datetime.utcnow()
+        if user_type == "company_admin":
+            result = await db.company_admins.update_one(
+                {"email": user_email},
+                {"$set": {"last_activity": now}},
+                upsert=False
+            )
+            if result.modified_count > 0:
+                logger.debug(f"✅ Updated last_activity for admin: {user_email}")
+        else:
+            result = await db.company_users.update_one(
+                {"email": user_email},
+                {"$set": {"last_activity": now}},
+                upsert=False
+            )
+            if result.modified_count > 0:
+                logger.debug(f"✅ Updated last_activity for user: {user_email}")
+    except Exception as e:
+        # Don't fail the request if activity tracking fails
+        logger.warning(f"⚠️  Failed to update activity for {user_email}: {e}")
+    
     # Get Keycloak access token for Nextcloud authentication
     access_token = user.get("_raw_token")
+    
+    # Extract user ID from token for Nextcloud WebDAV path
+    # CRITICAL: Use email as the Nextcloud user ID (as explicitly requested by user)
+    # Nextcloud is configured with mappingUid=email, so we MUST use email
+    # Priority: email (REQUIRED) > preferred_username (fallback) > sub (last resort)
+    if not user_email:
+        logger.error(f"❌ CRITICAL: user_email is missing! Cannot use email for Nextcloud user ID.")
+        # Fallback to preferred_username or sub only if email is truly missing
+        nextcloud_user_id = user.get("preferred_username") or user.get("sub")
+        logger.warning(f"Using fallback user ID for Nextcloud: {nextcloud_user_id} (email was missing)")
+    else:
+        # ALWAYS use email when available (Nextcloud expects email)
+        nextcloud_user_id = user_email
+        logger.info(f"Using email as Nextcloud user ID: {user_email}")
 
     if user_type == "company_admin":
         acting_admin_id = real_user_id
@@ -281,6 +320,7 @@ async def get_admin_or_user_company_id(
         "user_type": user_type,
         "guest_permissions": guest_permissions,
         "_access_token": access_token,  # Keycloak access token for Nextcloud authentication
+        "_nextcloud_user_id": nextcloud_user_id,  # User ID for Nextcloud WebDAV path (sub or preferred_username)
     }
 
 
@@ -324,6 +364,18 @@ async def get_admin_company_id(
 
     company_id = full_admin["company_id"]
     real_user_id = full_admin["user_id"]
+    
+    # Track user activity for online user detection
+    try:
+        from datetime import datetime
+        now = datetime.utcnow()
+        await db.company_admins.update_one(
+            {"email": admin_email},
+            {"$set": {"last_activity": now}},
+            upsert=False
+        )
+    except Exception as e:
+        logger.debug(f"Failed to update activity for {admin_email}: {e}")
     
     # Get Keycloak access token for Nextcloud authentication
     access_token = user.get("_raw_token")

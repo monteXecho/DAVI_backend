@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from app.api.ask import ask_router
 from app.api.upload import upload_router
 from app.api.super_admin import super_admin_router
+from app.api.super_admin_stats import super_admin_stats_router
 from app.api.auth import auth_router
 from app.api.company_admin import company_admin_router
 
@@ -22,6 +23,69 @@ app.add_middleware(
     allow_methods=["*"],  
     allow_headers=["*"],
 )
+
+# Middleware to track user activity for online user detection
+@app.middleware("http")
+async def track_user_activity(request: Request, call_next):
+    """
+    Track user activity for online user detection.
+    Updates last_activity timestamp when users make authenticated API calls.
+    """
+    # Skip tracking for certain paths
+    skip_paths = ["/docs", "/openapi.json", "/redoc", "/health", "/favicon.ico", "/"]
+    
+    if any(request.url.path.startswith(path) for path in skip_paths):
+        return await call_next(request)
+    
+    # Process request first
+    response = await call_next(request)
+    
+    # Track activity after request (non-blocking)
+    # Extract user from Authorization header if present
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            from app.deps.db import db
+            from datetime import datetime
+            import jwt
+            
+            # Get token from header
+            token = auth_header.replace("Bearer ", "")
+            
+            # Decode token to get email (without full validation to avoid circular dependency)
+            try:
+                # Decode without verification (just to get email for activity tracking)
+                unverified_payload = jwt.decode(token, options={"verify_signature": False})
+                user_email = unverified_payload.get("email")
+                
+                if user_email and db:
+                    now = datetime.utcnow()
+                    # Update both collections (non-blocking, fire and forget)
+                    try:
+                        await db.company_admins.update_one(
+                            {"email": user_email},
+                            {"$set": {"last_activity": now}},
+                            upsert=False
+                        )
+                    except:
+                        pass
+                    try:
+                        await db.company_users.update_one(
+                            {"email": user_email},
+                            {"$set": {"last_activity": now}},
+                            upsert=False
+                        )
+                    except:
+                        pass
+            except:
+                # If token decode fails, just skip activity tracking
+                pass
+        except Exception as e:
+            # Don't fail the request if activity tracking fails
+            pass
+    
+    return response
+
 
 # Middleware to handle 413 errors and provide better error messages
 @app.middleware("http")
@@ -57,6 +121,7 @@ def root():
 app.include_router(ask_router)
 app.include_router(upload_router)
 app.include_router(super_admin_router)
+app.include_router(super_admin_stats_router)
 app.include_router(auth_router)
 app.include_router(company_admin_router)
 

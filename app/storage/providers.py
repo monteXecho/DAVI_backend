@@ -179,11 +179,67 @@ class StorageError(Exception):
     pass
 
 
+async def exchange_token_for_nextcloud(
+    davi_token: str,
+    nextcloud_client_id: str,
+    nextcloud_client_secret: str,
+    keycloak_host: str,
+    realm: str
+) -> Optional[str]:
+    """
+    Exchange a token from DAVI client for a token from Nextcloud client using Keycloak token exchange.
+    
+    Args:
+        davi_token: Token from DAVI_frontend_demo client
+        nextcloud_client_id: Nextcloud client ID (nextcloud_dev)
+        nextcloud_client_secret: Nextcloud client secret
+        keycloak_host: Keycloak server URL
+        realm: Keycloak realm name
+        
+    Returns:
+        Exchanged token from nextcloud_dev client, or None if exchange fails
+    """
+    token_exchange_url = f"{keycloak_host}/realms/{realm}/protocol/openid-connect/token"
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                token_exchange_url,
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "client_id": nextcloud_client_id,
+                    "client_secret": nextcloud_client_secret,
+                    "subject_token": davi_token,
+                    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                    "requested_token_type": "urn:ietf:params:oauth:token-type:access_token"
+                }
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                exchanged_token = data.get("access_token")
+                if exchanged_token:
+                    logger.info("Successfully exchanged DAVI token for Nextcloud token")
+                    return exchanged_token
+                else:
+                    logger.warning("Token exchange succeeded but no access_token in response")
+            else:
+                logger.warning(
+                    f"Token exchange failed: {response.status_code} - {response.text[:200]}. "
+                    f"Will try using original token."
+                )
+    except Exception as e:
+        logger.warning(f"Token exchange error: {e}. Will try using original token.")
+    
+    return None
+
+
 def get_storage_provider(
     username: Optional[str] = None,
     access_token: Optional[str] = None,
     url: Optional[str] = None,
-    root_path: Optional[str] = None
+    root_path: Optional[str] = None,
+    user_id_from_token: Optional[str] = None
 ) -> StorageProvider:
     """
     Factory function to get the configured storage provider with Keycloak SSO.
@@ -193,6 +249,10 @@ def get_storage_provider(
         access_token: Keycloak access token for OIDC authentication. Required.
         url: Nextcloud server URL. If not provided, uses NEXTCLOUD_URL from config.
         root_path: Root path in Nextcloud. If not provided, uses NEXTCLOUD_ROOT_PATH from config.
+        user_id_from_token: Optional user ID from Keycloak token (sub claim or preferred_username).
+                          Nextcloud may use this instead of email as the user identifier.
+                          This is critical because Nextcloud's WebDAV path must match the authenticated user's ID.
+                          If not provided, username (email) will be used.
     
     Returns:
         Configured StorageProvider instance
@@ -224,5 +284,6 @@ def get_storage_provider(
         url=provider_url,
         username=provider_username,
         access_token=provider_access_token,
-        root_path=provider_root_path
+        root_path=provider_root_path,
+        user_id_from_token=user_id_from_token
     )

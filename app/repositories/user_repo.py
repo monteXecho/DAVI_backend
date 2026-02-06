@@ -519,12 +519,59 @@ class UserRepository(BaseRepository):
                         pid = f"{company_id}-{user_id}--{fn}"
             pass_ids.append(pid)
 
+        # Aggregate modules from user's assigned roles
+        # Modules can be assigned directly to the user OR via their assigned roles
+        modules_obj = {}
+        
+        # First, get modules directly assigned to the user
+        user_modules = user.get("modules", {})
+        if isinstance(user_modules, dict):
+            modules_obj.update(user_modules)
+        elif isinstance(user_modules, list):
+            for module in user_modules:
+                if isinstance(module, dict) and "name" in module:
+                    modules_obj[module["name"]] = {
+                        "enabled": module.get("enabled", False),
+                        "desc": module.get("desc", "")
+                    }
+        
+        # Then, aggregate modules from assigned roles (for company users)
+        if user_type == "company_user":
+            assigned_roles = user.get("assigned_roles", [])
+            added_by_admin_id = user.get("added_by_admin_id")
+            
+            if assigned_roles and added_by_admin_id:
+                roles_query = {
+                    "company_id": company_id,
+                    "added_by_admin_id": added_by_admin_id,
+                    "name": {"$in": assigned_roles}
+                }
+                roles_cursor = self.roles.find(roles_query)
+                roles = [r async for r in roles_cursor]
+                
+                # Aggregate modules from all assigned roles
+                for role in roles:
+                    role_modules = role.get("modules", {})
+                    if isinstance(role_modules, dict):
+                        # Merge role modules into user modules (role modules take precedence)
+                        for module_name, module_config in role_modules.items():
+                            if module_config.get("enabled", False):
+                                modules_obj[module_name] = module_config
+        
+        # Get is_teamlid flag
+        is_teamlid = user.get("is_teamlid", False)
+        
         return {
             "user_id": user_id,
             "company_id": company_id,
             "user_type": user_type,
             "documents": formatted_docs,
             "pass_ids": pass_ids,
+            "modules": modules_obj,  # Return as object, not array
+            "name": user.get("name", ""),
+            "email": user.get("email", ""),
+            "is_teamlid": is_teamlid,  # Required for workspace switcher
+            "assigned_roles": user.get("assigned_roles", []),  # Include assigned roles
         }
     
     async def get_all_user_documents(self, email: str) -> dict:

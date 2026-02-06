@@ -201,13 +201,21 @@ class AdminRepository(BaseRepository):
         if not admin:
             return None
         
-        # Filter modules to only include those enabled at company level
+        # Initialize modules dict if it doesn't exist
+        if "modules" not in admin or not admin["modules"]:
+            admin["modules"] = {}
+        
+        # Update or add modules - only allow modules enabled at company level
         for k, v in modules.items():
-            if k in admin["modules"]:
-                company_has_module = company_modules.get(k, {}).get("enabled", False)
-                if company_has_module:
-                    admin["modules"][k]["enabled"] = v.get("enabled", False)
-                else:
+            company_has_module = company_modules.get(k, {}).get("enabled", False)
+            if company_has_module:
+                # Add or update the module
+                if k not in admin["modules"]:
+                    admin["modules"][k] = {}
+                admin["modules"][k]["enabled"] = v.get("enabled", False)
+            else:
+                # Company doesn't have this module enabled, so disable it for admin
+                if k in admin["modules"]:
                     admin["modules"][k]["enabled"] = False
         
         await self.admins.update_one(

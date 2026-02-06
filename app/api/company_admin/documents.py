@@ -160,6 +160,7 @@ async def delete_documents(
     
     user_email = admin_context.get("admin_email") or admin_context.get("user_email")
     access_token = admin_context.get("_access_token")
+    nextcloud_user_id = admin_context.get("_nextcloud_user_id")
     
     storage_provider = None
     if user_email and access_token:
@@ -168,7 +169,8 @@ async def delete_documents(
                 username=user_email,
                 access_token=access_token,
                 url=NEXTCLOUD_URL,
-                root_path=NEXTCLOUD_ROOT_PATH
+                root_path=NEXTCLOUD_ROOT_PATH,
+                user_id_from_token=nextcloud_user_id
             )
         except (StorageError, Exception) as e:
             logger.debug(f"Storage provider not available for document deletion sync: {e}")

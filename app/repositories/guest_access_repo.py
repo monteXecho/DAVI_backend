@@ -90,13 +90,46 @@ class GuestAccessRepository(BaseRepository):
         Returns:
             List of guest access entries
         """
-        cursor = self.guest_access.find(
-            {
-                "company_id": company_id,
-                "guest_user_id": guest_user_id,
-                "is_active": True,
-            }
+        # Query for active entries (is_active=True) OR entries without is_active field (backward compatibility)
+        # Exclude entries where is_active is explicitly False
+        query = {
+            "company_id": company_id,
+            "guest_user_id": guest_user_id,
+            "$or": [
+                {"is_active": True},
+                {"is_active": {"$exists": False}},  # Backward compatibility: treat missing as active
+            ]
+        }
+        
+        logger.info(
+            f"[guest_access_repo] Querying guest workspaces: company_id={company_id}, guest_user_id={guest_user_id}"
         )
+        logger.info(f"[guest_access_repo] Query: {query}")
+        
+        # First, let's check if ANY entries exist (without is_active filter) for debugging
+        total_count = await self.guest_access.count_documents({
+            "company_id": company_id,
+            "guest_user_id": guest_user_id
+        })
+        logger.info(f"[guest_access_repo] Total entries (any is_active status): {total_count}")
+        
+        # Check entries with is_active explicitly set
+        active_count = await self.guest_access.count_documents({
+            "company_id": company_id,
+            "guest_user_id": guest_user_id,
+            "is_active": True
+        })
+        logger.info(f"[guest_access_repo] Active entries (is_active=True): {active_count}")
+        
+        # Check entries without is_active field
+        missing_active_count = await self.guest_access.count_documents({
+            "company_id": company_id,
+            "guest_user_id": guest_user_id,
+            "is_active": {"$exists": False}
+        })
+        logger.info(f"[guest_access_repo] Entries without is_active field: {missing_active_count}")
+        
+        cursor = self.guest_access.find(query)
         
         entries = []
         async for doc in cursor:
@@ -138,6 +171,27 @@ class GuestAccessRepository(BaseRepository):
                         doc.pop(field, None)
             
             entries.append(doc)
+        
+        logger.info(
+            f"[guest_access_repo] Found {len(entries)} guest access entries for guest_user_id={guest_user_id}, "
+            f"company_id={company_id}"
+        )
+        
+        if entries:
+            for idx, entry in enumerate(entries):
+                logger.info(
+                    f"[guest_access_repo] Entry {idx+1}: owner_admin_id={entry.get('owner_admin_id')}, "
+                    f"is_active={entry.get('is_active', 'missing')}, "
+                    f"can_role_write={entry.get('can_role_write')}, "
+                    f"can_user_write={entry.get('can_user_write')}"
+                )
+        else:
+            logger.warning(
+                f"[guest_access_repo] No guest access entries found for guest_user_id={guest_user_id}, "
+                f"company_id={company_id}. This might indicate: "
+                f"1) No teamlid permissions assigned, 2) All entries have is_active=False, "
+                f"3) guest_user_id mismatch in database"
+            )
         
         return entries
     
