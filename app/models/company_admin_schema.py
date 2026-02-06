@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uuid
 
 class ModuleConfig(BaseModel):
@@ -24,6 +24,8 @@ class CompanyAdmin(BaseModel):
 
 class CompanyCreate(BaseModel):
     name: str
+    limits: Optional[Dict[str, int]] = None
+    modules: Optional[Dict[str, Dict[str, bool]]] = None
 
 
 class CompanyUpdateModules(BaseModel):

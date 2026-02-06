@@ -7,16 +7,14 @@ import os
 
 from jwt import algorithms
 from keycloak import KeycloakAdmin
+from app.core.config import KEYCLOAK_HOST, KEYCLOAK_REALM, DAVI_KEYCLOAK_CLIENT_ID, DAVI_KEYCLOAK_CLIENT_SECRET
 
 app = FastAPI()
 
-KEYCLOAK_HOST = os.getenv("KEYCLOAK_HOST", "http://host.docker.internal:8080")
-REALM = "DAVI"
-
 # --- URLs ---
-JWKS_URL = f"{KEYCLOAK_HOST}/realms/{REALM}/protocol/openid-connect/certs"
-TOKEN_URL = f"{KEYCLOAK_HOST}/realms/{REALM}/protocol/openid-connect/token"
-AUTH_URL = f"{KEYCLOAK_HOST}/realms/{REALM}/protocol/openid-connect/auth"
+JWKS_URL = f"{KEYCLOAK_HOST}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
+TOKEN_URL = f"{KEYCLOAK_HOST}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token"
+AUTH_URL = f"{KEYCLOAK_HOST}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/auth"
 
 # --- OAuth2 ---
 oauth_2_scheme = OAuth2AuthorizationCodeBearer(
@@ -27,9 +25,9 @@ oauth_2_scheme = OAuth2AuthorizationCodeBearer(
 # --- Keycloak Admin Client ---
 keycloak_admin = KeycloakAdmin(
     server_url=f"{KEYCLOAK_HOST}/",
-    realm_name="DAVI",  # target realm
-    client_id="DAVI_client",
-    client_secret_key="b5WpZUjTp4K8cvqn16TAtJtxhSZ66sA6",
+    realm_name=KEYCLOAK_REALM,  # target realm
+    client_id=DAVI_KEYCLOAK_CLIENT_ID,
+    client_secret_key=DAVI_KEYCLOAK_CLIENT_SECRET,
     verify=True,
 )
 
@@ -40,9 +38,9 @@ def get_keycloak_admin():
     if _kc_admin is None:
         _kc_admin = KeycloakAdmin(
         server_url=f"{KEYCLOAK_HOST}/",
-        realm_name="DAVI",  
-        client_id="DAVI_client",
-        client_secret_key="b5WpZUjTp4K8cvqn16TAtJtxhSZ66sA6",
+        realm_name=KEYCLOAK_REALM,  
+        client_id=DAVI_KEYCLOAK_CLIENT_ID,
+        client_secret_key=DAVI_KEYCLOAK_CLIENT_SECRET,
         verify=True,
         )
     return _kc_admin

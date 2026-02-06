@@ -2,6 +2,8 @@ import os
 import shutil
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
+
+logger = logging.getLogger(__name__)
 from app.deps.auth import require_role, get_keycloak_admin
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
@@ -90,7 +92,59 @@ async def add_company(
     db=Depends(get_db),
 ):
     repo = CompanyRepository(db)
-    return await repo.create_company(payload.name)
+    company = await repo.create_company(payload.name)
+    # create_company returns a dict with 'id' key (see company_core_repo.py line 50)
+    company_id = company.get('id') or company.get('company_id') or company.get('_id')
+    if not company_id:
+        raise HTTPException(status_code=500, detail="Failed to get company ID after creation")
+    
+    # If limits are provided, update them using the existing repository method
+    if payload.limits:
+        limits = payload.limits
+        update_params = {}
+        if limits.get('max_users') is not None:
+            update_params['max_users'] = limits.get('max_users')
+        if limits.get('max_admins') is not None:
+            update_params['max_admins'] = limits.get('max_admins')
+        if limits.get('max_documents') is not None:
+            update_params['max_documents'] = limits.get('max_documents')
+        if limits.get('max_roles') is not None:
+            update_params['max_roles'] = limits.get('max_roles')
+        
+        if update_params:
+            await repo.update_company_limits(
+                company_id,
+                max_users=update_params.get('max_users'),
+                max_admins=update_params.get('max_admins'),
+                max_documents=update_params.get('max_documents'),
+                max_roles=update_params.get('max_roles')
+            )
+    
+    # If modules are provided, update them using the existing repository method
+    if payload.modules:
+        await repo.update_company_modules(company_id, payload.modules)
+    
+    # Refresh company data to return updated values
+    # get_all_companies returns a dict with 'companies' key
+    try:
+        companies_data = await repo.get_all_companies()
+        companies_list = companies_data.get('companies', []) if isinstance(companies_data, dict) else []
+        
+        # Find the updated company by matching ID
+        updated_company = company  # Default to original
+        for c in companies_list:
+            if isinstance(c, dict):
+                # Companies from get_all_companies use 'id' field
+                c_id = c.get('id') or c.get('company_id')
+                if c_id and str(c_id) == str(company_id):
+                    updated_company = c
+                    break
+    except Exception as e:
+        # If refresh fails, just return the original company
+        logger.warning(f"Failed to refresh company data after creation: {e}")
+        updated_company = company
+    
+    return updated_company
 
 
 @super_admin_router.put("/companies/{company_id}/limits")

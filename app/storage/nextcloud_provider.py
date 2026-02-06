@@ -131,6 +131,9 @@ class NextcloudStorageProvider(StorageProvider):
         self._exchanged_token = None
         self._original_token = access_token  # Keep original token for exchange
         
+        # Track if root folder has been ensured (lazy initialization)
+        self._root_folder_ensured = False
+        
         # Log token claims for debugging
         import jwt
         try:
@@ -914,9 +917,68 @@ class NextcloudStorageProvider(StorageProvider):
             logger.error(f"Failed to authenticate with Nextcloud OIDC: {e}")
             return False
     
+    async def _ensure_root_folder(self) -> bool:
+        """
+        Ensure the root DAVI folder exists in Nextcloud.
+        This should be called before creating any subfolders.
+        
+        Returns:
+            True if root folder exists or was created, False otherwise
+        """
+        # The root folder path is just the root_path itself
+        root_full_path = f"{self.webdav_base}/{self.root_path}".rstrip("/")
+        
+        logger.info(f"🔍 Checking if root folder exists: {root_full_path}")
+        
+        # Check if root folder exists by doing a PROPFIND with Depth: 0
+        try:
+            check_path = root_full_path + "/"
+            response = await self._make_request("PROPFIND", check_path, headers={"Depth": "0"})
+            if response.status_code == 207:
+                # 207 Multi-Status means resource exists
+                logger.info(f"✅ Root folder /{self.root_path} already exists")
+                return True
+            else:
+                logger.info(f"📋 Root folder check returned status {response.status_code}, will try to create")
+        except Exception as e:
+            logger.info(f"📋 Root folder check failed (will try to create): {e}")
+        
+        # Root folder doesn't exist, try to create it
+        logger.info(f"🔨 Attempting to create root folder: {root_full_path}")
+        try:
+            response = await self._make_request("MKCOL", root_full_path)
+            logger.info(f"📋 MKCOL response for root folder: status={response.status_code}")
+            
+            if response.status_code == 201:
+                logger.info(f"✅ Successfully created root folder /{self.root_path} in Nextcloud")
+                return True
+            elif response.status_code == 405:
+                # Already exists (race condition - another request created it)
+                logger.info(f"✅ Root folder /{self.root_path} already exists (405 - Method Not Allowed)")
+                return True
+            elif response.status_code == 409:
+                # 409 Conflict - parent doesn't exist, but this shouldn't happen for root folder
+                # The parent should be the user's root directory which always exists
+                logger.error(
+                    f"❌ 409 Conflict when creating root folder /{self.root_path}. "
+                    f"This suggests the user's root directory doesn't exist or there's a path issue. "
+                    f"Response: {response.text[:500]}"
+                )
+                return False
+            else:
+                logger.error(
+                    f"❌ Failed to create root folder /{self.root_path}: "
+                    f"status={response.status_code}, response={response.text[:500]}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"❌ Exception creating root folder /{self.root_path}: {e}", exc_info=True)
+            return False
+    
     async def create_folder(self, path: str) -> bool:
         """
         Create a folder in Nextcloud using WebDAV MKCOL.
+        Automatically ensures the root /DAVI folder exists first.
         
         Args:
             path: Logical path to the folder (relative to storage root)
@@ -924,6 +986,19 @@ class NextcloudStorageProvider(StorageProvider):
         Returns:
             True if folder was created, False if it already exists
         """
+        # Ensure root folder exists first (only check once per instance, unless we get 409)
+        if not self._root_folder_ensured:
+            logger.info(f"🔄 First time creating folder - ensuring root folder exists: {path}")
+            root_created = await self._ensure_root_folder()
+            self._root_folder_ensured = True
+            if not root_created:
+                logger.error(
+                    f"❌ Root folder /{self.root_path} could not be created. "
+                    f"Folder creation will likely fail. Path: {path}"
+                )
+            else:
+                logger.info(f"✅ Root folder ensured before creating: {path}")
+        
         # Don't call _get_actual_nextcloud_user_id() - use email directly
         
         full_path = self._get_full_path(path)
@@ -940,9 +1015,32 @@ class NextcloudStorageProvider(StorageProvider):
             return False
         elif response.status_code == 409:
             # 409 Conflict - parent directory doesn't exist
+            # First, ensure root folder exists (it might have failed earlier or not been created)
+            # Reset the flag so we can retry root folder creation
+            logger.warning(f"⚠️  409 Conflict for path '{path}' - parent doesn't exist. Ensuring root folder exists...")
+            if not self._root_folder_ensured:
+                logger.info(f"🔄 Root folder not yet ensured - creating it now")
+            else:
+                logger.warning(f"🔄 Root folder was marked as ensured but we got 409 - retrying root folder creation")
+                # Reset flag to allow retry
+                self._root_folder_ensured = False
+            
+            root_created = await self._ensure_root_folder()
+            self._root_folder_ensured = True
+            
+            if not root_created:
+                logger.error(
+                    f"❌ CRITICAL: Cannot create folder '{path}': root folder /{self.root_path} does not exist and could not be created. "
+                    f"This is a critical error - Nextcloud sync will not work. "
+                    f"Check Nextcloud authentication and permissions."
+                )
+            else:
+                logger.info(f"✅ Root folder ensured after 409 error")
+            
             # Create parent directories first
             parent = os.path.dirname(path).strip("/")
             if parent:
+                logger.info(f"Creating parent folder: {parent}")
                 await self.create_folder(parent)
                 # Retry creating the folder
                 response = await self._make_request("MKCOL", full_path)
@@ -951,6 +1049,19 @@ class NextcloudStorageProvider(StorageProvider):
                     return True
                 elif response.status_code == 405:
                     return False
+            else:
+                # Parent is empty - this means we're trying to create a folder at the root level
+                # The root folder should exist, but if we get here, retry root folder creation
+                logger.warning(f"409 error for path '{path}' with no parent - root folder may not exist")
+                root_created = await self._ensure_root_folder()
+                if root_created:
+                    # Retry creating the folder
+                    response = await self._make_request("MKCOL", full_path)
+                    if response.status_code == 201:
+                        logger.info(f"Created Nextcloud folder (after ensuring root): {path}")
+                        return True
+                    elif response.status_code == 405:
+                        return False
             
             raise StorageError(f"Failed to create folder {path}: {response.status_code} {response.text}")
         else:
@@ -1215,6 +1326,17 @@ class NextcloudStorageProvider(StorageProvider):
                 f"Failed to delete folder '{path}': {response.status_code} {error_text}"
             )
     
+    async def _ensure_root_folder_if_needed(self):
+        """Lazy initialization: ensure root folder exists when first needed."""
+        if not self._root_folder_ensured:
+            root_created = await self._ensure_root_folder()
+            self._root_folder_ensured = True
+            if not root_created:
+                logger.warning(
+                    f"⚠️  Root folder /{self.root_path} could not be created. "
+                    f"Some operations may fail."
+                )
+    
     async def list_folders(
         self,
         path: str,
@@ -1230,6 +1352,9 @@ class NextcloudStorageProvider(StorageProvider):
         Returns:
             List of folder dictionaries with path, name, and depth
         """
+        # Ensure root folder exists before listing
+        await self._ensure_root_folder_if_needed()
+        
         # Don't call _get_actual_nextcloud_user_id() - use email directly (already set)
         
         full_path = self._get_full_path(path)
@@ -1358,6 +1483,9 @@ class NextcloudStorageProvider(StorageProvider):
         Returns:
             List of file dictionaries with path, name, and size
         """
+        # Ensure root folder exists before listing
+        await self._ensure_root_folder_if_needed()
+        
         # Don't call _get_actual_nextcloud_user_id() - it requires web session
         # Use email directly (already set in self.nextcloud_user_id during initialization)
         
