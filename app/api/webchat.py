@@ -71,15 +71,13 @@ async def ask_webchat_question(
                 documents=[]
             )
 
-        # Query RAG with webchat index_id
-        webchat_index_id = f"{company_id}_webchat"
+        # Query RAG - use same index_id as documents (company_id)
         try:
             rag_result = await rag_query(
                 pass_ids=",".join(file_ids),
                 question=request.question,
                 file_names=file_names,
-                company_id=company_id,
-                index_id=webchat_index_id
+                company_id=company_id
             )
         except RuntimeError as rag_error:
             error_detail = str(rag_error)

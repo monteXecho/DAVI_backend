@@ -17,7 +17,8 @@ from app.repositories.company_repo import CompanyRepository
 from app.models.company_user_schema import CompanyRoleCreate, DeleteRolesPayload, AssignRolePayload
 from app.api.company_admin.shared import (
     get_admin_or_user_company_id,
-    check_teamlid_permission
+    check_teamlid_permission,
+    check_nextcloud_permission
 )
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,7 @@ async def upload_document_for_role(
         raise HTTPException(status_code=403, detail=error_msg)
 
     # Get storage provider using Keycloak SSO
+    # Check Nextcloud permission before attempting to use it
     from app.storage.providers import get_storage_provider, StorageError
     from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_ROOT_PATH
     
@@ -133,18 +135,25 @@ async def upload_document_for_role(
     
     storage_provider = None
     if user_email and access_token:
+        # Check Nextcloud permission before using storage provider
         try:
-            storage_provider = get_storage_provider(
-                username=user_email,
-                access_token=access_token,
-                url=NEXTCLOUD_URL,
-                root_path=NEXTCLOUD_ROOT_PATH,
-                user_id_from_token=nextcloud_user_id
-            )
-        except StorageError as e:
-            logger.warning(f"Storage provider not available: {e}")
-        except Exception as e:
-            logger.warning(f"Storage provider error: {e}")
+            await check_nextcloud_permission(admin_context, db)
+            # Nextcloud is enabled, try to get storage provider
+            try:
+                storage_provider = get_storage_provider(
+                    username=user_email,
+                    access_token=access_token,
+                    url=NEXTCLOUD_URL,
+                    root_path=NEXTCLOUD_ROOT_PATH,
+                    user_id_from_token=nextcloud_user_id
+                )
+            except StorageError as e:
+                logger.warning(f"Storage provider not available: {e}")
+            except Exception as e:
+                logger.warning(f"Storage provider error: {e}")
+        except HTTPException:
+            # Nextcloud not enabled, skip storage provider (will use local storage only)
+            logger.debug(f"Nextcloud not enabled for company {admin_context['company_id']}, using local storage only")
 
     try:
         result = await repo.upload_document_for_folder(

@@ -67,10 +67,24 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
 
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(RAG_INDEX_URL, files=files, data=data)
-            logger.info(f"✅ RAG response: {response.status_code}, body={response.text[:300]}")
+            response_text = response.text
+            logger.info(f"✅ RAG response: {response.status_code}, body={response_text[:500]}")
 
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            
+            # Check if RAG service returned an error in the result (even with 200 status)
+            if isinstance(result, dict):
+                result_data = result.get("result", {})
+                if isinstance(result_data, dict):
+                    message = result_data.get("message", "")
+                    # Check for error indicators in the message
+                    if message and ("Error" in message or "error" in message.lower() or "failed" in message.lower() or "Failed" in message):
+                        error_detail = result_data.get("error", message)
+                        logger.error(f"RAG indexing error detected: {error_detail}")
+                        raise RuntimeError(f"RAG indexing failed: {error_detail}")
+            
+            return result
 
     finally:
         for _, (fn, f, ct) in files:
@@ -184,13 +198,18 @@ async def rag_query(pass_ids: str, question: str, file_names: List[str], company
     # Use custom index_id if provided, otherwise use company_id
     actual_index_id = index_id if index_id else company_id
 
+    # Convert comma-separated string to array for RAG API
+    file_id_list = pass_ids.split(",") if isinstance(pass_ids, str) else pass_ids
+    if isinstance(file_id_list, str):
+        file_id_list = [file_id_list]
+    
     payload = {
         "query": question,
         "index_id": actual_index_id,
         "filters": {
             "field": "file_id",
             "operator": "in",
-            "value": pass_ids,
+            "value": file_id_list,
         },
     }
 

@@ -68,6 +68,64 @@ async def get_repository(db=Depends(get_db)) -> CompanyRepository:
     return CompanyRepository(db)
 
 
+async def check_nextcloud_permission(
+    admin_context: dict,
+    db
+):
+    """
+    Check if user/company has Nextcloud module enabled.
+    Nextcloud requires both company-level and user/admin-level permission.
+    
+    Raises HTTPException 403 if Nextcloud is not enabled.
+    """
+    from app.repositories.modules_repo import ModulesRepository
+    
+    repo = CompanyRepository(db)
+    modules_repo = ModulesRepository(db)
+    company_id = admin_context["company_id"]
+    user_type = admin_context.get("user_type", "company_admin")
+    user_email = admin_context.get("admin_email") or admin_context.get("user_email")
+    
+    # Check company-level Nextcloud permission
+    company_modules = await modules_repo.get_company_modules(company_id)
+    company_has_nextcloud = (
+        company_modules.get("Nexcloud", {}).get("enabled", False) or
+        company_modules.get("Nextcloud", {}).get("enabled", False)
+    )
+    
+    if not company_has_nextcloud:
+        raise HTTPException(
+            status_code=403,
+            detail="Nextcloud module is niet ingeschakeld voor dit bedrijf. Neem contact op met de super admin."
+        )
+    
+    # Check user/admin-level Nextcloud permission
+    if user_type == "company_admin":
+        user_record = await repo.find_admin_by_email(user_email)
+    else:
+        user_record = await db.company_users.find_one({"email": user_email})
+    
+    if not user_record:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+    
+    user_modules = user_record.get("modules", {})
+    user_has_nextcloud = (
+        user_modules.get("Nexcloud", {}).get("enabled", False) or
+        user_modules.get("Nextcloud", {}).get("enabled", False)
+    )
+    
+    if not user_has_nextcloud:
+        raise HTTPException(
+            status_code=403,
+            detail="Nextcloud module is niet ingeschakeld voor uw account. Neem contact op met uw beheerder."
+        )
+    
+    return True
+
+
 async def check_teamlid_permission(
     admin_context: dict,
     db,

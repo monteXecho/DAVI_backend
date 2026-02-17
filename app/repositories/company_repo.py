@@ -464,7 +464,7 @@ class CompanyRepository(BaseRepository):
         admins = await self.admins.find().to_list(None)
         users = await self.users.find().to_list(None)
         documents = await self.documents.find().to_list(None)
-        roles = await self.roles.find().to_list(None)
+        roles = await self.roles.find().to_list(None) 
         folders = await self.folders.find().to_list(None)
         guests = await self.guest_access.find().to_list(None)
         

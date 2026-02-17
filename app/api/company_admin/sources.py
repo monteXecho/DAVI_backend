@@ -201,15 +201,13 @@ async def add_url_source(
         result = await db.webchat_sources.insert_one(source_doc)
         source_id = str(result.inserted_id)
         
-        # Index to RAG with webchat index_id
-        webchat_index_id = f"{company_id}_webchat"
+        # Index to RAG - use same payload structure as document uploads
         try:
             await rag_index_files(
                 user_id=admin_id,
                 file_paths=[file_path],
                 company_id=company_id,
-                is_role_based=False,
-                index_id=webchat_index_id
+                is_role_based=False
             )
             logger.info(f"Successfully indexed URL source: {url}")
         except Exception as e:
@@ -286,15 +284,13 @@ async def upload_html_source(
         result = await db.webchat_sources.insert_one(source_doc)
         source_id = str(result.inserted_id)
         
-        # Index to RAG with webchat index_id
-        webchat_index_id = f"{company_id}_webchat"
+        # Index to RAG - use same payload structure as document uploads
         try:
             await rag_index_files(
                 user_id=admin_id,
                 file_paths=[file_path],
                 company_id=company_id,
-                is_role_based=False,
-                index_id=webchat_index_id
+                is_role_based=False
             )
             logger.info(f"Successfully indexed HTML source: {file_name}")
         except Exception as e:
@@ -438,7 +434,6 @@ async def sync_sources(
             "status": "active"
         }).to_list(length=None)
         
-        webchat_index_id = f"{company_id}_webchat"
         synced_count = 0
         failed_count = 0
         
@@ -457,14 +452,13 @@ async def sync_sources(
                     async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                         await f.write(html_content)
                 
-                # Re-index to RAG
+                # Re-index to RAG - use same payload structure as document uploads
                 if file_path and os.path.exists(file_path):
                     await rag_index_files(
                         user_id=admin_id,
                         file_paths=[file_path],
                         company_id=company_id,
-                        is_role_based=False,
-                        index_id=webchat_index_id
+                        is_role_based=False
                     )
                 
                 # Update source record

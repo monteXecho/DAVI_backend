@@ -24,8 +24,36 @@ DEFAULT_MODULES = {
 
 
 def serialize_modules(modules: dict) -> list:
-    """Serialize module dictionary to list format."""
-    return [{"name": k, "desc": v["desc"], "enabled": v["enabled"]} for k, v in modules.items()]
+    """Serialize module dictionary to list format.
+    
+    Handles multiple data formats for backward compatibility:
+    - New format: {"module_name": {"desc": "...", "enabled": True}}
+    - Old format: {"module_name": {"enabled": True}} (no desc)
+    - Simple format: {"module_name": True} (just boolean)
+    """
+    result = []
+    for k, v in modules.items():
+        # Handle different data formats
+        if isinstance(v, bool):
+            # Simple format: {"module_name": True}
+            enabled = v
+            desc = DEFAULT_MODULES.get(k, {}).get("desc", "")
+        elif isinstance(v, dict):
+            # Dict format: {"module_name": {"desc": "...", "enabled" : True}}
+            enabled = v.get("enabled", False)
+            # Try to get desc from the value, fallback to DEFAULT_MODULES, then empty string
+            desc = v.get("desc") or DEFAULT_MODULES.get(k, {}).get("desc", "")
+        else:
+            # Fallback for unexpected formats
+            enabled = bool(v)
+            desc = DEFAULT_MODULES.get(k, {}).get("desc", "")
+        
+        result.append({
+            "name": k,
+            "desc": desc,
+            "enabled": enabled
+        })
+    return result
 
 
 def serialize_documents(docs_cursor, user_id: str):

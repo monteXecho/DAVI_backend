@@ -21,7 +21,8 @@ from app.models.company_admin_schema import AddFoldersPayload, ImportFoldersPayl
 from app.models.company_user_schema import DeleteFolderPayload
 from app.api.company_admin.shared import (
     get_admin_or_user_company_id,
-    check_teamlid_permission
+    check_teamlid_permission,
+    check_nextcloud_permission
 )
 
 # Use uvicorn logger to ensure logs are visible (same as HTTP request logs)
@@ -50,29 +51,36 @@ async def add_folders(
 
     try:
         # Get storage provider for Nextcloud sync using Keycloak SSO
+        # Only attempt if Nextcloud permission is enabled
         storage_provider = None
         try:
-            from app.storage.providers import get_storage_provider, StorageError
-            from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_ROOT_PATH
-            
-            user_email = admin_context.get("admin_email") or admin_context.get("user_email")
-            access_token = admin_context.get("_access_token")
-            nextcloud_user_id = admin_context.get("_nextcloud_user_id")
-            
-            if user_email and access_token:
-                storage_provider = get_storage_provider(
-                    username=user_email,
-                    access_token=access_token,
-                    url=NEXTCLOUD_URL,
-                    root_path=NEXTCLOUD_ROOT_PATH,
-                    user_id_from_token=nextcloud_user_id
-                )
-            else:
-                logger.warning(f"Keycloak token not available for {user_email}, creating folders in DAVI only")
-        except StorageError as e:
-            logger.warning(f"Storage provider not available, creating folders in DAVI only: {e}")
-        except Exception as e:
-            logger.warning(f"Storage provider error, creating folders in DAVI only: {e}")
+            await check_nextcloud_permission(admin_context, db)
+            # Nextcloud is enabled, try to get storage provider
+            try:
+                from app.storage.providers import get_storage_provider, StorageError
+                from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_ROOT_PATH
+                
+                user_email = admin_context.get("admin_email") or admin_context.get("user_email")
+                access_token = admin_context.get("_access_token")
+                nextcloud_user_id = admin_context.get("_nextcloud_user_id")
+                
+                if user_email and access_token:
+                    storage_provider = get_storage_provider(
+                        username=user_email,
+                        access_token=access_token,
+                        url=NEXTCLOUD_URL,
+                        root_path=NEXTCLOUD_ROOT_PATH,
+                        user_id_from_token=nextcloud_user_id
+                    )
+                else:
+                    logger.warning(f"Keycloak token not available for {user_email}, creating folders in DAVI only")
+            except StorageError as e:
+                logger.warning(f"Storage provider not available, creating folders in DAVI only: {e}")
+            except Exception as e:
+                logger.warning(f"Storage provider error, creating folders in DAVI only: {e}")
+        except HTTPException:
+            # If Nextcloud is not enabled, still allow folder creation but skip Nextcloud sync
+            logger.debug(f"Nextcloud not enabled for company {company_id}, creating folders in DAVI only")
 
         result = await repo.add_folders(
             company_id=company_id,
@@ -115,6 +123,15 @@ async def get_folders(
 
     try:
         # Auto-sync documents from Nextcloud if enabled (default: True)
+        # Only sync if Nextcloud permission is enabled
+        if auto_sync:
+            try:
+                await check_nextcloud_permission(admin_context, db)
+            except HTTPException:
+                # Nextcloud not enabled, skip sync
+                auto_sync = False
+                logger.debug(f"Nextcloud not enabled, skipping auto-sync for company {company_id}")
+        
         if auto_sync:
             try:
                 from app.storage.providers import get_storage_provider, StorageError
@@ -266,6 +283,7 @@ async def list_importable_folders(
     - Supports recursive listing for tree view
     """
     await check_teamlid_permission(admin_context, db, "roles_folders")
+    await check_nextcloud_permission(admin_context, db)
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -391,6 +409,7 @@ async def import_folders(
     - Marks folders as imported (origin="imported")
     """
     await check_teamlid_permission(admin_context, db, "roles_folders")
+    await check_nextcloud_permission(admin_context, db)
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -553,6 +572,7 @@ async def sync_documents_from_nextcloud(
     detecting new files, deleted files, and deleted folders.
     """
     await check_teamlid_permission(admin_context, db, "documents")
+    await check_nextcloud_permission(admin_context, db)
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]

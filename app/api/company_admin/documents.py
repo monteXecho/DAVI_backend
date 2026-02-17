@@ -24,7 +24,8 @@ from app.repositories.document_repo import DocumentRepository
 from app.models.company_user_schema import DeleteDocumentsPayload
 from app.api.company_admin.shared import (
     get_admin_or_user_company_id,
-    check_teamlid_permission
+    check_teamlid_permission,
+    check_nextcloud_permission
 )
 from app.api.rag import rag_index_files
 
@@ -287,6 +288,7 @@ async def delete_documents(
     admin_id = admin_context["admin_id"]
 
     # Get storage provider using Keycloak SSO
+    # Check Nextcloud permission before attempting to use it
     from app.storage.providers import get_storage_provider, StorageError
     from app.core.config import NEXTCLOUD_URL, NEXTCLOUD_ROOT_PATH
     
@@ -296,16 +298,23 @@ async def delete_documents(
     
     storage_provider = None
     if user_email and access_token:
+        # Check Nextcloud permission before using storage provider
         try:
-            storage_provider = get_storage_provider(
-                username=user_email,
-                access_token=access_token,
-                url=NEXTCLOUD_URL,
-                root_path=NEXTCLOUD_ROOT_PATH,
-                user_id_from_token=nextcloud_user_id
-            )
-        except (StorageError, Exception) as e:
-            logger.debug(f"Storage provider not available for document deletion sync: {e}")
+            await check_nextcloud_permission(admin_context, db)
+            # Nextcloud is enabled, try to get storage provider
+            try:
+                storage_provider = get_storage_provider(
+                    username=user_email,
+                    access_token=access_token,
+                    url=NEXTCLOUD_URL,
+                    root_path=NEXTCLOUD_ROOT_PATH,
+                    user_id_from_token=nextcloud_user_id
+                )
+            except (StorageError, Exception) as e:
+                logger.debug(f"Storage provider not available for document deletion sync: {e}")
+        except HTTPException:
+            # Nextcloud not enabled, skip storage provider (will use local storage only)
+            logger.debug(f"Nextcloud not enabled for company {company_id}, using local storage only")
 
     try:
         deleted_count = await repo.delete_documents(
