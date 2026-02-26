@@ -535,6 +535,21 @@ async def import_folders(
                 if sync_result.get("errors"):
                     sync_errors = sync_result.get("errors", [])
                 logger.info(f"Auto-sync completed: {synced_documents} new document(s) imported")
+                
+                # Trigger RAG indexing for synced files from Nextcloud
+                # This ensures documents imported from Nextcloud are indexed for Document Chat
+                synced_file_paths = sync_result.get("synced_file_paths", [])
+                if synced_file_paths:
+                    from app.api.rag import rag_index_files
+                    try:
+                        logger.info(f"Indexing {len(synced_file_paths)} document(s) to RAG service")
+                        # rag_index_files expects (user_id, file_paths, company_id, is_role_based)
+                        # Synced documents from Nextcloud are role-based, so is_role_based=True
+                        await rag_index_files(admin_id, synced_file_paths, company_id, is_role_based=True)
+                        logger.info(f"Successfully indexed {len(synced_file_paths)} document(s) to RAG service")
+                    except Exception as rag_error:
+                        logger.warning(f"RAG indexing failed for synced files (non-critical): {rag_error}")
+                        sync_errors.append(f"RAG indexing failed: {str(rag_error)}")
             except Exception as sync_error:
                 logger.warning(f"Auto-sync after import failed (non-critical): {sync_error}")
                 sync_errors.append(f"Auto-sync failed: {str(sync_error)}")

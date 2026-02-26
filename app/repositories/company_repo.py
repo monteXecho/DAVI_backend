@@ -87,11 +87,12 @@ class CompanyRepository(BaseRepository):
         max_users: int = None,
         max_admins: int = None,
         max_documents: int = None,
-        max_roles: int = None
+        max_roles: int = None,
+        max_public_chats: int = None
     ) -> dict:
         """Update resource limits for a company."""
         return await self._limits_repo.update_company_limits(
-            company_id, max_users, max_admins, max_documents, max_roles
+            company_id, max_users, max_admins, max_documents, max_roles, max_public_chats
         )
     
     # ==================== Modules (Migrated) ====================

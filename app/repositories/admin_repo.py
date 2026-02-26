@@ -104,12 +104,13 @@ class AdminRepository(BaseRepository):
         Find admin by email.
         
         Returns:
-            Dictionary with email and role, or None if not found
+            Full admin document from database, or None if not found
         """
         admin = await self.admins.find_one({"email": email})
         if not admin:
             return None
-        return {"email": admin["email"], "role": "company_admin"}
+        # Return the full admin document so modules and other fields are available
+        return admin
     
     async def update_admin(
         self,
@@ -296,9 +297,6 @@ class AdminRepository(BaseRepository):
             })
             roles = await roles_cursor.to_list(None)
             
-            if not roles:
-                return {}
-            
             folders_cursor = self.folders.find({
                 "company_id": company_id,
                 "admin_id": admin_id
@@ -359,6 +357,7 @@ class AdminRepository(BaseRepository):
                     folder_roles_map[folder_name].add(role_name)
             
             result = {}
+            # Process roles and their assigned folders
             for role in roles:
                 role_name = role["name"]
                 role_data = {"folders": []}

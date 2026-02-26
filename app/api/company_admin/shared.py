@@ -88,12 +88,32 @@ async def check_nextcloud_permission(
     
     # Check company-level Nextcloud permission
     company_modules = await modules_repo.get_company_modules(company_id)
+    
+    # Handle both dict and list formats for company_modules
+    if isinstance(company_modules, list):
+        # If it's a list, convert to dict for easier checking
+        company_modules_dict = {}
+        for module in company_modules:
+            if isinstance(module, dict) and "name" in module:
+                company_modules_dict[module["name"]] = {
+                    "enabled": module.get("enabled", False),
+                    "desc": module.get("desc", "")
+                }
+        company_modules = company_modules_dict
+    
+    # Check for both "Nexcloud" (typo) and "Nextcloud" (correct spelling)
+    nexcloud_module = company_modules.get("Nexcloud", {})
+    nextcloud_module = company_modules.get("Nextcloud", {})
     company_has_nextcloud = (
-        company_modules.get("Nexcloud", {}).get("enabled", False) or
-        company_modules.get("Nextcloud", {}).get("enabled", False)
+        (nexcloud_module.get("enabled", False) if isinstance(nexcloud_module, dict) else False) or
+        (nextcloud_module.get("enabled", False) if isinstance(nextcloud_module, dict) else False)
     )
     
     if not company_has_nextcloud:
+        logger.warning(
+            f"Nextcloud not enabled at company level for company {company_id}. "
+            f"Company modules: {list(company_modules.keys())}"
+        )
         raise HTTPException(
             status_code=403,
             detail="Nextcloud module is niet ingeschakeld voor dit bedrijf. Neem contact op met de super admin."
@@ -106,23 +126,46 @@ async def check_nextcloud_permission(
         user_record = await db.company_users.find_one({"email": user_email})
     
     if not user_record:
+        logger.error(f"User not found: {user_email} (type: {user_type})")
         raise HTTPException(
             status_code=404,
             detail="User not found"
         )
     
     user_modules = user_record.get("modules", {})
+    
+    # Handle both dict and list formats for user_modules
+    if isinstance(user_modules, list):
+        # If it's a list, convert to dict for easier checking
+        user_modules_dict = {}
+        for module in user_modules:
+            if isinstance(module, dict) and "name" in module:
+                user_modules_dict[module["name"]] = {
+                    "enabled": module.get("enabled", False),
+                    "desc": module.get("desc", "")
+                }
+        user_modules = user_modules_dict
+    
+    # Check for both "Nexcloud" (typo) and "Nextcloud" (correct spelling)
+    user_nexcloud = user_modules.get("Nexcloud", {})
+    user_nextcloud = user_modules.get("Nextcloud", {})
     user_has_nextcloud = (
-        user_modules.get("Nexcloud", {}).get("enabled", False) or
-        user_modules.get("Nextcloud", {}).get("enabled", False)
+        (user_nexcloud.get("enabled", False) if isinstance(user_nexcloud, dict) else False) or
+        (user_nextcloud.get("enabled", False) if isinstance(user_nextcloud, dict) else False)
     )
     
     if not user_has_nextcloud:
+        logger.warning(
+            f"Nextcloud not enabled at user level for {user_email} (type: {user_type}). "
+            f"User modules keys: {list(user_modules.keys()) if isinstance(user_modules, dict) else 'not a dict'}, "
+            f"User modules: {user_modules}"
+        )
         raise HTTPException(
             status_code=403,
             detail="Nextcloud module is niet ingeschakeld voor uw account. Neem contact op met uw beheerder."
         )
     
+    logger.debug(f"Nextcloud permission check passed for {user_email} (company: {company_id})")
     return True
 
 

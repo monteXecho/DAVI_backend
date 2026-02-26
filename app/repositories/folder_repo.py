@@ -267,6 +267,30 @@ class FolderRepository(BaseRepository):
                     logger.info(log_msg)
                     print(log_msg, file=sys.stderr, flush=True)
                     
+                    # STEP 0: Remove folder from ALL roles that contain it (BEFORE deleting folder)
+                    # This ensures the folder is removed from roles regardless of how it's being deleted
+                    roles_updated = await self.roles.update_many(
+                        {
+                            "company_id": company_id,
+                            "added_by_admin_id": admin_id,
+                            "folders": folder_name  # Find all roles that contain this folder
+                        },
+                        {"$pull": {"folders": folder_name}}  # Remove folder_name from roles
+                    )
+                    if roles_updated.modified_count > 0:
+                        log_msg = (
+                            f"✅ Removed folder '{folder_name}' from {roles_updated.modified_count} role(s) "
+                            f"before deletion"
+                        )
+                        logger.info(log_msg)
+                        print(log_msg, file=sys.stderr, flush=True)
+                    else:
+                        log_msg = (
+                            f"ℹ️  Folder '{folder_name}' was not assigned to any roles (or already removed)"
+                        )
+                        logger.info(log_msg)
+                        print(log_msg, file=sys.stderr, flush=True)
+                    
                     # REGULAR FOLDER DELETION (not role-based)
                     # STEP 1: Find folder in MongoDB FIRST (before deleting anything)
                     folder = await self.folders.find_one({
@@ -542,34 +566,61 @@ class FolderRepository(BaseRepository):
                     logger.warning(log_msg)
                     print(log_msg, file=sys.stderr, flush=True)
                     
+                    # STEP 0: Remove folder from ALL roles that contain it (BEFORE deleting folder)
+                    # Use folder_name (not role_name) to find all roles containing this folder
+                    roles_updated = await self.roles.update_many(
+                        {
+                            "company_id": company_id,
+                            "added_by_admin_id": admin_id,
+                            "folders": folder_name  # Find all roles that contain this folder
+                        },
+                        {"$pull": {"folders": folder_name}}  # Remove folder_name from roles
+                    )
+                    if roles_updated.modified_count > 0:
+                        log_msg = (
+                            f"✅ Removed folder '{folder_name}' from {roles_updated.modified_count} role(s) "
+                            f"before deletion"
+                        )
+                        logger.info(log_msg)
+                        print(log_msg, file=sys.stderr, flush=True)
+                    else:
+                        log_msg = (
+                            f"ℹ️  Folder '{folder_name}' was not assigned to any roles (or already removed)"
+                        )
+                        logger.info(log_msg)
+                        print(log_msg, file=sys.stderr, flush=True)
+                    
+                    # Now proceed with folder deletion
+                    # Note: Use folder_name for document query, not role_name
                     delete_docs_result = await self.documents.delete_many({
                         "company_id": company_id,
                         "user_id": admin_id,
-                        "upload_type": role_name
+                        "upload_type": folder_name  # Use folder_name, not role_name
                     })
                     
                     total_documents_deleted += delete_docs_result.deleted_count
                     
-                    base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, role_name)
+                    base_path = os.path.join(UPLOAD_ROOT, "roleBased", company_id, admin_id, folder_name)
                     if os.path.exists(base_path):
                         try:
                             shutil.rmtree(base_path)
                         except Exception as e:
                             logger.warning(f"Failed to delete folder {base_path}: {e}")
                     
-                    await self.roles.update_many(
-                        {"company_id": company_id, "added_by_admin_id": admin_id, "folders": role_name},
-                        {"$pull": {"folders": role_name}}
-                    )
-                    
-                    await self.folders.delete_many({
+                    # Delete the folder from MongoDB
+                    delete_result = await self.folders.delete_one({
                         "company_id": company_id,
                         "admin_id": admin_id,
-                        "name": {"$in": [f for f in folder_names if f]}
+                        "name": folder_name  # Use folder_name, not the entire list
                     })
                     
-                    deleted_folders.append(role_name)
-                    log_msg = f"✅ Completed deletion process for role-based folder: '{role_name}'"
+                    if delete_result.deleted_count > 0:
+                        logger.info(f"✅ Deleted folder '{folder_name}' from MongoDB")
+                    else:
+                        logger.warning(f"⚠️  Folder '{folder_name}' was not found in MongoDB (may have been already deleted)")
+                    
+                    deleted_folders.append(folder_name)  # Use folder_name, not role_name
+                    log_msg = f"✅ Completed deletion process for role-based folder: '{folder_name}'"
                     logger.info(log_msg)
                     print(log_msg, file=sys.stderr, flush=True)
             except Exception as e:
@@ -713,17 +764,20 @@ class FolderRepository(BaseRepository):
         
         file_path = os.path.join(base_path, clean_file_name)
 
+        # Use actual_folder_name from database to ensure it matches what was stored when folder was created
+        upload_type_folder_name = actual_folder_name if folder_exists else safe_folder
+        
         existing_doc = await self.documents.find_one({
             "company_id": company_id,
             "user_id": admin_id,
-            "upload_type": safe_folder,
+            "upload_type": upload_type_folder_name,
             "file_name": file_name
         })
 
         if existing_doc:
             raise HTTPException(
                 status_code=409,
-                detail=f"Het document '{file_name}' bestaat al in de map '{safe_folder}'."
+                detail=f"Het document '{file_name}' bestaat al in de map '{upload_type_folder_name}'."
             )
 
         storage_path = None
@@ -785,11 +839,13 @@ class FolderRepository(BaseRepository):
         from app.repositories.document_repo import DocumentRepository
         document_repo = DocumentRepository(self.db)
         
+        # Use actual_folder_name from database to ensure it matches what was stored when folder was created
+        # This ensures documents are properly associated with the folder even when Nextcloud is disabled
         doc_record = await document_repo.add_document(
             company_id=company_id,
             user_id=admin_id,
             file_name=file_name,
-            upload_type=safe_folder,
+            upload_type=upload_type_folder_name,
             path=file_path,
             storage_path=storage_path,
             source="manual_upload"
@@ -908,4 +964,3 @@ class FolderRepository(BaseRepository):
                 continue
         
         return deleted_count
-

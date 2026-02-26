@@ -10,6 +10,7 @@ from app.api.super_admin_stats import super_admin_stats_router
 from app.api.auth import auth_router
 from app.api.company_admin import company_admin_router
 from app.api.webchat import webchat_router
+from app.api.public_chat import router as public_chat_router
 
 app = FastAPI(
     title="MijnDAVI API",
@@ -126,6 +127,7 @@ app.include_router(super_admin_stats_router)
 app.include_router(auth_router)
 app.include_router(company_admin_router)
 app.include_router(webchat_router)
+app.include_router(public_chat_router)
 
 # Log registered routes for debugging
 import logging

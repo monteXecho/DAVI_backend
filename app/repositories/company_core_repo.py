@@ -41,6 +41,7 @@ class CompanyCoreRepository(BaseRepository):
             "max_admins": -1,  # Default: infinite
             "max_documents": -1,  # Default: infinite
             "max_roles": -1,  # Default: infinite
+            "max_public_chats": -1,  # Default: infinite
             "modules": company_modules,  # Company-level module permissions
             "created_at": now,
             "updated_at": now,
@@ -53,6 +54,7 @@ class CompanyCoreRepository(BaseRepository):
             "max_admins": -1,
             "max_documents": -1,
             "max_roles": -1,
+            "max_public_chats": -1,
             "modules": serialize_modules(company_modules),
             "created_at": now.isoformat(),
             "updated_at": now.isoformat(),
@@ -178,6 +180,7 @@ class CompanyCoreRepository(BaseRepository):
                 "max_admins": company.get("max_admins", -1),
                 "max_documents": company.get("max_documents", -1),
                 "max_roles": company.get("max_roles", -1),
+                "max_public_chats": company.get("max_public_chats", -1),
                 "modules": serialize_modules(company_modules),
                 "admins": admins,
                 "users": users,

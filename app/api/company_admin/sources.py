@@ -16,7 +16,8 @@ import httpx
 import aiofiles
 from datetime import datetime, timedelta
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, Query
+from fastapi.responses import FileResponse
 from app.deps.auth import get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
@@ -412,6 +413,52 @@ async def delete_source(
         raise HTTPException(status_code=500, detail=f"Failed to delete source: {str(e)}")
 
 
+@router.get("/sources/download")
+async def download_source_file(
+    file_path: str = Query(..., description="Path to the source file"),
+    admin_context=Depends(get_admin_or_user_company_id),
+    db=Depends(get_db)
+):
+    """
+    Download/view a source file (HTML or URL-extracted HTML).
+    Verifies the user has access to the source before serving it.
+    Same pattern as documents/download.
+    """
+    await check_teamlid_permission(admin_context, db, "roles_folders")
+    
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+    
+    try:
+        # Verify the source belongs to this company/admin
+        source = await db.webchat_sources.find_one({
+            "file_path": file_path,
+            "company_id": company_id,
+            "admin_id": admin_id
+        })
+        
+        if not source:
+            raise HTTPException(status_code=403, detail="You don't have access to this source")
+        
+        # Check if file exists
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Return file with appropriate content type
+        file_name = source.get("file_name", os.path.basename(file_path))
+        return FileResponse(
+            path=file_path,
+            filename=file_name,
+            media_type="text/html"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to download source file")
+        raise HTTPException(status_code=500, detail=f"Failed to download source file: {str(e)}")
+
+
 @router.post("/sources/sync")
 async def sync_sources(
     admin_context=Depends(get_admin_or_user_company_id),
@@ -508,5 +555,3 @@ async def sync_sources(
     except Exception as e:
         logger.exception("Failed to sync sources")
         raise HTTPException(status_code=500, detail=f"Failed to sync sources: {str(e)}")
-
-

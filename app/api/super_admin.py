@@ -85,6 +85,27 @@ async def get_roles_count(
     return roles_count_by_company
 
 
+@super_admin_router.get("/public-chats/count")
+async def get_public_chats_count(
+    user=Depends(require_role("super_admin")),
+    db=Depends(get_db),
+):
+    """
+    Get public chats count per company for super admin dashboard.
+    Returns a dictionary mapping company_id to public chats count.
+    """
+    public_chats_collection = db.public_chats
+    chats_cursor = public_chats_collection.find({}, {"company_id": 1})
+    
+    chats_count_by_company = {}
+    async for chat in chats_cursor:
+        company_id = chat.get("company_id")
+        if company_id:
+            chats_count_by_company[company_id] = chats_count_by_company.get(company_id, 0) + 1
+    
+    return chats_count_by_company
+
+
 @super_admin_router.post("/companies")
 async def add_company(
     payload: CompanyCreate,
@@ -154,6 +175,7 @@ async def update_company_limits(
     max_admins: int = Query(None),
     max_documents: int = Query(None),
     max_roles: int = Query(None),
+    max_public_chats: int = Query(None),
     user=Depends(require_role("super_admin")),
     db=Depends(get_db),
 ):
@@ -193,15 +215,29 @@ async def update_company_limits(
             except (ValueError, TypeError):
                 raise HTTPException(status_code=400, detail=f"Invalid max_roles value: {max_roles}")
         
+        if max_public_chats is not None:
+            try:
+                update_params['max_public_chats'] = int(max_public_chats)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"Invalid max_public_chats value: {max_public_chats}")
+        
         if not update_params:
             raise HTTPException(status_code=400, detail="No limits provided to update")
         
         logger.info(f"Updating company {company_id} limits: {update_params}")
         
+        # Explicitly pass all parameters to ensure max_public_chats is included
         limits = await repo.update_company_limits(
             company_id=company_id,
-            **update_params
+            max_users=update_params.get('max_users'),
+            max_admins=update_params.get('max_admins'),
+            max_documents=update_params.get('max_documents'),
+            max_roles=update_params.get('max_roles'),
+            max_public_chats=update_params.get('max_public_chats')
         )
+        
+        logger.info(f"Updated company {company_id} limits result: {limits}")
+        
         return {
             "status": "success",
             "company_id": company_id,

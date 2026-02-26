@@ -17,9 +17,10 @@ DEFAULT_MODULES = {
     "GGD Checks": {"desc": "Automatische GGD-controles, inclusief BKR-bewaking, afwijkingslogica en rapportage.", "enabled": False},
     "CreatieChat": {"desc": "Creatieve schrijfassistent met AI-ondersteuning voor het schrijven, herschrijven en brainstormen.", "enabled": False},
     "WebChat": {"desc": "AI-zoek & Q&A over gecureerde websites en HTML bronnen.", "enabled": False},
+    "PublicChat": {"desc": "Publieke chat module voor niet-geregistreerde gebruikers met toegang tot URL, HTML en document bronnen.", "enabled": False},
     "Admin Dashboard": {"desc": "Admin dashboard voor beheer en overzicht.", "enabled": False},
     "Webcrawler": {"desc": "Web crawler functionaliteit.", "enabled": False},
-    "Nexcloud": {"desc": "Nextcloud integratie.", "enabled": False}
+    "Nextcloud": {"desc": "Nextcloud integratie.", "enabled": False}
 }
 
 

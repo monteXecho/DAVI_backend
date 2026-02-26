@@ -35,7 +35,11 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
     # Generate file_ids based on document type
     # Private documents: {user_id}--{filename}
     # Role-based documents: {company_id}-{admin_id}--{filename}
-    if is_role_based:
+    # Publicchat: {index_id}--{filename} (when index_id starts with "publicchat")
+    if actual_index_id and actual_index_id.startswith("publicchat/"):
+        # For publicchat, use index_id as the file_id prefix
+        file_ids = [f"{actual_index_id}--{os.path.basename(fp)}" for fp in file_paths]
+    elif is_role_based:
         file_ids = [f"{company_id}-{user_id}--{os.path.basename(fp)}" for fp in file_paths]
     else:
         file_ids = [f"{user_id}--{os.path.basename(fp)}" for fp in file_paths]
@@ -118,7 +122,11 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, 
     # Generate file_ids based on document type
     # Private documents: {user_id}--{filename}
     # Role-based documents: {company_id}-{admin_id}--{filename}
-    if is_role_based:
+    # Publicchat: {index_id}--{filename} (when index_id starts with "publicchat")
+    if actual_index_id and actual_index_id.startswith("publicchat/"):
+        # For publicchat, use index_id as the file_id prefix
+        file_ids = [f"{actual_index_id}--{os.path.basename(fp)}" for fp in file_paths]
+    elif is_role_based:
         file_ids = [f"{company_id}-{user_id}--{os.path.basename(fp)}" for fp in file_paths]
     else:
         file_ids = [f"{user_id}--{os.path.basename(fp)}" for fp in file_paths]

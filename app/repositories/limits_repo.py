@@ -22,7 +22,7 @@ class LimitsRepository(BaseRepository):
             company_id: Company identifier
             
         Returns:
-            Dictionary with max_users, max_admins, max_documents, max_roles
+            Dictionary with max_users, max_admins, max_documents, max_roles, max_public_chats
             (defaults to -1 for infinite if not set)
         """
         company = await self.companies.find_one({"company_id": company_id})
@@ -32,12 +32,14 @@ class LimitsRepository(BaseRepository):
                 "max_admins": -1,
                 "max_documents": -1,
                 "max_roles": -1,
+                "max_public_chats": -1,
             }
         return {
             "max_users": company.get("max_users", -1),
             "max_admins": company.get("max_admins", -1),
             "max_documents": company.get("max_documents", -1),
             "max_roles": company.get("max_roles", -1),
+            "max_public_chats": company.get("max_public_chats", -1),
         }
 
     async def check_users_limit(self, company_id: str) -> tuple[bool, str]:
@@ -152,7 +154,8 @@ class LimitsRepository(BaseRepository):
         max_users: int = None,
         max_admins: int = None,
         max_documents: int = None,
-        max_roles: int = None
+        max_roles: int = None,
+        max_public_chats: int = None
     ) -> dict:
         """
         Update resource limits for a company.
@@ -163,6 +166,7 @@ class LimitsRepository(BaseRepository):
             max_admins: Maximum number of admins (None to skip)
             max_documents: Maximum number of documents (None to skip)
             max_roles: Maximum number of roles (None to skip)
+            max_public_chats: Maximum number of public chats (None to skip)
             
         Returns:
             Updated limits dictionary
@@ -176,6 +180,8 @@ class LimitsRepository(BaseRepository):
             update_data["max_documents"] = max_documents
         if max_roles is not None:
             update_data["max_roles"] = max_roles
+        if max_public_chats is not None:
+            update_data["max_public_chats"] = max_public_chats
         
         await self.companies.update_one(
             {"company_id": company_id},

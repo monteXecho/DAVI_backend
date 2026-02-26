@@ -32,6 +32,10 @@ async def register_user(
                 status_code=400,
                 detail="EMAIL_NOT_FOUND"
             )
+        
+        # Determine if this is an admin or user
+        # Admin documents have company_id/user_id, user documents have role field
+        is_admin = existing_admin is not None
 
         # -------------------------------------------------------------
         # 2. Check if email already exists in Keycloak
@@ -104,12 +108,16 @@ async def register_user(
         # -------------------------------------------------------------
         # 5. Assign role from MongoDB
         # -------------------------------------------------------------
-        role_name = invited_user.get("role")
-        if not role_name:
-            raise HTTPException(
-                status_code=400,
-                detail="ROLE_MISSING"
-            )
+        # Determine role: admins get "company_admin", users get role from their document
+        if is_admin:
+            role_name = "company_admin"
+        else:
+            role_name = invited_user.get("role")
+            if not role_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="ROLE_MISSING"
+                )
 
         kc_role = ensure_role_exists(role_name)
         kc_admin.assign_realm_roles(user_id=user_id, roles=[kc_role])

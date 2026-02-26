@@ -88,3 +88,29 @@ class FolderImportItem(BaseModel):
     name: str  # Folder name
     depth: int  # Depth level (0 = root level)
     imported: bool = False  # Whether this folder is already imported in DAVI
+
+
+class PublicChatCreate(BaseModel):
+    """Payload for creating a public chat."""
+    chat_name: str
+    password: Optional[str] = None
+    is_private: bool = False
+
+
+class PublicChatUpdate(BaseModel):
+    """Payload for updating a public chat."""
+    chat_name: Optional[str] = None
+    password: Optional[str] = None
+    is_private: Optional[bool] = None
+
+
+class PublicChatOut(BaseModel):
+    """Public chat response model."""
+    id: str
+    chat_name: str
+    password: Optional[str] = None  # Only returned if admin
+    is_private: bool
+    company_id: str
+    admin_id: str
+    created_at: str
+    updated_at: str
