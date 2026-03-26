@@ -12,6 +12,7 @@ from app.deps.auth import get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.api.rag import rag_query
+from app.services.multi_index_answer_merge import RagIndexSegment, select_segments_for_merge
 
 logger = logging.getLogger("uvicorn")
 
@@ -249,11 +250,8 @@ async def ask_question(
         # ------------------------------------------------------------------
         # Call RAG API for each index group and merge results
         # ------------------------------------------------------------------
-        all_raw_docs = []
-        all_answers_with_offsets = []  # Store (answer_text, doc_offset, raw_docs) tuples
-        
-        doc_offset = 0  # Track cumulative document offset across indexes
-        
+        rag_segment_results: list[RagIndexSegment] = []
+
         for index_id, group in index_groups.items():
             if not group["pass_ids"]:
                 continue
@@ -321,17 +319,23 @@ async def ask_question(
             raw_docs = answer_data.get("documents", []) or rag_result.get("documents", [])
             
             logger.info(f"Index {index_id}: Answer length={len(answer_text) if answer_text else 0}, Documents={len(raw_docs)}")
-            
-            # Store answer with its document offset for citation adjustment
-            if answer_text:
-                all_answers_with_offsets.append((answer_text, doc_offset, len(raw_docs)))
-            
-            # Add documents to combined list
-            all_raw_docs.extend(raw_docs)
-            
-            # Update offset for next index group
-            doc_offset += len(raw_docs)
-        
+            rag_segment_results.append(
+                RagIndexSegment(index_id=index_id, answer_text=answer_text or "", raw_docs=raw_docs)
+            )
+
+        # Drop redundant per-index answers (e.g. "no information" when another index
+        # cites evidence), then rebuild combined docs + offsets so [n] stays valid.
+        selected_segments = select_segments_for_merge(rag_segment_results)
+
+        all_raw_docs = []
+        all_answers_with_offsets = []  # (answer_text, doc_offset, len(raw_docs))
+        doc_offset = 0
+        for seg in selected_segments:
+            if seg.answer_text:
+                all_answers_with_offsets.append((seg.answer_text, doc_offset, len(seg.raw_docs)))
+            all_raw_docs.extend(seg.raw_docs)
+            doc_offset += len(seg.raw_docs)
+
         # Merge answers and adjust citation numbers
         # Citations in each answer are relative to that query's document list (1-based)
         # We need to adjust them to be relative to the combined document list
@@ -351,7 +355,6 @@ async def ask_question(
             merged_answer_parts.append(adjusted_answer)
             logger.info(f"Adjusted answer from offset {offset}: citations adjusted, answer length={len(adjusted_answer)}")
         
-        # Combine all adjusted answers
         if merged_answer_parts:
             answer_text = " ".join(merged_answer_parts) if len(merged_answer_parts) > 1 else merged_answer_parts[0]
             logger.info(f"Merged answer from {len(merged_answer_parts)} sources, total length={len(answer_text)}")
