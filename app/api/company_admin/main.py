@@ -12,7 +12,7 @@ from fastapi import APIRouter
 company_admin_router = APIRouter(prefix="/company-admin", tags=["Company Admin"])
 
 # Include all domain routers
-from app.api.company_admin import users, documents, roles, folders, guest_access, stats, debug, sources, public_chat
+from app.api.company_admin import users, documents, roles, folders, guest_access, stats, debug, sources, public_chat, dashboard
 
 company_admin_router.include_router(users.router)
 company_admin_router.include_router(documents.router)
@@ -20,6 +20,7 @@ company_admin_router.include_router(roles.router)
 company_admin_router.include_router(folders.router)
 company_admin_router.include_router(guest_access.router)
 company_admin_router.include_router(stats.router)
+company_admin_router.include_router(dashboard.router)
 company_admin_router.include_router(debug.router)
 company_admin_router.include_router(sources.router)
 company_admin_router.include_router(public_chat.router)

@@ -8,11 +8,13 @@ Handles all folder-related endpoints:
 - GET /folders/import/list - List importable folders from Nextcloud
 - POST /folders/import - Import folders from Nextcloud
 - POST /folders/sync - Sync documents from Nextcloud
+- GET /folders/nextcloud-sync-schedule - Get Nextcloud auto-sync schedule
 """
 
 import logging
 import os
 import sys
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.deps.db import get_db
@@ -28,6 +30,43 @@ from app.api.company_admin.shared import (
 # Use uvicorn logger to ensure logs are visible (same as HTTP request logs)
 logger = logging.getLogger("uvicorn")
 router = APIRouter()
+
+# Default sync interval in minutes
+DEFAULT_SYNC_INTERVAL_MINUTES = 60
+
+
+async def _get_sync_schedule(db, company_id: str, admin_id: str):
+    """Get nextcloud sync schedule for company+admin. Initializes if not set."""
+    from app.core.config import NEXTCLOUD_SYNC_INTERVAL_MINUTES
+    coll = db.nextcloud_sync_schedules
+    doc = await coll.find_one({"company_id": company_id, "admin_id": admin_id})
+    interval = doc.get("interval_minutes", NEXTCLOUD_SYNC_INTERVAL_MINUTES) if doc else NEXTCLOUD_SYNC_INTERVAL_MINUTES
+    next_at = doc.get("next_sync_at") if doc else None
+    if next_at is None:
+        # Initialize: first sync in interval minutes
+        next_at = datetime.now(timezone.utc) + timedelta(minutes=interval)
+        await coll.update_one(
+            {"company_id": company_id, "admin_id": admin_id},
+            {"$set": {"next_sync_at": next_at, "interval_minutes": interval, "updated_at": datetime.now(timezone.utc)}},
+            upsert=True
+        )
+    elif next_at.tzinfo is None:
+        next_at = next_at.replace(tzinfo=timezone.utc)
+    return {"next_sync_at": next_at, "interval_minutes": interval}
+
+
+async def _update_schedule_after_sync(db, company_id: str, admin_id: str):
+    """Set next_sync_at = now + interval after a successful sync."""
+    from app.core.config import NEXTCLOUD_SYNC_INTERVAL_MINUTES
+    coll = db.nextcloud_sync_schedules
+    doc = await coll.find_one({"company_id": company_id, "admin_id": admin_id})
+    interval = doc.get("interval_minutes", NEXTCLOUD_SYNC_INTERVAL_MINUTES) if doc else NEXTCLOUD_SYNC_INTERVAL_MINUTES
+    next_at = datetime.now(timezone.utc) + timedelta(minutes=interval)
+    await coll.update_one(
+        {"company_id": company_id, "admin_id": admin_id},
+        {"$set": {"next_sync_at": next_at, "interval_minutes": interval, "last_sync_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc)}},
+        upsert=True
+    )
 
 
 @router.post("/folders")
@@ -543,9 +582,11 @@ async def import_folders(
                     from app.api.rag import rag_index_files
                     try:
                         logger.info(f"Indexing {len(synced_file_paths)} document(s) to RAG service")
-                        # rag_index_files expects (user_id, file_paths, company_id, is_role_based)
+                        # rag_index_files expects (user_id, file_paths, company_id, is_role_based, index_id)
                         # Synced documents from Nextcloud are role-based, so is_role_based=True
-                        await rag_index_files(admin_id, synced_file_paths, company_id, is_role_based=True)
+                        # Use documentchat index format for proper separation
+                        index_id = f"documentchat-{company_id}-{admin_id}"
+                        await rag_index_files(admin_id, synced_file_paths, company_id, is_role_based=True, index_id=index_id)
                         logger.info(f"Successfully indexed {len(synced_file_paths)} document(s) to RAG service")
                     except Exception as rag_error:
                         logger.warning(f"RAG indexing failed for synced files (non-critical): {rag_error}")
@@ -572,6 +613,27 @@ async def import_folders(
     except Exception as e:
         logger.exception("Failed to import folders")
         raise HTTPException(status_code=500, detail=f"Failed to import folders: {str(e)}")
+
+
+@router.get("/folders/nextcloud-sync-schedule")
+async def get_nextcloud_sync_schedule(
+    admin_context=Depends(get_admin_or_user_company_id),
+    db=Depends(get_db)
+):
+    """
+    Get Nextcloud auto-sync schedule (next sync time and interval).
+    Used by the frontend to show when the next sync will run and to trigger auto-sync when due.
+    """
+    await check_teamlid_permission(admin_context, db, "documents")
+    await check_nextcloud_permission(admin_context, db)
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+    schedule = await _get_sync_schedule(db, company_id, admin_id)
+    next_at = schedule["next_sync_at"]
+    return {
+        "next_sync_at": next_at.isoformat() if next_at else None,
+        "interval_minutes": schedule["interval_minutes"],
+    }
 
 
 @router.post("/folders/sync")
@@ -641,11 +703,16 @@ async def sync_documents_from_nextcloud(
         if result.get("synced_file_paths"):
             from app.api.rag import rag_index_files
             try:
-                # rag_index_files expects (user_id, file_paths, company_id, is_role_based)
+                # rag_index_files expects (user_id, file_paths, company_id, is_role_based, index_id)
                 # Synced documents from Nextcloud are role-based, so is_role_based=True
-                await rag_index_files(admin_id, result["synced_file_paths"], company_id, is_role_based=True)
+                # Use documentchat index format for proper separation
+                index_id = f"documentchat-{company_id}-{admin_id}"
+                await rag_index_files(admin_id, result["synced_file_paths"], company_id, is_role_based=True, index_id=index_id)
             except Exception as e:
                 logger.warning(f"RAG indexing failed for synced files: {e}")
+
+        # Update next auto-sync time (schedule runs when user has Nextcloud tab open)
+        await _update_schedule_after_sync(db, company_id, admin_id)
         
         return result
     except HTTPException:

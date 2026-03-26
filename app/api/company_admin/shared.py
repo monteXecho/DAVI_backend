@@ -38,6 +38,16 @@ def _can_write_documents(perms: dict) -> bool:
     return str(val).lower() == "true"
 
 
+def _can_write_publicchat(perms: dict) -> bool:
+    """Check if user has write permission for PublicChat"""
+    return _to_bool(perms.get("publicchat_modify_permission", False))
+
+
+def _can_write_webchat(perms: dict) -> bool:
+    """Check if user has write permission for WebChat"""
+    return _to_bool(perms.get("webchat_modify_permission", False))
+
+
 def _to_bool(value) -> bool:
     """Convert string/boolean to boolean, handling both old and new formats"""
     if value is None:
@@ -172,10 +182,14 @@ async def check_nextcloud_permission(
 async def check_teamlid_permission(
     admin_context: dict,
     db,
-    permission_type: str
+    permission_type: str,
+    require_write: bool = True
 ):
     """
-    Check if teamlid has write permission for the given operation.
+    Check if teamlid has permission for the given operation.
+    When require_write=True (default), requires write permission (e.g. can_webchat_write).
+    When require_write=False, only requires that the user has guest access to this workspace
+    (read-only access to the module).
     Supports multiple teamlid roles by checking guest_access collection based on acting workspace.
     Works for both company_admin and company_user.
     """
@@ -215,24 +229,38 @@ async def check_teamlid_permission(
         can_user_write = _get_guest_permission(guest_entry, "can_user_write", "can_user_read")
         can_document_write = _get_guest_permission(guest_entry, "can_document_write", "can_document_read")
         can_folder_write = _get_guest_permission(guest_entry, "can_folder_write")
-        
+        can_publicchat_write = _get_guest_permission(guest_entry, "can_publicchat_write")
+        can_webchat_write = _get_guest_permission(guest_entry, "can_webchat_write")
+
         if permission_type == "users":
-            if not can_user_write:
+            if require_write and not can_user_write:
                 raise HTTPException(
                     status_code=403,
                     detail="U heeft geen toestemming om gebruikers te beheren."
                 )
         elif permission_type == "roles_folders":
-            if not can_role_write and not can_folder_write:
+            if require_write and not can_role_write and not can_folder_write:
                 raise HTTPException(
                     status_code=403,
                     detail="U heeft geen toestemming om rollen of mappen te beheren."
                 )
         elif permission_type == "documents":
-            if not can_document_write:
+            if require_write and not can_document_write:
                 raise HTTPException(
                     status_code=403,
                     detail="U heeft geen toestemming om documenten te beheren."
+                )
+        elif permission_type == "publicchat":
+            if require_write and not can_publicchat_write:
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om PublicChat te beheren."
+                )
+        elif permission_type == "webchat":
+            if require_write and not can_webchat_write:
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om WebChat te beheren."
                 )
         return True
     else:
@@ -245,24 +273,36 @@ async def check_teamlid_permission(
         perms = user_record.get("teamlid_permissions", {})
         
         if permission_type == "users":
-            if not _can_write_users(perms):
+            if require_write and not _can_write_users(perms):
                 raise HTTPException(
                     status_code=403,
                     detail="U heeft geen toestemming om gebruikers te beheren."
                 )
         elif permission_type == "roles_folders":
-            if not _can_write_roles_folders(perms):
+            if require_write and not _can_write_roles_folders(perms):
                 raise HTTPException(
                     status_code=403,
                     detail="U heeft geen toestemming om rollen of mappen te beheren."
                 )
         elif permission_type == "documents":
-            if not _can_write_documents(perms):
+            if require_write and not _can_write_documents(perms):
                 raise HTTPException(
                     status_code=403,
                     detail="U heeft geen toestemming om documenten te beheren."
                 )
-    
+        elif permission_type == "publicchat":
+            if require_write and not _can_write_publicchat(perms):
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om PublicChat te beheren."
+                )
+        elif permission_type == "webchat":
+            if require_write and not _can_write_webchat(perms):
+                raise HTTPException(
+                    status_code=403,
+                    detail="U heeft geen toestemming om WebChat te beheren."
+                )
+
     return True
 
 
@@ -391,6 +431,8 @@ async def get_admin_or_user_company_id(
                 "user_write": _get_guest_permission(guest_entry, "can_user_write", "can_user_read"),
                 "document_write": _get_guest_permission(guest_entry, "can_document_write", "can_document_read"),
                 "folder_write": _get_guest_permission(guest_entry, "can_folder_write"),
+                "publicchat_write": _get_guest_permission(guest_entry, "can_publicchat_write"),
+                "webchat_write": _get_guest_permission(guest_entry, "can_webchat_write"),
             }
         else:
             if (
@@ -403,6 +445,8 @@ async def get_admin_or_user_company_id(
                     "user_write": teamlid_perms.get("user_create_modify_permission", False),
                     "document_write": teamlid_perms.get("document_modify_permission", False),
                     "folder_write": teamlid_perms.get("role_folder_modify_permission", False),
+                    "publicchat_write": _to_bool(teamlid_perms.get("publicchat_modify_permission", False)),
+                    "webchat_write": _to_bool(teamlid_perms.get("webchat_modify_permission", False)),
                 }
             else:
                 raise HTTPException(

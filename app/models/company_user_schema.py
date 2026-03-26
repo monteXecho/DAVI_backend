@@ -9,8 +9,10 @@ class ModuleConfig(BaseModel):
 
 class CompanyUserCreate(BaseModel):
     email: EmailStr
-    company_role: str  
+    company_role: str
     assigned_role: str
+    name: Optional[str] = None  # Optional; when company_role is company_admin, used for display name
+    modules: Optional[List[ModuleConfig]] = None  # When company_role is company_admin, modules the new admin can use
 
 class TeamlidPermissionAssign(BaseModel):
     email: EmailStr
@@ -49,4 +51,8 @@ class ResetPasswordPayload(BaseModel):
 class CompanyRoleModifyUsers(BaseModel):
     user_ids: List[str]
     role_name: str
+
+
+class AssignUserModulesPayload(BaseModel):
+    modules: List[ModuleConfig]
 

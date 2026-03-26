@@ -548,6 +548,23 @@ class FolderRepository(BaseRepository):
                     
                     if delete_result.deleted_count > 0:
                         logger.info(f"✅ Deleted folder '{folder_name}' from MongoDB")
+                        try:
+                            from app.services.user_activity_log import (
+                                record_user_activity_event,
+                            )
+
+                            await record_user_activity_event(
+                                self.db,
+                                company_id=company_id,
+                                added_by_admin_id=str(admin_id),
+                                user_id=str(admin_id),
+                                kind="delete_folder",
+                                what=f'Map verwijderd "{folder_name}"',
+                            )
+                        except Exception:
+                            _module_logger.exception(
+                                "record_user_activity_event after folder delete"
+                            )
                     else:
                         logger.warning(f"⚠️  Folder '{folder_name}' was not found in MongoDB (may have been already deleted)")
                     
@@ -616,6 +633,23 @@ class FolderRepository(BaseRepository):
                     
                     if delete_result.deleted_count > 0:
                         logger.info(f"✅ Deleted folder '{folder_name}' from MongoDB")
+                        try:
+                            from app.services.user_activity_log import (
+                                record_user_activity_event,
+                            )
+
+                            await record_user_activity_event(
+                                self.db,
+                                company_id=company_id,
+                                added_by_admin_id=str(admin_id),
+                                user_id=str(admin_id),
+                                kind="delete_folder",
+                                what=f'Map verwijderd "{folder_name}"',
+                            )
+                        except Exception:
+                            _module_logger.exception(
+                                "record_user_activity_event after folder delete"
+                            )
                     else:
                         logger.warning(f"⚠️  Folder '{folder_name}' was not found in MongoDB (may have been already deleted)")
                     

@@ -17,6 +17,7 @@ from fastapi import HTTPException
 
 from app.repositories.base_repo import BaseRepository
 from app.repositories.constants import UPLOAD_ROOT
+from app.repositories.role_constants import COMPANY_USER_ROLE_MODULE_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,8 @@ class RoleRepository(BaseRepository):
                 for module in modules:
                     if isinstance(module, dict):
                         module_name = module.get('name')
+                        if module_name and module_name not in COMPANY_USER_ROLE_MODULE_NAMES:
+                            continue
                         if module_name:
                             company_has_module = company_modules.get(module_name, {}).get("enabled", False)
                             if company_has_module:
@@ -101,6 +104,8 @@ class RoleRepository(BaseRepository):
                     elif hasattr(module, 'dict'):
                         module_dict = module.dict()
                         module_name = module_dict.get('name')
+                        if module_name and module_name not in COMPANY_USER_ROLE_MODULE_NAMES:
+                            continue
                         if module_name:
                             company_has_module = company_modules.get(module_name, {}).get("enabled", False)
                             if company_has_module:
@@ -109,6 +114,8 @@ class RoleRepository(BaseRepository):
             else:
                 modules_dict = {}
                 for module_name, module_config in modules.items():
+                    if module_name not in COMPANY_USER_ROLE_MODULE_NAMES:
+                        continue
                     company_has_module = company_modules.get(module_name, {}).get("enabled", False)
                     if company_has_module:
                         modules_dict[module_name] = module_config

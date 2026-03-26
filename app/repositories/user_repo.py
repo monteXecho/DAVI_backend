@@ -11,6 +11,7 @@ This module handles all user-related operations including:
 import logging
 import uuid
 import io
+import os
 import re
 from datetime import datetime
 from typing import List, Optional
@@ -18,9 +19,20 @@ from fastapi import HTTPException
 import pandas as pd
 
 from app.repositories.base_repo import BaseRepository
-from app.repositories.constants import BASE_DOC_URL, serialize_documents
+from app.repositories.constants import BASE_DOC_URL, serialize_documents, serialize_modules
 
 logger = logging.getLogger(__name__)
+
+
+def _to_bool(value):  # noqa: N802
+    """Convert permission value to bool (handles string/boolean from API)."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes")
+    return bool(value)
 
 
 class UserRepository(BaseRepository):
@@ -299,7 +311,8 @@ class UserRepository(BaseRepository):
             
             user_name = usr.get("name")
             user_email = usr.get("email")
-            users.append({
+            is_teamlid = usr.get("is_teamlid", False)
+            user_entry = {
                 "id": user_id,
                 "user_id": user_id,
                 "name": user_name if user_name is not None else "",
@@ -308,11 +321,14 @@ class UserRepository(BaseRepository):
                 "roles": usr.get("assigned_roles", []),
                 "type": "user",
                 "added_by_admin_id": usr.get("added_by_admin_id"),
-                "is_teamlid": usr.get("is_teamlid", False),
+                "is_teamlid": is_teamlid,
                 "created_at": usr.get("created_at"),
                 "updated_at": usr.get("updated_at"),
                 "documents": serialize_documents(await self.documents.find({"user_id": user_id}).to_list(None), user_id)
-            })
+            }
+            if is_teamlid and usr.get("teamlid_permissions"):
+                user_entry["teamlid_permissions"] = usr.get("teamlid_permissions")
+            users.append(user_entry)
         
         # 2. Get admins added by this admin
         admins_cursor = self.admins.find({
@@ -328,7 +344,8 @@ class UserRepository(BaseRepository):
             
             admin_name = adm.get("name")
             admin_email = adm.get("email")
-            users.append({
+            is_teamlid = adm.get("is_teamlid", False)
+            admin_entry = {
                 "id": admin_user_id,
                 "user_id": admin_user_id,
                 "name": admin_name if admin_name is not None else "",
@@ -337,11 +354,15 @@ class UserRepository(BaseRepository):
                 "roles": ["Beheerder"],
                 "type": "admin",
                 "added_by_admin_id": adm.get("added_by_admin_id"),
-                "is_teamlid": adm.get("is_teamlid", False),
+                "is_teamlid": is_teamlid,
                 "created_at": adm.get("created_at"),
                 "updated_at": adm.get("updated_at"),
-                "documents": serialize_documents(await self.documents.find({"user_id": admin_user_id}).to_list(None), admin_user_id)
-            })
+                "documents": serialize_documents(await self.documents.find({"user_id": admin_user_id}).to_list(None), admin_user_id),
+                "modules": serialize_modules(adm.get("modules", {})),
+            }
+            if is_teamlid and adm.get("teamlid_permissions"):
+                admin_entry["teamlid_permissions"] = adm.get("teamlid_permissions")
+            users.append(admin_entry)
         
         # 3. Get admins who have teamlid role assigned by this admin
         # Check guest_access collection where created_by = admin_id
@@ -372,7 +393,7 @@ class UserRepository(BaseRepository):
                 seen_user_ids.add(teamlid_user_id)
                 admin_name = teamlid_admin.get("name")
                 admin_email = teamlid_admin.get("email")
-                users.append({
+                admin_entry = {
                     "id": teamlid_user_id,
                     "user_id": teamlid_user_id,
                     "name": admin_name if admin_name is not None else "",
@@ -385,8 +406,12 @@ class UserRepository(BaseRepository):
                     "teamlid_assigned_by": admin_id,
                     "created_at": teamlid_admin.get("created_at"),
                     "updated_at": teamlid_admin.get("updated_at"),
-                    "documents": serialize_documents(await self.documents.find({"user_id": teamlid_user_id}).to_list(None), teamlid_user_id)
-                })
+                    "documents": serialize_documents(await self.documents.find({"user_id": teamlid_user_id}).to_list(None), teamlid_user_id),
+                    "modules": serialize_modules(teamlid_admin.get("modules", {})),
+                }
+                if teamlid_admin.get("teamlid_permissions"):
+                    admin_entry["teamlid_permissions"] = teamlid_admin.get("teamlid_permissions")
+                users.append(admin_entry)
         
         # Sort users: admins first, then by name/email
         def get_sort_key(user):
@@ -501,22 +526,30 @@ class UserRepository(BaseRepository):
             for doc in all_docs
         ]
 
+        # Generate pass_ids matching the indexing format
+        # Private documents: documentchat-{company_id}-{user_id}--{filename} (use user_id, not admin_id)
+        # Role-based documents: documentchat-{company_id}-{admin_id}--{filename} (use admin_id)
         pass_ids = []
         for doc in formatted_docs:
             fn = doc["file_name"]
             upload_type = doc.get("upload_type", "document")
 
             if upload_type == "document":
-                pid = f"{user_id}--{fn}"
+                # Private documents: use user_id for personal document separation
+                pid = f"documentchat-{company_id}-{user_id}--{fn}"
             else:
+                # Role-based documents: use admin_id for admin-level separation
+                admin_id = None
                 if user_type == "admin":
-                    pid = f"{company_id}-{user_id}--{fn}"
+                    admin_id = user_id  # Admin's own user_id
                 else:
-                    added_by_admin_id = user.get("added_by_admin_id")
-                    if added_by_admin_id:
-                        pid = f"{company_id}-{added_by_admin_id}--{fn}"
-                    else:
-                        pid = f"{company_id}-{user_id}--{fn}"
+                    admin_id = user.get("added_by_admin_id")  # Company user's admin
+                
+                if admin_id:
+                    pid = f"documentchat-{company_id}-{admin_id}--{fn}"
+                else:
+                    # Fallback: if no admin_id, use old format for backward compatibility
+                    pid = f"{company_id}-{user_id}--{fn}"
             pass_ids.append(pid)
 
         # Aggregate modules from user's assigned roles
@@ -549,17 +582,21 @@ class UserRepository(BaseRepository):
                 roles_cursor = self.roles.find(roles_query)
                 roles = [r async for r in roles_cursor]
                 
-                # Aggregate modules from all assigned roles
+                from app.repositories.role_constants import COMPANY_USER_ROLE_MODULE_NAMES
+
+                # Aggregate modules from all assigned roles (only modules company users can use in-app)
                 for role in roles:
                     role_modules = role.get("modules", {})
                     if isinstance(role_modules, dict):
-                        # Merge role modules into user modules (role modules take precedence)
                         for module_name, module_config in role_modules.items():
+                            if module_name not in COMPANY_USER_ROLE_MODULE_NAMES:
+                                continue
                             if module_config.get("enabled", False):
                                 modules_obj[module_name] = module_config
         
-        # Get is_teamlid flag
+        # Get is_teamlid flag and teamlid_permissions (for frontend permission helpers when guest_permissions not in response)
         is_teamlid = user.get("is_teamlid", False)
+        teamlid_permissions = user.get("teamlid_permissions") if is_teamlid else None
         
         # Get company-level modules for role assignment (what modules are enabled at company level)
         from app.repositories.modules_repo import ModulesRepository
@@ -567,10 +604,14 @@ class UserRepository(BaseRepository):
         modules_repo = ModulesRepository(self.db)
         company_modules = await modules_repo.get_company_modules(company_id)
         
-        return {
+        result = {
             "user_id": user_id,
             "company_id": company_id,
             "user_type": user_type,
+            # Workspace owner for analytics (Document Chat questions, etc.)
+            "added_by_admin_id": user_id
+            if user_type == "admin"
+            else user.get("added_by_admin_id"),
             "documents": formatted_docs,
             "pass_ids": pass_ids,
             "modules": modules_obj,  # Return as object, not array (user's aggregated modules)
@@ -580,6 +621,9 @@ class UserRepository(BaseRepository):
             "is_teamlid": is_teamlid,  # Required for workspace switcher
             "assigned_roles": user.get("assigned_roles", []),  # Include assigned roles
         }
+        if teamlid_permissions is not None:
+            result["teamlid_permissions"] = teamlid_permissions
+        return result
     
     async def get_all_user_documents(self, email: str) -> dict:
         """
@@ -716,14 +760,34 @@ class UserRepository(BaseRepository):
             update_data["email"] = email
         if assigned_roles is not None:
             update_data["assigned_roles"] = assigned_roles
+            # When Teamlid is removed from assigned_roles, clear teamlid state
+            if "Teamlid" not in assigned_roles:
+                update_data["is_teamlid"] = False
         if is_teamlid is not None:
             update_data["is_teamlid"] = is_teamlid
         if teamlid_permissions is not None:
             update_data["teamlid_permissions"] = teamlid_permissions
         
+        # When removing Teamlid from assigned_roles, delete guest_access and unset teamlid fields
+        unset_data = {}
+        if assigned_roles is not None and "Teamlid" not in assigned_roles:
+            await self.guest_access.delete_many({
+                "company_id": company_id,
+                "guest_user_id": user_id
+            })
+            unset_data = {
+                "teamlid_permissions": "",
+                "assigned_teamlid_by_id": "",
+                "assigned_teamlid_by_name": "",
+                "assigned_teamlid_at": ""
+            }
+
+        update_op = {"$set": update_data}
+        if unset_data:
+            update_op["$unset"] = unset_data
         result = await self.users.update_one(
             {"company_id": company_id, "user_id": user_id},
-            {"$set": update_data}
+            update_op
         )
         
         if result.modified_count == 0:
@@ -778,7 +842,36 @@ class UserRepository(BaseRepository):
                     "$addToSet": {"assigned_roles": "Teamlid"}  # Add Teamlid to assigned_roles if not present
                 }
             )
-            
+            if result.modified_count > 0 or result.matched_count > 0:
+                # Create/update guest_access so workspace switcher shows teamlid workspace for this user
+                guest_user_id = user["user_id"]
+                can_role = _to_bool(permissions.get("role_folder_modify_permission", False))
+                can_user = _to_bool(permissions.get("user_create_modify_permission", False))
+                can_doc = _to_bool(permissions.get("document_modify_permission", False))
+                can_publicchat = _to_bool(permissions.get("publicchat_modify_permission", False))
+                can_webchat = _to_bool(permissions.get("webchat_modify_permission", False))
+                await self.guest_access.update_one(
+                    {
+                        "company_id": company_id,
+                        "owner_admin_id": admin_id,
+                        "guest_user_id": guest_user_id,
+                    },
+                    {
+                        "$set": {
+                            "can_role_write": can_role,
+                            "can_user_write": can_user,
+                            "can_document_write": can_doc,
+                            "can_folder_write": can_role,
+                            "can_publicchat_write": can_publicchat,
+                            "can_webchat_write": can_webchat,
+                            "is_active": True,
+                            "updated_at": datetime.utcnow(),
+                            "created_by": admin_id,
+                        },
+                        "$setOnInsert": {"created_at": datetime.utcnow()},
+                    },
+                    upsert=True,
+                )
             return result.modified_count > 0
         
         # If not found in users, try admins
@@ -801,7 +894,36 @@ class UserRepository(BaseRepository):
                 {"company_id": company_id, "email": email},
                 {"$set": update_data}
             )
-            
+            if result.modified_count > 0 or result.matched_count > 0:
+                # Create/update guest_access so workspace switcher shows teamlid workspace for this admin
+                guest_user_id = admin["user_id"]
+                can_role = _to_bool(permissions.get("role_folder_modify_permission", False))
+                can_user = _to_bool(permissions.get("user_create_modify_permission", False))
+                can_doc = _to_bool(permissions.get("document_modify_permission", False))
+                can_publicchat = _to_bool(permissions.get("publicchat_modify_permission", False))
+                can_webchat = _to_bool(permissions.get("webchat_modify_permission", False))
+                await self.guest_access.update_one(
+                    {
+                        "company_id": company_id,
+                        "owner_admin_id": admin_id,
+                        "guest_user_id": guest_user_id,
+                    },
+                    {
+                        "$set": {
+                            "can_role_write": can_role,
+                            "can_user_write": can_user,
+                            "can_document_write": can_doc,
+                            "can_folder_write": can_role,
+                            "can_publicchat_write": can_publicchat,
+                            "can_webchat_write": can_webchat,
+                            "is_active": True,
+                            "updated_at": datetime.utcnow(),
+                            "created_by": admin_id,
+                        },
+                        "$setOnInsert": {"created_at": datetime.utcnow()},
+                    },
+                    upsert=True,
+                )
             return result.modified_count > 0
         
         return False
@@ -1130,7 +1252,6 @@ class UserRepository(BaseRepository):
 
                 if file_path and os.path.exists(file_path):
                     try:
-                        import os
                         os.remove(file_path)
                         logger.info(f"Deleted physical file: {file_path}")
                     except Exception as e:
@@ -1139,6 +1260,30 @@ class UserRepository(BaseRepository):
                 delete_result = await self.documents.delete_one({"_id": document["_id"]})
                 if delete_result.deleted_count > 0:
                     deleted_count += 1
+                    cid = user.get("company_id")
+                    uid_str = str(user_id)
+                    if user_rec:
+                        added_by = user_rec.get("added_by_admin_id") or uid_str
+                    else:
+                        added_by = (admin_rec or {}).get("added_by_admin_id") or uid_str
+                    if cid and added_by:
+                        try:
+                            from app.services.user_activity_log import (
+                                record_user_activity_event,
+                            )
+
+                            await record_user_activity_event(
+                                self.db,
+                                company_id=cid,
+                                added_by_admin_id=str(added_by),
+                                user_id=uid_str,
+                                kind="delete_private",
+                                what=f'Privédocument verwijderd "{file_name}"',
+                            )
+                        except Exception:
+                            logger.exception(
+                                "record_user_activity_event after private delete"
+                            )
 
             except Exception as e:
                 logger.error(f"Error deleting document {file_name}: {str(e)}")

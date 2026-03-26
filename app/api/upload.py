@@ -127,9 +127,15 @@ async def upload_document(
 
         logger.info(f" File '{file.filename}' uploaded by {email} (user_id={user_id}, company_id={company_id})")
 
+        # For private documents (upload_type="document"), use user_id for index separation
+        # Private documents are personal to each user, not shared across admins
+        # For role-based documents, we would use admin_id, but this endpoint is only for private documents
+        # Use documentchat-{company_id}-{user_id} format for private documents
+        index_id = f"documentchat-{company_id}-{user_id}"
+
         try:
-            await rag_index_files(user_id, [file_path], company_id)
-            logger.info(f"RAG indexing triggered for '{file.filename}'")
+            await rag_index_files(user_id, [file_path], company_id, index_id=index_id)
+            logger.info(f"RAG indexing triggered for '{file.filename}' with index_id: {index_id}")
         except Exception as e:
             logger.error(f"RAG indexing failed for '{file.filename}': {e}")
 

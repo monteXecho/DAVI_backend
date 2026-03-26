@@ -191,7 +191,8 @@ class CompanyRepository(BaseRepository):
         teamlid_permissions: dict = None
     ):
         """Update user or admin information."""
-        if user_type == "company_admin":
+        # Accept both "admin" and "company_admin" for admin type (frontend sends "admin")
+        if user_type in ("company_admin", "admin"):
             # Update admin
             return await self._admin_repo.update_admin(company_id, user_id, name, email)
         else:

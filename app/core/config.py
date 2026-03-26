@@ -26,3 +26,9 @@ DAVI_KEYCLOAK_CLIENT_SECRET = os.getenv("DAVI_KEYCLOAK_CLIENT_SECRET", "")
 
 # SSL Verification (set to "false" if using self-signed certificates)
 KEYCLOAK_VERIFY_SSL = os.getenv("KEYCLOAK_VERIFY_SSL", "true").lower() == "true"
+
+# Nextcloud auto-sync interval (minutes) - used for scheduled sync when user has tab open
+NEXTCLOUD_SYNC_INTERVAL_MINUTES = int(os.getenv("NEXTCLOUD_SYNC_INTERVAL_MINUTES", "60"))
+
+# Public Chat URL auto-sync interval (minutes) - used for scheduled sync when user has tab open
+PUBLIC_CHAT_URL_SYNC_INTERVAL_MINUTES = int(os.getenv("PUBLIC_CHAT_URL_SYNC_INTERVAL_MINUTES", "60"))

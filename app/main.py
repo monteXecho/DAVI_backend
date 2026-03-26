@@ -11,6 +11,7 @@ from app.api.auth import auth_router
 from app.api.company_admin import company_admin_router
 from app.api.webchat import webchat_router
 from app.api.public_chat import router as public_chat_router
+from app.api.maintenance import maintenance_router
 
 app = FastAPI(
     title="MijnDAVI API",
@@ -34,7 +35,7 @@ async def track_user_activity(request: Request, call_next):
     Updates last_activity timestamp when users make authenticated API calls.
     """
     # Skip tracking for certain paths
-    skip_paths = ["/docs", "/openapi.json", "/redoc", "/health", "/favicon.ico", "/"]
+    skip_paths = ["/docs", "/openapi.json", "/redoc", "/health", "/maintenance-status", "/favicon.ico", "/"]
     
     if any(request.url.path.startswith(path) for path in skip_paths):
         return await call_next(request)
@@ -120,6 +121,12 @@ app.mount("/highlighted", StaticFiles(directory=HIGHLIGHTED_DIR), name="highligh
 def root():
     return {"message": "Welcome to the MijnDavi RAG API. Use /ask endpoint to querdy."}
 
+
+@app.get("/health")
+def health():
+    """Simple health check - returns 200 when backend is up. Used by frontend to detect backend availability."""
+    return {"status": "ok"}
+
 app.include_router(ask_router)
 app.include_router(upload_router)
 app.include_router(super_admin_router)
@@ -128,6 +135,7 @@ app.include_router(auth_router)
 app.include_router(company_admin_router)
 app.include_router(webchat_router)
 app.include_router(public_chat_router)
+app.include_router(maintenance_router)
 
 # Log registered routes for debugging
 import logging

@@ -176,8 +176,10 @@ async def upload_document_for_role(
                     file_path = file_path[0] if file_path else None
                 if isinstance(file_path, str) and os.path.exists(file_path):
                     logger.info(f"Triggering RAG indexing for role-based document: {file_path}")
-                    await rag_index_files(admin_id, [file_path], company_id, is_role_based=True)
-                    logger.info(f"RAG indexing triggered successfully for role-based document '{result.get('file_name')}'")
+                    # Use documentchat index format for proper separation
+                    index_id = f"documentchat-{company_id}-{admin_id}"
+                    await rag_index_files(admin_id, [file_path], company_id, is_role_based=True, index_id=index_id)
+                    logger.info(f"RAG indexing triggered successfully for role-based document '{result.get('file_name')}' with index_id: {index_id}")
                 else:
                     logger.warning(f"File path does not exist for RAG indexing: {file_path} (type: {type(file_path)})")
             else:

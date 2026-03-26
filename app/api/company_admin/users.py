@@ -18,6 +18,7 @@ Handles all user-related endpoints:
 import logging
 import os
 import json
+from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, Query
 from app.deps.auth import get_keycloak_admin, get_current_user
@@ -28,7 +29,8 @@ from app.models.company_user_schema import (
     TeamlidPermissionAssign,
     CompanyUserUpdate,
     ResetPasswordPayload,
-    CompanyRoleModifyUsers
+    CompanyRoleModifyUsers,
+    AssignUserModulesPayload,
 )
 from app.deps.auth import get_keycloak_admin
 from app.api.company_admin.shared import (
@@ -83,6 +85,18 @@ async def get_current_user_info(
         
         if not user_data:
             raise HTTPException(status_code=404, detail="User not found")
+
+        # Merge guest (teamlid) permissions for current workspace so frontend can enforce read vs write
+        guest_perms = admin_context.get("guest_permissions")
+        if guest_perms:
+            user_data["guest_permissions"] = {
+                "can_role_write": guest_perms.get("role_write"),
+                "can_user_write": guest_perms.get("user_write"),
+                "can_document_write": guest_perms.get("document_write"),
+                "can_folder_write": guest_perms.get("folder_write"),
+                "can_publicchat_write": guest_perms.get("publicchat_write"),
+                "can_webchat_write": guest_perms.get("webchat_write"),
+            }
         
         return user_data
     except HTTPException:
@@ -109,7 +123,11 @@ async def add_user(
     try:
         if payload.company_role == "company_admin":
             name = getattr(payload, "name", None) or payload.email.split("@")[0]
-            new_admin = await repo.add_admin(company_id, admin_id, name, payload.email)
+            # Convert modules list to dict for add_admin (only company-enabled modules are applied in repo)
+            modules_dict = None
+            if payload.modules:
+                modules_dict = {m.name: {"enabled": m.enabled, "desc": m.desc or ""} for m in payload.modules}
+            new_admin = await repo.add_admin(company_id, admin_id, name, payload.email, modules_dict)
             return {"status": "admin_created", "user": new_admin}
         else:
             new_user = await repo.add_user_by_admin(company_id, admin_id, payload.email, payload.company_role, payload.assigned_role)
@@ -271,29 +289,139 @@ async def reset_user_password(
         )
 
 
+def _update_keycloak_user_email_sync(kc_admin, old_email: str, new_email: str, new_name: Optional[str] = None) -> bool:
+    """Update Keycloak user email/username so they can login with new email without re-registering."""
+    if not old_email or not new_email or old_email.strip().lower() == new_email.strip().lower():
+        return False
+    new_email = new_email.strip()
+    old_email = old_email.strip()
+    try:
+        # Try exact match first, fallback to default
+        kc_users = kc_admin.get_users({"email": old_email, "exact": True})
+        if not kc_users:
+            kc_users = kc_admin.get_users({"email": old_email})
+        if not kc_users:
+            return False
+        kc_user_id = kc_users[0].get("id")
+        if not kc_user_id:
+            return False
+        # Get full user and merge: Keycloak often requires complete payload when updating
+        full_user = kc_admin.get_user(kc_user_id)
+        if not full_user:
+            full_user = kc_users[0]
+        # Only include JSON-serializable, valid Keycloak user fields.
+        # Do NOT include "username" - many realms have "Edit username" disabled (read-only).
+        allow_keys = {"email", "emailVerified", "enabled", "firstName", "lastName",
+                      "attributes", "createdTimestamp"}
+        update_payload = {k: v for k, v in full_user.items() if k in allow_keys and k != "id"}
+        update_payload["email"] = new_email
+        update_payload["emailVerified"] = True
+        if new_name and new_name.strip():
+            parts = new_name.strip().split(None, 1)
+            update_payload["firstName"] = parts[0]
+            update_payload["lastName"] = parts[1] if len(parts) > 1 else ""
+        kc_admin.update_user(kc_user_id, update_payload)
+        logger.info(f"Updated Keycloak user {old_email} -> {new_email}")
+        return True
+    except Exception as e:
+        logger.warning(f"Keycloak email update failed {old_email} -> {new_email}: {e}")
+        return False
+
+
 @router.put("/users/{user_id}")
 async def update_user(
     user_id: str,
     payload: CompanyUserUpdate,
     admin_context=Depends(get_admin_or_user_company_id),
-    db=Depends(get_db)
+    db=Depends(get_db),
+    kc=Depends(get_keycloak_admin),
 ):
-    """Update user information."""
+    """Update user information. When email changes, updates Keycloak so user can login with new email immediately."""
+    from fastapi.concurrency import run_in_threadpool
+
     await check_teamlid_permission(admin_context, db, "users")
     repo = CompanyRepository(db)
     company_id = admin_context["company_id"]
 
     user_type = payload.user_type
+    is_admin = user_type in ("company_admin", "admin")
 
-    updated = await repo.update_user(company_id, user_id, user_type, payload.name, payload.email, payload.assigned_roles)
+    old_email = None
+    if is_admin:
+        admin_doc = await db.company_admins.find_one({"company_id": company_id, "user_id": user_id})
+        if admin_doc:
+            old_email = admin_doc.get("email")
+    else:
+        user_doc = await db.company_users.find_one({"company_id": company_id, "user_id": user_id})
+        if user_doc:
+            old_email = user_doc.get("email")
+
+    # If email changed, update Keycloak so user can login with new email immediately (no re-register)
+    if old_email and payload.email and payload.email.strip().lower() != (old_email or "").strip().lower():
+        try:
+            await run_in_threadpool(
+                _update_keycloak_user_email_sync,
+                kc, old_email, payload.email.strip(),
+                payload.name if payload.name else None
+            )
+        except Exception as e:
+            logger.warning(f"Keycloak email update failed (continuing with DB update): {e}")
+
+    updated = await repo.update_user(
+        company_id, user_id,
+        "company_admin" if is_admin else "company_user",
+        payload.name, payload.email, payload.assigned_roles
+    )
     if not updated:
         raise HTTPException(status_code=404, detail="User not found or not in your company")
+
+    # For admins: if Teamlid was removed from assigned_roles, clear teamlid and guest_access
+    if is_admin and "Teamlid" not in (payload.assigned_roles or []):
+        admin_doc = await db.company_admins.find_one({"company_id": company_id, "user_id": user_id})
+        if admin_doc and admin_doc.get("is_teamlid"):
+            await db.company_admins.update_one(
+                {"company_id": company_id, "user_id": user_id},
+                {
+                    "$set": {"is_teamlid": False, "updated_at": datetime.utcnow()},
+                    "$unset": {
+                        "teamlid_permissions": "",
+                        "assigned_teamlid_by_id": "",
+                        "assigned_teamlid_by_name": "",
+                        "assigned_teamlid_at": ""
+                    }
+                }
+            )
+            await db.company_guest_access.delete_many({
+                "company_id": company_id,
+                "guest_user_id": user_id
+            })
 
     # Ensure ObjectId is converted to string
     if updated and "_id" in updated:
         updated["_id"] = str(updated["_id"])
 
     return {"success": True, "user_id": user_id, "new_name": payload.name, "assigned_roles": payload.assigned_roles}
+
+
+@router.post("/users/{user_id}/modules")
+async def assign_user_modules(
+    user_id: str,
+    payload: AssignUserModulesPayload,
+    admin_context=Depends(get_admin_or_user_company_id),
+    db=Depends(get_db),
+):
+    """Assign module permissions to an admin. Only admins (Beheerder) can have modules assigned."""
+    await check_teamlid_permission(admin_context, db, "users")
+    repo = CompanyRepository(db)
+    company_id = admin_context["company_id"]
+    admin_doc = await db.company_admins.find_one({"company_id": company_id, "user_id": user_id})
+    if not admin_doc:
+        raise HTTPException(status_code=404, detail="Admin not found or not in your company")
+    modules_dict = {m.name: {"enabled": m.enabled, "desc": m.desc or ""} for m in payload.modules}
+    result = await repo.assign_modules(company_id, user_id, modules_dict)
+    if not result:
+        raise HTTPException(status_code=404, detail="Failed to update modules")
+    return {"success": True, "user_id": user_id, "message": "Modules updated successfully"}
 
 
 @router.delete("/users")

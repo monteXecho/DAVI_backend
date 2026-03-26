@@ -29,6 +29,8 @@ class GuestAccessRepository(BaseRepository):
         can_document_write: bool,
         can_folder_write: bool,
         created_by: str,
+        can_publicchat_write: bool = False,
+        can_webchat_write: bool = False,
     ) -> dict:
         """
         Create or update guest access for a given (owner_admin, guest_user) pair.
@@ -55,6 +57,8 @@ class GuestAccessRepository(BaseRepository):
             "can_user_write": can_user_write,
             "can_document_write": can_document_write,
             "can_folder_write": can_folder_write,
+            "can_publicchat_write": can_publicchat_write,
+            "can_webchat_write": can_webchat_write,
             "is_active": True,
             "updated_at": now,
             "created_by": created_by,

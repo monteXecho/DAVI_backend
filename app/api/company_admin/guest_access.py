@@ -155,6 +155,8 @@ async def get_guest_workspaces(
                     "user_write": entry.get("can_user_write", False),
                     "document_write": entry.get("can_document_write", False),
                     "folder_write": entry.get("can_folder_write", False),
+                    "publicchat_write": entry.get("can_publicchat_write", False),
+                    "webchat_write": entry.get("can_webchat_write", False),
                 }
             }
             guest_workspaces.append(guest_ws)

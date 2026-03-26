@@ -12,6 +12,7 @@ Handles all source-related endpoints:
 
 import logging
 import os
+import asyncio
 import httpx
 import aiofiles
 from datetime import datetime, timedelta
@@ -49,7 +50,7 @@ async def health_check():
 
 async def extract_html_from_url(url: str) -> str:
     """
-    Extract HTML content from a URL.
+    Extract HTML content from a URL with retry logic and improved error handling.
     
     Args:
         url: URL to extract HTML from
@@ -60,17 +61,110 @@ async def extract_html_from_url(url: str) -> str:
     Raises:
         HTTPException: If URL extraction fails
     """
-    try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.text
-    except httpx.HTTPError as e:
-        logger.error(f"Failed to fetch URL {url}: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error fetching URL {url}: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    # Add proper headers to avoid 403 Forbidden errors and make requests look more like a real browser
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Cache-Control": "max-age=0"
+    }
+    
+    max_retries = 3
+    retry_delay = 2  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Increase timeout for slow websites
+            timeout = httpx.Timeout(60.0, connect=10.0)  # 60s total, 10s connect
+            
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+                headers=headers,
+                verify=True  # SSL verification
+            ) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                
+                # Handle content encoding - httpx should auto-decompress, but ensure we get text
+                # Check if response is already decoded
+                if response.headers.get("content-encoding"):
+                    # Response might be compressed, but httpx should handle it
+                    # If we get binary data, try to decode it
+                    try:
+                        return response.text
+                    except UnicodeDecodeError:
+                        # If text decoding fails, the response might be binary
+                        # Try to decode as UTF-8
+                        return response.content.decode('utf-8', errors='ignore')
+                else:
+                    return response.text
+                
+        except httpx.TimeoutException as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Timeout fetching URL {url} (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 1.5  # Exponential backoff
+                continue
+            else:
+                logger.error(f"Timeout fetching URL {url} after {max_retries} attempts: {e}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Timeout when fetching URL. The website took too long to respond. Please try again or check if the URL is accessible."
+                )
+        except httpx.ConnectError as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Connection error fetching URL {url} (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 1.5
+                continue
+            else:
+                logger.error(f"Connection error fetching URL {url} after {max_retries} attempts: {e}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Connection error when fetching URL. The server disconnected without sending a response. Please check if the URL is correct and accessible."
+                )
+        except httpx.HTTPStatusError as e:
+            # Try to get response text, but handle cases where it might be compressed or binary
+            try:
+                response_preview = e.response.text[:200] if e.response.text else "No response body"
+            except (UnicodeDecodeError, AttributeError):
+                response_preview = f"Binary/compressed response ({len(e.response.content)} bytes)"
+            
+            logger.error(f"Failed to fetch URL {url}: HTTP {e.response.status_code} - {response_preview}")
+            
+            if e.response.status_code == 403:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Access denied (403 Forbidden) when fetching URL. The website may be blocking automated requests. Please try accessing the URL manually in a browser first, or contact the website administrator."
+                )
+            elif e.response.status_code == 404:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"URL not found (404). Please check if the URL is correct and accessible."
+                )
+            raise HTTPException(status_code=400, detail=f"Failed to fetch URL: HTTP {e.response.status_code}")
+        except httpx.HTTPError as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"HTTP error fetching URL {url} (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 1.5
+                continue
+            else:
+                logger.error(f"Failed to fetch URL {url}: {e}")
+                raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error fetching URL {url}: {e}")
+            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    
+    # Should never reach here, but just in case
+    raise HTTPException(status_code=500, detail="Failed to fetch URL after all retry attempts")
 
 
 @router.get("/sources")
@@ -80,7 +174,7 @@ async def list_sources(
 ):
     """List all sources (URLs and HTML files) for the company."""
     try:
-        await check_teamlid_permission(admin_context, db, "roles_folders")
+        await check_teamlid_permission(admin_context, db, "webchat", require_write=False)
     except HTTPException:
         raise
     except Exception as e:
@@ -156,7 +250,7 @@ async def add_url_source(
     Add a URL source. Extracts HTML from the URL and indexes it to RAG.
     """
     try:
-        await check_teamlid_permission(admin_context, db, "roles_folders")
+        await check_teamlid_permission(admin_context, db, "webchat")
     except HTTPException:
         raise
     except Exception as e:
@@ -202,13 +296,21 @@ async def add_url_source(
         result = await db.webchat_sources.insert_one(source_doc)
         source_id = str(result.inserted_id)
         
-        # Index to RAG - use same payload structure as document uploads
+        # Index to RAG: use same 2-field metadata as PublicChat indexing.
+        # Extra keys (e.g. 4 fields) can trigger RAG indexer errors
+        # ("dictionary update sequence element #0 has length 4; 2 is required").
+        webchat_index_id = f"webchat-{company_id}-{admin_id}"
+        display_title = source_doc.get("title") or url
+        file_metadata = [{"url": url, "title": display_title}]
+        
         try:
             await rag_index_files(
                 user_id=admin_id,
                 file_paths=[file_path],
                 company_id=company_id,
-                is_role_based=False
+                is_role_based=False,
+                index_id=webchat_index_id,
+                file_metadata=file_metadata
             )
             logger.info(f"Successfully indexed URL source: {url}")
         except Exception as e:
@@ -242,7 +344,7 @@ async def upload_html_source(
     """
     Upload an HTML file and index it to RAG.
     """
-    await check_teamlid_permission(admin_context, db, "roles_folders")
+    await check_teamlid_permission(admin_context, db, "webchat")
     
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -285,13 +387,19 @@ async def upload_html_source(
         result = await db.webchat_sources.insert_one(source_doc)
         source_id = str(result.inserted_id)
         
-        # Index to RAG - use same payload structure as document uploads
+        webchat_index_id = f"webchat-{company_id}-{admin_id}"
+        html_title = source_doc.get("title") or file_name
+        # Empty url string (not null) — same shape as PublicChat file indexing
+        file_metadata = [{"url": "", "title": html_title}]
+        
         try:
             await rag_index_files(
                 user_id=admin_id,
                 file_paths=[file_path],
                 company_id=company_id,
-                is_role_based=False
+                is_role_based=False,
+                index_id=webchat_index_id,
+                file_metadata=file_metadata
             )
             logger.info(f"Successfully indexed HTML source: {file_name}")
         except Exception as e:
@@ -324,7 +432,7 @@ async def update_source(
     db=Depends(get_db)
 ):
     """Update a source (e.g., change status)."""
-    await check_teamlid_permission(admin_context, db, "roles_folders")
+    await check_teamlid_permission(admin_context, db, "webchat")
     
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -366,7 +474,7 @@ async def delete_source(
     db=Depends(get_db)
 ):
     """Delete a source."""
-    await check_teamlid_permission(admin_context, db, "roles_folders")
+    await check_teamlid_permission(admin_context, db, "webchat")
     
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -422,20 +530,27 @@ async def download_source_file(
     """
     Download/view a source file (HTML or URL-extracted HTML).
     Verifies the user has access to the source before serving it.
-    Same pattern as documents/download.
+    No roles_folders check: company users can view sources from their admin's workspace
+    (same pattern as documents/download for read-only access).
     """
-    await check_teamlid_permission(admin_context, db, "roles_folders")
-    
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
     
     try:
         # Verify the source belongs to this company/admin
+        # Check webchat_sources first
         source = await db.webchat_sources.find_one({
             "file_path": file_path,
             "company_id": company_id,
             "admin_id": admin_id
         })
+        # If not found, check public_chat_sources (HTML/files for public chats)
+        if not source and "public_chat" in file_path:
+            source = await db.public_chat_sources.find_one({
+                "file_path": file_path,
+                "company_id": company_id,
+                "admin_id": admin_id
+            })
         
         if not source:
             raise HTTPException(status_code=403, detail="You don't have access to this source")
@@ -467,7 +582,7 @@ async def sync_sources(
     """
     Sync all active URL sources by re-extracting HTML and re-indexing.
     """
-    await check_teamlid_permission(admin_context, db, "roles_folders")
+    await check_teamlid_permission(admin_context, db, "webchat")
     
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -499,13 +614,17 @@ async def sync_sources(
                     async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                         await f.write(html_content)
                 
-                # Re-index to RAG - use same payload structure as document uploads
+                # Re-index into the WebChat index (must match file_id prefix used in /webchat/ask)
                 if file_path and os.path.exists(file_path):
+                    webchat_index_id = f"webchat-{company_id}-{admin_id}"
+                    display_title = source.get("title") or url
                     await rag_index_files(
                         user_id=admin_id,
                         file_paths=[file_path],
                         company_id=company_id,
-                        is_role_based=False
+                        is_role_based=False,
+                        index_id=webchat_index_id,
+                        file_metadata=[{"url": url, "title": display_title}],
                     )
                 
                 # Update source record

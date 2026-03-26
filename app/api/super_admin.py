@@ -530,3 +530,49 @@ async def delete_company_admin(
         "personal_documents_deleted": personal_docs_deleted,
         "files_deleted": removed_paths,
     }
+
+
+# -------------------------- Maintenance (Construction Page) --------------------------
+
+MAINTENANCE_DOC_ID = "maintenance_config"
+
+
+@super_admin_router.get("/maintenance-status")
+async def get_maintenance_status_super(
+    user=Depends(require_role("super_admin")),
+    db=Depends(get_db),
+):
+    """Get maintenance mode (super admin only). Same as public endpoint but requires auth."""
+    doc = await db.maintenance_config.find_one({"_id": MAINTENANCE_DOC_ID})
+    enabled = doc.get("enabled", False) if doc else False
+    return {"maintenance": bool(enabled)}
+
+
+@super_admin_router.post("/maintenance/activate")
+async def activate_maintenance(
+    user=Depends(require_role("super_admin")),
+    db=Depends(get_db),
+):
+    """Activate construction page for all non-super-admin users."""
+    await db.maintenance_config.update_one(
+        {"_id": MAINTENANCE_DOC_ID},
+        {"$set": {"enabled": True}},
+        upsert=True,
+    )
+    logger.info("Maintenance (construction page) activated by super admin")
+    return {"status": "activated", "maintenance": True}
+
+
+@super_admin_router.post("/maintenance/deactivate")
+async def deactivate_maintenance(
+    user=Depends(require_role("super_admin")),
+    db=Depends(get_db),
+):
+    """Deactivate construction page."""
+    await db.maintenance_config.update_one(
+        {"_id": MAINTENANCE_DOC_ID},
+        {"$set": {"enabled": False}},
+        upsert=True,
+    )
+    logger.info("Maintenance (construction page) deactivated by super admin")
+    return {"status": "deactivated", "maintenance": False}

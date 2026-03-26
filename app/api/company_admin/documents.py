@@ -206,10 +206,15 @@ async def upload_private_document(
 
         logger.info(f"File '{file.filename}' uploaded by {email} (user_id={user_id}, company_id={company_id})")
 
+        # For private documents (upload_type="document"), use user_id for index separation
+        # Private documents are personal to each user, not shared across admins
+        # Use documentchat-{company_id}-{user_id} format for private documents
+        index_id = f"documentchat-{company_id}-{user_id}"
+
         # Trigger RAG indexing
         try:
-            await rag_index_files(user_id, [file_path], company_id)
-            logger.info(f"RAG indexing triggered for '{file.filename}'")
+            await rag_index_files(user_id, [file_path], company_id, index_id=index_id)
+            logger.info(f"RAG indexing triggered for '{file.filename}' with index_id: {index_id}")
         except Exception as e:
             logger.error(f"RAG indexing failed for '{file.filename}': {e}")
 
@@ -232,23 +237,34 @@ async def upload_private_document(
 async def download_document(
     file_path: str = Query(..., description="Path to the document file"),
     user=Depends(get_current_user),
+    admin_context=Depends(get_admin_or_user_company_id),
     db=Depends(get_db)
 ):
     """
     Download/view a document file. Verifies the user has access to the document
-    before serving it.
+    before serving it. Supports company documents and public chat source files (docx, etc.).
     """
     email = user.get("email")
     if not email:
         raise HTTPException(status_code=401, detail="Email not found in token")
 
     repo = CompanyRepository(db)
-    
+
     user_data = await repo.get_all_user_documents(email)
     user_documents = user_data.get("documents", [])
-    
     document_found = any(doc.get("path") == file_path for doc in user_documents)
-    
+
+    # If not found, check public_chat_sources (for docx/files in public chat)
+    if not document_found and "public_chat" in file_path:
+        company_id = admin_context.get("company_id")
+        admin_id = admin_context.get("admin_id")
+        source = await db.public_chat_sources.find_one({
+            "file_path": file_path,
+            "company_id": company_id,
+            "admin_id": admin_id
+        })
+        document_found = source is not None
+
     if not document_found:
         raise HTTPException(status_code=403, detail="You don't have access to this document")
     

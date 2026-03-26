@@ -2,11 +2,14 @@ import os
 import httpx
 import asyncio
 import logging
+import json
 from typing import List
 
-RAG_INDEX_URL = "http://host.docker.internal:1416/davi_indexing/run"
-RAG_QUERY_URL = "http://host.docker.internal:1416/davi_query/run"
+# RAG_INDEX_URL = "http://host.docker.internal:1416/davi_indexing/run"
+# RAG_QUERY_URL = "http://host.docker.internal:1416/davi_query/run"
 
+RAG_INDEX_URL = "https://demo.daviapp.nl/rag/davi_indexing/run"
+RAG_QUERY_URL = "https://demo.daviapp.nl/rag/davi_query/run"
 
 logger = logging.getLogger("uvicorn")
 
@@ -14,7 +17,7 @@ logger = logging.getLogger("uvicorn")
 # ------------------------------------------------------------
 #  INTERNAL ASYNC HELPER
 # ------------------------------------------------------------
-async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id: str, is_role_based: bool = False, index_id: str = None):
+async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id: str, is_role_based: bool = False, index_id: str = None, file_metadata: List[dict] = None):
     """
     Internal async implementation for RAG indexing.
     Uses httpx.AsyncClient for non-blocking uploads.
@@ -26,6 +29,7 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
         is_role_based: If True, file_id format will be {company_id}-{user_id}--{filename}
                       If False, file_id format will be {user_id}--{filename}
         index_id: Optional custom index_id (e.g., for webchat). If None, uses company_id
+        file_metadata: Optional list of metadata dicts for each file (e.g., [{"url": "...", "title": "..."}])
     """
     files = []
     
@@ -35,9 +39,13 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
     # Generate file_ids based on document type
     # Private documents: {user_id}--{filename}
     # Role-based documents: {company_id}-{admin_id}--{filename}
-    # Publicchat: {index_id}--{filename} (when index_id starts with "publicchat")
-    if actual_index_id and actual_index_id.startswith("publicchat/"):
-        # For publicchat, use index_id as the file_id prefix
+    # Publicchat: {index_id}--{filename} (when index_id starts with "publicchat-")
+    # Documentchat: {index_id}--{filename} (when index_id starts with "documentchat-")
+    # Webchat: {index_id}--{filename} (when index_id starts with "webchat-")
+    if actual_index_id and (actual_index_id.startswith("publicchat-") or 
+                            actual_index_id.startswith("documentchat-") or 
+                            actual_index_id.startswith("webchat-")):
+        # For publicchat, documentchat, and webchat, use index_id as the file_id prefix
         file_ids = [f"{actual_index_id}--{os.path.basename(fp)}" for fp in file_paths]
     elif is_role_based:
         file_ids = [f"{company_id}-{user_id}--{os.path.basename(fp)}" for fp in file_paths]
@@ -49,6 +57,12 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
         "file_ids": file_ids,
         "original_file_paths": file_paths, 
     }
+    
+    # Add file metadata if provided
+    # RAG API expects 'files_meta_data' as a JSON-encoded string
+    # Format: JSON array of objects, e.g., [{"source_url": "...", "source_title": "..."}, ...]
+    if file_metadata and len(file_metadata) == len(file_paths):
+        data["files_meta_data"] = json.dumps(file_metadata)
 
     try:
         # Validate file_paths is a list
@@ -101,7 +115,7 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
 # ------------------------------------------------------------
 #  INTERNAL SYNC HELPER (NO EVENT LOOP)
 # ------------------------------------------------------------
-def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, is_role_based: bool = False, index_id: str = None):
+def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, is_role_based: bool = False, index_id: str = None, file_metadata: List[dict] = None):
     """
     Sync-safe RAG call.
     Runs in its own threadpool or standalone sync context.
@@ -113,6 +127,7 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, 
         is_role_based: If True, file_id format will be {company_id}-{user_id}--{filename}
                       If False, file_id format will be {user_id}--{filename}
         index_id: Optional custom index_id (e.g., for webchat). If None, uses company_id
+        file_metadata: Optional list of metadata dicts for each file (e.g., [{"url": "...", "title": "..."}])
     """
     files = []
     
@@ -122,9 +137,13 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, 
     # Generate file_ids based on document type
     # Private documents: {user_id}--{filename}
     # Role-based documents: {company_id}-{admin_id}--{filename}
-    # Publicchat: {index_id}--{filename} (when index_id starts with "publicchat")
-    if actual_index_id and actual_index_id.startswith("publicchat/"):
-        # For publicchat, use index_id as the file_id prefix
+    # Publicchat: {index_id}--{filename} (when index_id starts with "publicchat-")
+    # Documentchat: {index_id}--{filename} (when index_id starts with "documentchat-")
+    # Webchat: {index_id}--{filename} (when index_id starts with "webchat-")
+    if actual_index_id and (actual_index_id.startswith("publicchat-") or 
+                            actual_index_id.startswith("documentchat-") or 
+                            actual_index_id.startswith("webchat-")):
+        # For publicchat, documentchat, and webchat, use index_id as the file_id prefix
         file_ids = [f"{actual_index_id}--{os.path.basename(fp)}" for fp in file_paths]
     elif is_role_based:
         file_ids = [f"{company_id}-{user_id}--{os.path.basename(fp)}" for fp in file_paths]
@@ -136,6 +155,12 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, 
         "file_ids": file_ids,
         "original_file_paths": file_paths, 
     }
+    
+    # Add file metadata if provided
+    # RAG API expects 'files_meta_data' as a JSON-encoded string
+    # Format: JSON array of objects, e.g., [{"source_url": "...", "source_title": "..."}, ...]
+    if file_metadata and len(file_metadata) == len(file_paths):
+        data["files_meta_data"] = json.dumps(file_metadata)
 
     try:
         for file_path in file_paths:
@@ -167,7 +192,7 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, 
 # ------------------------------------------------------------
 #  PUBLIC ENTRY POINT
 # ------------------------------------------------------------
-async def rag_index_files(user_id: str, file_paths: List[str], company_id: str, is_role_based: bool = False, index_id: str = None):
+async def rag_index_files(user_id: str, file_paths: List[str], company_id: str, is_role_based: bool = False, index_id: str = None, file_metadata: List[dict] = None):
     """
     Public entry point — automatically detects async/sync context.
     Ensures no event loop conflict.
@@ -179,14 +204,15 @@ async def rag_index_files(user_id: str, file_paths: List[str], company_id: str, 
         is_role_based: If True, file_id format will be {company_id}-{user_id}--{filename}
                       If False, file_id format will be {user_id}--{filename}
         index_id: Optional custom index_id (e.g., for webchat). If None, uses company_id
+        file_metadata: Optional list of metadata dicts for each file (e.g., [{"url": "...", "title": "..."}])
     """
     try:
         loop = asyncio.get_running_loop()
         # If we're already inside an event loop, stay async
-        return await _async_rag_index_files(user_id, file_paths, company_id, is_role_based, index_id)
+        return await _async_rag_index_files(user_id, file_paths, company_id, is_role_based, index_id, file_metadata)
     except RuntimeError:
         # If called from sync context, use the sync fallback
-        return _sync_rag_index_files(user_id, file_paths, company_id, is_role_based, index_id)
+        return _sync_rag_index_files(user_id, file_paths, company_id, is_role_based, index_id, file_metadata)
 
 
 # ------------------------------------------------------------
