@@ -225,13 +225,14 @@ class CompanyRepository(BaseRepository):
         admin_id: str,
         name: str,
         email: str,
-        modules: dict = None
+        modules: dict = None,
+        assigner_modules: Optional[dict] = None,
     ):
         """Create a new company admin."""
         # Get company modules for filtering
         company_modules = await self._modules_repo.get_company_modules(company_id)
         return await self._admin_repo.create_admin(
-            company_id, admin_id, name, email, modules, company_modules
+            company_id, admin_id, name, email, modules, company_modules, assigner_modules
         )
     
     async def reassign_admin(self, company_id: str, admin_id: str, name: str, email: str):
@@ -242,11 +243,17 @@ class CompanyRepository(BaseRepository):
         """Delete an admin."""
         return await self._admin_repo.delete_admin(company_id, user_id, admin_id)
     
-    async def assign_modules(self, company_id: str, user_id: str, modules: dict):
+    async def assign_modules(
+        self,
+        company_id: str,
+        user_id: str,
+        modules: dict,
+        assigner_admin_modules: Optional[dict] = None,
+    ):
         """Assign module permissions to an admin."""
         company_modules = await self._modules_repo.get_company_modules(company_id)
         return await self._admin_repo.assign_modules(
-            company_id, user_id, modules, company_modules
+            company_id, user_id, modules, company_modules, assigner_admin_modules
         )
     
     async def find_admin_by_email(self, email: str):

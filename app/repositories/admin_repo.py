@@ -11,7 +11,7 @@ import copy
 import logging
 import uuid
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 from fastapi import HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -31,7 +31,8 @@ class AdminRepository(BaseRepository):
         name: str,
         email: str,
         modules: Optional[dict] = None,
-        company_modules: Optional[dict] = None
+        company_modules: Optional[dict] = None,
+        assigner_modules: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         Create a new company admin.
@@ -63,9 +64,9 @@ class AdminRepository(BaseRepository):
         if modules:
             for k, v in modules.items():
                 if k in admin_modules:
-                    # Only enable if company has this module enabled
                     company_has_module = company_modules.get(k, {}).get("enabled", False)
-                    if company_has_module:
+                    assigner_ok = assigner_modules is None or assigner_modules.get(k, {}).get("enabled", False)
+                    if company_has_module and assigner_ok:
                         admin_modules[k]["enabled"] = v.get("enabled", False)
                     else:
                         admin_modules[k]["enabled"] = False
@@ -178,7 +179,8 @@ class AdminRepository(BaseRepository):
         company_id: str,
         user_id: str,
         modules: dict,
-        company_modules: Optional[dict] = None
+        company_modules: Optional[dict] = None,
+        assigner_admin_modules: Optional[dict] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Assign module permissions to an admin.
@@ -188,6 +190,7 @@ class AdminRepository(BaseRepository):
             user_id: Admin user ID
             modules: Module permissions dictionary
             company_modules: Company-level module configuration (optional)
+            assigner_admin_modules: If set, cannot enable modules the assigner does not have
             
         Returns:
             Updated admin details or None if admin not found
@@ -197,6 +200,12 @@ class AdminRepository(BaseRepository):
             from app.repositories.modules_repo import ModulesRepository
             modules_repo = ModulesRepository(self.db)
             company_modules = await modules_repo.get_company_modules(company_id)
+
+        modules = dict(modules)
+        if assigner_admin_modules is not None:
+            for k in list(modules.keys()):
+                if modules[k].get("enabled") and not assigner_admin_modules.get(k, {}).get("enabled", False):
+                    modules[k] = {**modules[k], "enabled": False}
         
         admin = await self.admins.find_one({"company_id": company_id, "user_id": user_id})
         if not admin:

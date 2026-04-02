@@ -127,7 +127,11 @@ async def add_user(
             modules_dict = None
             if payload.modules:
                 modules_dict = {m.name: {"enabled": m.enabled, "desc": m.desc or ""} for m in payload.modules}
-            new_admin = await repo.add_admin(company_id, admin_id, name, payload.email, modules_dict)
+            assigning = await db.company_admins.find_one({"company_id": company_id, "user_id": admin_id})
+            assigner_mods = (assigning or {}).get("modules")
+            new_admin = await repo.add_admin(
+                company_id, admin_id, name, payload.email, modules_dict, assigner_modules=assigner_mods
+            )
             return {"status": "admin_created", "user": new_admin}
         else:
             new_user = await repo.add_user_by_admin(company_id, admin_id, payload.email, payload.company_role, payload.assigned_role)
@@ -418,7 +422,9 @@ async def assign_user_modules(
     if not admin_doc:
         raise HTTPException(status_code=404, detail="Admin not found or not in your company")
     modules_dict = {m.name: {"enabled": m.enabled, "desc": m.desc or ""} for m in payload.modules}
-    result = await repo.assign_modules(company_id, user_id, modules_dict)
+    assigning = await db.company_admins.find_one({"company_id": company_id, "user_id": admin_context["admin_id"]})
+    assigner_mods = (assigning or {}).get("modules")
+    result = await repo.assign_modules(company_id, user_id, modules_dict, assigner_admin_modules=assigner_mods)
     if not result:
         raise HTTPException(status_code=404, detail="Failed to update modules")
     return {"success": True, "user_id": user_id, "message": "Modules updated successfully"}

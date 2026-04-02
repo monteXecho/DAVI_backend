@@ -35,6 +35,30 @@ def _to_bool(value):  # noqa: N802
     return bool(value)
 
 
+def _assigner_has_module(module_name: str, assigner_modules: dict, company_modules: dict) -> bool:
+    if not company_modules.get(module_name, {}).get("enabled", False):
+        return False
+    return assigner_modules.get(module_name, {}).get("enabled", False) is True
+
+
+def _clamp_teamlid_permissions(
+    permissions: dict,
+    assigner_modules: dict,
+    company_modules: dict,
+) -> dict:
+    """Teamlid flags may only cover modules the assigning admin has (company + assigner scope)."""
+    out = dict(permissions or {})
+    # Documenten chat covers Rollen-mappen + Documenten only — not Gebruikers (matches company admin UI).
+    if not _assigner_has_module("Documenten chat", assigner_modules, company_modules):
+        out["role_folder_modify_permission"] = False
+        out["document_modify_permission"] = False
+    if not _assigner_has_module("PublicChat", assigner_modules, company_modules):
+        out["publicchat_modify_permission"] = False
+    if not _assigner_has_module("WebChat", assigner_modules, company_modules):
+        out["webchat_modify_permission"] = False
+    return out
+
+
 class UserRepository(BaseRepository):
     """Repository for user management operations."""
     
@@ -820,6 +844,14 @@ class UserRepository(BaseRepository):
         Returns:
             True if permissions were assigned, False otherwise
         """
+        from app.repositories.modules_repo import ModulesRepository
+
+        modules_repo = ModulesRepository(self.db)
+        company_modules = await modules_repo.get_company_modules(company_id)
+        assigner = await self.admins.find_one({"company_id": company_id, "user_id": admin_id})
+        assigner_modules = (assigner or {}).get("modules") or {}
+        permissions = _clamp_teamlid_permissions(permissions or {}, assigner_modules, company_modules)
+
         # Try to find user first
         user = await self.users.find_one({
             "company_id": company_id,

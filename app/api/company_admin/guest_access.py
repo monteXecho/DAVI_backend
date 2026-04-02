@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.deps.auth import get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
+from app.repositories.constants import serialize_modules
 from app.models.company_admin_schema import GuestAccessPayload, GuestWorkspaceOut
 from app.api.company_admin.shared import get_admin_company_id
 
@@ -143,6 +144,15 @@ async def get_guest_workspaces(
         })
 
         if owner_admin:
+            # Modules enabled for the workspace owner (by super admin). Teamlid sidebar must
+            # intersect with this list — not show every BEHEER item.
+            owner_mods_raw = owner_admin.get("modules") or {}
+            if isinstance(owner_mods_raw, dict):
+                owner_modules_out = serialize_modules(owner_mods_raw)
+            elif isinstance(owner_mods_raw, list):
+                owner_modules_out = owner_mods_raw
+            else:
+                owner_modules_out = []
             guest_ws = {
                 "ownerId": owner_id,
                 "owner": {
@@ -150,6 +160,7 @@ async def get_guest_workspaces(
                     "email": owner_admin.get("email", ""),
                 },
                 "label": f"WERKRUIMTE VAN {owner_admin.get('name', '').upper()}",
+                "owner_modules": owner_modules_out,
                 "permissions": {
                     "role_write": entry.get("can_role_write", False),
                     "user_write": entry.get("can_user_write", False),
