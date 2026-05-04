@@ -44,9 +44,20 @@ _DISCLAIMER_PATTERNS = re.compile(
     r"|de\s+vraag\s+kan\s+niet\s+beantwoord\s+worden"
     r"|geen\s+relevante\s+informatie\s+(?:beschikbaar|om\s+deze)"
     r"|er\s+is\s+(?:dus\s+)?geen\s+relevante\s+informatie"
+    r"|niet\s+relevant\s+met\s+betrekking\s+tot\s+de\s+aangeleverde\s+documenten"
+    r"|de\s+vraag\s+is\s+niet\s+relevant\s+met\s+betrekking\s+tot\s+de\s+aangeleverde\s+documenten"
+    r"|de\s+gevraagde\s+informatie\s+is\s+niet\s+aanwezig\s+in\s+de\s+aangeleverde\s+documenten"
+    r"|gevraagde\s+informatie\s+is\s+niet\s+aanwezig\s+in\s+de\s+aangeleverde\s+documenten"
+    r"|the\s+requested\s+information\s+is\s+not\s+(?:present|available)\s+in\s+the\s+(?:provided|given)\s+documents"
+    r"|wordt\s+niet\s+beantwoord\s+door\s+(?:enige|een)\s+van\s+de\s+aangeleverde\s+documenten"
+    r"|wordt\s+niet\s+beantwoord\s+door\s+[^.]{0,400}?\s+aangeleverde\s+documenten"
+    r"|er\s+is\s+geen\s+informatie\s+beschikbaar\s+over\s+[^\n.]{1,400}?\s+in\s+de\s+documenten"
+    r"|geen\s+informatie\s+over\s+[^\n.]{1,400}?\s+is\s+aanwezig\s+in\s+de\s+documenten"
     r"|the\s+provided\s+documents\s+do\s+not\s+contain"
     r"|cannot\s+be\s+answered\s+based\s+on\s+the\s+(?:provided|given)\s+documents"
     r"|no\s+information\s+(?:in|about|found\s+in)\s+the\s+(?:provided|given)\s+documents"
+    r"|the\s+question\s+is\s+not\s+relevant\s+(?:to|regarding)\s+the\s+(?:provided|given)\s+documents"
+    r"|no\s+information\s+about\s+[^\n.]{1,400}?\s+is\s+(?:present|available)\s+in\s+the\s+(?:provided|given)\s+documents"
     r")",
     re.IGNORECASE,
 )
@@ -94,6 +105,25 @@ def _looks_like_disclaimer_only(text: str) -> bool:
     if len(t) <= 700:
         return bool(_DISCLAIMER_PATTERNS.search(t))
     return bool(_DISCLAIMER_PATTERNS.search(head))
+
+
+def answer_is_documents_only_disclaimer(answer_text: Optional[str]) -> bool:
+    """True when the model replied with nl/en boilerplate that sources lack the requested info."""
+    return _looks_like_disclaimer_only(answer_text or "")
+
+
+def answer_matches_documents_no_information_disclaimer(answer_text: Optional[str]) -> bool:
+    """
+    True if answer text matches nl/en 'documents do not contain this information' wording.
+
+    Used for public-chat query history analytics. Unlike merge-time disclaimer detection,
+    this ignores citation markers ([1]): RAG often labels chunks while still concluding
+    the question cannot be answered from the docs.
+    """
+    t = (answer_text or "").strip()
+    if not t:
+        return True
+    return bool(_DISCLAIMER_PATTERNS.search(t))
 
 
 def select_segments_for_merge(segments: list[RagIndexSegment]) -> list[RagIndexSegment]:

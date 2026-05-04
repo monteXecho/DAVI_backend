@@ -28,6 +28,7 @@ from app.api.company_admin.shared import (
     check_teamlid_permission
 )
 from app.api.rag import rag_index_files
+from app.services.multi_index_answer_merge import answer_matches_documents_no_information_disclaimer
 from app.models.company_admin_schema import (
     PublicChatCreate,
     PublicChatUpdate,
@@ -342,6 +343,94 @@ async def get_public_chat(
         raise HTTPException(status_code=500, detail=f"Failed to get public chat: {str(e)}")
 
 
+@router.get("/public-chats/{chat_id}/query-history")
+async def get_public_chat_query_history(
+    chat_id: str,
+    admin_context=Depends(get_admin_or_user_company_id),
+    db=Depends(get_db),
+):
+    """
+    List stored public-chat questions for this chat, grouped into with_answer / without_answer.
+    Requires access to PublicChat module (read is enough for viewing history).
+    """
+    await check_teamlid_permission(admin_context, db, "publicchat", require_write=False)
+
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+
+    try:
+        chat = await db.public_chats.find_one({
+            "_id": ObjectId(chat_id),
+            "company_id": company_id,
+            "admin_id": admin_id,
+        })
+        if not chat:
+            raise HTTPException(status_code=404, detail="Public chat not found")
+
+        cursor = (
+            db.public_chat_query_history.find(
+                {"company_id": company_id, "admin_id": admin_id, "chat_id": chat_id}
+            )
+            .sort("created_at", -1)
+            .limit(500)
+        )
+        docs = await cursor.to_list(length=500)
+
+        def serialize(doc):
+            dt = doc.get("created_at")
+            return {
+                "id": str(doc["_id"]),
+                "question": doc.get("question", ""),
+                "answer": doc.get("answer"),
+                "has_answer": doc.get("has_answer", False),
+                "error_detail": doc.get("error_detail"),
+                "linked_source_count": doc.get("linked_source_count"),
+                "created_at": dt.isoformat() if hasattr(dt, "isoformat") else None,
+            }
+
+        with_answer = []
+        without_answer = []
+        for doc in docs:
+            item = serialize(doc)
+            lc = doc.get("linked_source_count")
+            downgrade_disclaimer = (
+                bool(doc.get("has_answer"))
+                and answer_matches_documents_no_information_disclaimer(doc.get("answer"))
+            )
+            # New rows persist linked_source_count; 0 means no UI sources (same as "zonder antwoord").
+            downgrade_no_linked = bool(doc.get("has_answer")) and lc is not None and int(lc) == 0
+            if downgrade_disclaimer or downgrade_no_linked:
+                item["has_answer"] = False
+                if not item.get("error_detail"):
+                    item["error_detail"] = (
+                        "Geen relevante informatie in de aangeleverde documenten"
+                        if downgrade_disclaimer
+                        else "Geen gekoppelde bron voor dit antwoord"
+                    )
+                without_answer.append(item)
+            elif doc.get("has_answer"):
+                with_answer.append(item)
+            else:
+                without_answer.append(item)
+
+        return {
+            "success": True,
+            "chat_id": chat_id,
+            "chat_name": chat.get("chat_name", ""),
+            "counts": {"with_answer": len(with_answer), "without_answer": len(without_answer)},
+            "with_answer": with_answer,
+            "without_answer": without_answer,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to load public chat query history")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load query history: {str(e)}",
+        )
+
+
 @router.put("/public-chats/{chat_id}")
 async def update_public_chat(
     chat_id: str,
@@ -474,6 +563,13 @@ async def delete_public_chat(
             "chat_id": chat_id
         })
         
+        # Delete stored query history for this chat
+        await db.public_chat_query_history.delete_many({
+            "company_id": company_id,
+            "admin_id": admin_id,
+            "chat_id": chat_id,
+        })
+
         # Delete chat
         await db.public_chats.delete_one({"_id": ObjectId(chat_id)})
         

@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import unquote
 from fastapi import APIRouter, HTTPException, Depends, Body
@@ -20,6 +21,9 @@ from pydantic import BaseModel
 from bson import ObjectId
 from app.deps.db import get_db
 from app.api.rag import rag_query
+from app.services.multi_index_answer_merge import (
+    answer_matches_documents_no_information_disclaimer,
+)
 from app.core.highlight_snippet_in_pdf import find_and_highlight
 from motor.motor_asyncio import AsyncIOMotorDatabase
 import hashlib
@@ -28,6 +32,60 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/public-chat", tags=["Public Chat"])
 
 security = HTTPBasic()
+
+
+def _answer_is_meaningful(answer_text: Optional[str]) -> bool:
+    """True if RAG returned a substantive answer for analytics (vs empty / placeholder)."""
+    if answer_text is None:
+        return False
+    s = str(answer_text).strip()
+    if not s:
+        return False
+    if s.lower() == "no answer generated":
+        return False
+    return True
+
+
+async def insert_public_chat_query_history(
+    db,
+    *,
+    company_id: str,
+    admin_id: str,
+    chat_id: str,
+    chat_name: str,
+    question: str,
+    has_answer: bool,
+    answer: Optional[str] = None,
+    error_detail: Optional[str] = None,
+    linked_source_count: int = 0,
+) -> None:
+    """Persist a public-chat question for company-admin history (analytics).
+
+    ``linked_source_count`` is len(filtered_sources) for successful RAG replies: sources
+    the public UI can show under the answer. Used to align history with user-visible
+    “met/zonder bron” behaviour.
+    """
+    try:
+        q = (question or "")[:20000]
+        ans = None if answer is None else str(answer)
+        if ans is not None and len(ans) > 50000:
+            ans = ans[:50000] + "\n…"
+        err = (error_detail[:2000] if error_detail else None)
+        doc = {
+            "company_id": company_id,
+            "admin_id": admin_id,
+            "chat_id": chat_id,
+            "chat_name": chat_name,
+            "question": q,
+            "answer": ans,
+            "has_answer": bool(has_answer),
+            "error_detail": err,
+            "linked_source_count": int(linked_source_count),
+            "created_at": datetime.now(timezone.utc),
+        }
+        await db.public_chat_query_history.insert_one(doc)
+    except Exception as e:
+        logger.warning("insert_public_chat_query_history failed: %s", e, exc_info=True)
 
 
 def prepare_highlighted_dir(output_dir: str):
@@ -277,6 +335,7 @@ async def query_public_chat(
     db=Depends(get_db)
 ):
     """Query a public chat. Requires password if chat is private."""
+    chat_id_str: Optional[str] = None
     try:
         # Find admin by email or user_id (company_admin can be either)
         admin = await db.company_admins.find_one({
@@ -300,6 +359,10 @@ async def query_public_chat(
         
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
+
+        chat_id_str = str(chat["_id"])
+        stored_chat_name = chat.get("chat_name", chat_name)
+        qtext = (request.question or "").strip()
         
         # Note: Password verification is handled by /verify-password endpoint
         # Once verified, users can query without sending password again
@@ -313,6 +376,17 @@ async def query_public_chat(
         }).to_list(length=None)
         
         if not sources:
+            await insert_public_chat_query_history(
+                db,
+                company_id=company_id,
+                admin_id=admin_id,
+                chat_id=chat_id_str,
+                chat_name=stored_chat_name,
+                question=qtext,
+                has_answer=False,
+                answer=None,
+                error_detail="No sources available for this chat",
+            )
             raise HTTPException(
                 status_code=400,
                 detail="No sources available for this chat"
@@ -333,6 +407,17 @@ async def query_public_chat(
                 file_names.append(file_name)
         
         if not file_ids:
+            await insert_public_chat_query_history(
+                db,
+                company_id=company_id,
+                admin_id=admin_id,
+                chat_id=chat_id_str,
+                chat_name=stored_chat_name,
+                question=qtext,
+                has_answer=False,
+                answer=None,
+                error_detail="No valid sources found for querying",
+            )
             raise HTTPException(
                 status_code=400,
                 detail="No valid sources found for querying"
@@ -364,6 +449,17 @@ async def query_public_chat(
                         continue
                     else:
                         logger.error(f"PublicChat index {index_id} not found after {max_retries} attempts")
+                        await insert_public_chat_query_history(
+                            db,
+                            company_id=company_id,
+                            admin_id=admin_id,
+                            chat_id=chat_id_str,
+                            chat_name=stored_chat_name,
+                            question=qtext,
+                            has_answer=False,
+                            answer=None,
+                            error_detail="Search index not ready for this chat",
+                        )
                         raise HTTPException(
                             status_code=503,
                             detail=(
@@ -375,6 +471,17 @@ async def query_public_chat(
                     raise  # Re-raise if it's a different error
         
         if not rag_result:
+            await insert_public_chat_query_history(
+                db,
+                company_id=company_id,
+                admin_id=admin_id,
+                chat_id=chat_id_str,
+                chat_name=stored_chat_name,
+                question=qtext,
+                has_answer=False,
+                answer=None,
+                error_detail="Public chat query service is not available",
+            )
             raise HTTPException(
                 status_code=503,
                 detail="Public chat query service is not available."
@@ -488,6 +595,36 @@ async def query_public_chat(
             await run_in_threadpool(prepare_highlighted_dir, output_dir)
             await run_in_threadpool(highlight_public_chat_documents, normalized_docs, output_dir, sources)
             
+            linked_source_count = len(filtered_sources)
+            shown_sources = linked_source_count > 0
+            has_meaningful = _answer_is_meaningful(answer_text)
+            no_info_reply = answer_matches_documents_no_information_disclaimer(answer_text)
+            # Match admin UX: "met antwoord" only when the public UI would list linked sources.
+            has_ans = has_meaningful and shown_sources and not no_info_reply
+            if has_ans:
+                err_detail = None
+            elif no_info_reply:
+                err_detail = "Geen relevante informatie in de aangeleverde documenten"
+            elif not shown_sources:
+                err_detail = "Geen gekoppelde bron voor dit antwoord"
+            elif not has_meaningful:
+                err_detail = "Geen inhoudelijk antwoord gegenereerd"
+            else:
+                err_detail = "Geen inhoudelijk antwoord gegenereerd"
+
+            await insert_public_chat_query_history(
+                db,
+                company_id=company_id,
+                admin_id=admin_id,
+                chat_id=chat_id_str,
+                chat_name=stored_chat_name,
+                question=qtext,
+                has_answer=has_ans,
+                answer=answer_text,
+                error_detail=err_detail,
+                linked_source_count=linked_source_count,
+            )
+            
             return {
                 "success": True,
                 "answer": answer_text,  # Use parsed answer_text
@@ -496,6 +633,17 @@ async def query_public_chat(
             }
         except Exception as rag_error:
             logger.error(f"RAG query failed: {rag_error}")
+            await insert_public_chat_query_history(
+                db,
+                company_id=company_id,
+                admin_id=admin_id,
+                chat_id=chat_id_str,
+                chat_name=stored_chat_name,
+                question=qtext,
+                has_answer=False,
+                answer=None,
+                error_detail=f"Failed to generate answer: {str(rag_error)}"[:2000],
+            )
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to generate answer: {str(rag_error)}"
