@@ -21,9 +21,7 @@ from pydantic import BaseModel
 from bson import ObjectId
 from app.deps.db import get_db
 from app.api.rag import rag_query
-from app.services.multi_index_answer_merge import (
-    answer_matches_documents_no_information_disclaimer,
-)
+from app.services.multi_index_answer_merge import answer_matches_documents_no_information_disclaimer
 from app.core.highlight_snippet_in_pdf import find_and_highlight
 from motor.motor_asyncio import AsyncIOMotorDatabase
 import hashlib
@@ -35,7 +33,7 @@ security = HTTPBasic()
 
 
 def _answer_is_meaningful(answer_text: Optional[str]) -> bool:
-    """True if RAG returned a substantive answer for analytics (vs empty / placeholder)."""
+    """True if RAG returned a non-empty answer (vs placeholder)."""
     if answer_text is None:
         return False
     s = str(answer_text).strip()
@@ -59,12 +57,7 @@ async def insert_public_chat_query_history(
     error_detail: Optional[str] = None,
     linked_source_count: int = 0,
 ) -> None:
-    """Persist a public-chat question for company-admin history (analytics).
-
-    ``linked_source_count`` is len(filtered_sources) for successful RAG replies: sources
-    the public UI can show under the answer. Used to align history with user-visible
-    “met/zonder bron” behaviour.
-    """
+    """Persist a public-chat question for company-admin history."""
     try:
         q = (question or "")[:20000]
         ans = None if answer is None else str(answer)
@@ -335,7 +328,6 @@ async def query_public_chat(
     db=Depends(get_db)
 ):
     """Query a public chat. Requires password if chat is private."""
-    chat_id_str: Optional[str] = None
     try:
         # Find admin by email or user_id (company_admin can be either)
         admin = await db.company_admins.find_one({
@@ -363,7 +355,7 @@ async def query_public_chat(
         chat_id_str = str(chat["_id"])
         stored_chat_name = chat.get("chat_name", chat_name)
         qtext = (request.question or "").strip()
-        
+
         # Note: Password verification is handled by /verify-password endpoint
         # Once verified, users can query without sending password again
         
@@ -594,12 +586,11 @@ async def query_public_chat(
             output_dir = os.path.join("output", "highlighted")
             await run_in_threadpool(prepare_highlighted_dir, output_dir)
             await run_in_threadpool(highlight_public_chat_documents, normalized_docs, output_dir, sources)
-            
+
             linked_source_count = len(filtered_sources)
             shown_sources = linked_source_count > 0
             has_meaningful = _answer_is_meaningful(answer_text)
             no_info_reply = answer_matches_documents_no_information_disclaimer(answer_text)
-            # Match admin UX: "met antwoord" only when the public UI would list linked sources.
             has_ans = has_meaningful and shown_sources and not no_info_reply
             if has_ans:
                 err_detail = None
@@ -624,7 +615,7 @@ async def query_public_chat(
                 error_detail=err_detail,
                 linked_source_count=linked_source_count,
             )
-            
+
             return {
                 "success": True,
                 "answer": answer_text,  # Use parsed answer_text

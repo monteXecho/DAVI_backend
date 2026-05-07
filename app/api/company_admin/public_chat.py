@@ -351,7 +351,7 @@ async def get_public_chat_query_history(
 ):
     """
     List stored public-chat questions for this chat, grouped into with_answer / without_answer.
-    Requires access to PublicChat module (read is enough for viewing history).
+    Read access is enough (same module visibility as viewing chats).
     """
     await check_teamlid_permission(admin_context, db, "publicchat", require_write=False)
 
@@ -397,7 +397,6 @@ async def get_public_chat_query_history(
                 bool(doc.get("has_answer"))
                 and answer_matches_documents_no_information_disclaimer(doc.get("answer"))
             )
-            # New rows persist linked_source_count; 0 means no UI sources (same as "zonder antwoord").
             downgrade_no_linked = bool(doc.get("has_answer")) and lc is not None and int(lc) == 0
             if downgrade_disclaimer or downgrade_no_linked:
                 item["has_answer"] = False
@@ -555,6 +554,12 @@ async def delete_public_chat(
             raise HTTPException(status_code=404, detail="Public chat not found")
         
         chat_name = chat.get("chat_name")
+
+        await db.public_chat_query_history.delete_many({
+            "company_id": company_id,
+            "admin_id": admin_id,
+            "chat_id": chat_id,
+        })
         
         # Delete all sources for this chat
         await db.public_chat_sources.delete_many({
@@ -563,13 +568,6 @@ async def delete_public_chat(
             "chat_id": chat_id
         })
         
-        # Delete stored query history for this chat
-        await db.public_chat_query_history.delete_many({
-            "company_id": company_id,
-            "admin_id": admin_id,
-            "chat_id": chat_id,
-        })
-
         # Delete chat
         await db.public_chats.delete_one({"_id": ObjectId(chat_id)})
         
