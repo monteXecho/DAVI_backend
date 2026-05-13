@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from bson import ObjectId
 from app.deps.db import get_db
 from app.api.rag import rag_query
+from app.api.company_admin.public_chat import get_public_chat_index_id
 from app.services.multi_index_answer_merge import answer_matches_documents_no_information_disclaimer
 from app.core.highlight_snippet_in_pdf import find_and_highlight
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -106,30 +107,34 @@ def highlight_public_chat_documents(documents, output_dir: str, sources: list):
         output_dir: Directory to save highlighted PDFs
         sources: List of public chat sources with file_path info
     """
-    # Create a map of file_name -> file_path for quick lookup
-    source_map = {s.get("file_name"): s.get("file_path", "") for s in sources}
-    
     for doc in documents:
         snippet = doc["content"]
         meta = doc["meta"]
         file_id = meta.get("file_id", "")
         file_name = meta.get("file_name", "")
         
-        # Extract filename from file_id if it follows the pattern: {index_id}--{filename}
         file_id_filename = None
         if file_id and "--" in file_id:
             file_id_filename = file_id.split("--", 1)[1]
         
-        # Find the source file path
         abs_input_path = None
         
-        # Try to match by file_name or file_id_filename
-        for source_file_name, source_file_path in source_map.items():
-            if source_file_name == file_name or (file_id_filename and source_file_name == file_id_filename):
-                if source_file_path and os.path.exists(source_file_path):
-                    abs_input_path = source_file_path
-                    logger.info(f"Found source file path: {abs_input_path}")
-                    break
+        for s in sources:
+            source_file_name = s.get("file_name", "")
+            source_rag_logical = (s.get("rag_logical_file_name") or "").strip()
+            source_file_path = s.get("file_path", "")
+            if (
+                source_file_path
+                and os.path.exists(source_file_path)
+                and (
+                    source_file_name == file_name
+                    or (file_id_filename and source_file_name == file_id_filename)
+                    or (file_id_filename and source_rag_logical and source_rag_logical == file_id_filename)
+                )
+            ):
+                abs_input_path = source_file_path
+                logger.info(f"Found source file path: {abs_input_path}")
+                break
         
         # Fallback: try original_file_path or file_path from meta
         if not abs_input_path:
@@ -384,19 +389,23 @@ async def query_public_chat(
                 detail="No sources available for this chat"
             )
         
-        # Build file_ids for RAG query
-        # Use hyphens instead of slashes to comply with Elasticsearch index name restrictions
-        index_id = f"publicchat-{company_id}-{admin_id}-{chat_name}"
+        # Build file_ids for RAG query (must match admin indexing; ES: index names lowercase)
+        index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
         file_ids = []
         file_names = []
+        seen_ids = set()
         
         for source in sources:
-            file_name = source.get("file_name", "")
-            if file_name:
-                # Format: publicchat-{company_id}-{admin_id}-{chat_name}--{filename}
-                file_id = f"{index_id}--{file_name}"
+            disk_name = source.get("file_name", "")
+            logical = (source.get("rag_logical_file_name") or "").strip() or disk_name
+            if logical:
+                file_id = f"{index_id}--{logical}"
+                if file_id in seen_ids:
+                    continue
+                seen_ids.add(file_id)
                 file_ids.append(file_id)
-                file_names.append(file_name)
+                if disk_name:
+                    file_names.append(disk_name)
         
         if not file_ids:
             await insert_public_chat_query_history(
@@ -515,8 +524,15 @@ async def query_public_chat(
                 # Try to match source by file_id filename or file_name
                 for s in sources:
                     source_file_name = s.get("file_name", "")
+                    source_rag_logical = (s.get("rag_logical_file_name") or "").strip()
                     # Match by exact file_name or by filename extracted from file_id
-                    if source_file_name == file_name or (file_id_filename and source_file_name == file_id_filename):
+                    if source_file_name == file_name or (
+                        file_id_filename
+                        and (
+                            source_file_name == file_id_filename
+                            or source_rag_logical == file_id_filename
+                        )
+                    ):
                         source_info = s
                         break
                 
@@ -555,16 +571,20 @@ async def query_public_chat(
             filtered_sources = []
             for s in sources:
                 source_file_name = s.get("file_name", "")
+                source_rag_logical = (s.get("rag_logical_file_name") or "").strip()
                 # Check if this source matches any used file_id
                 matches = False
-                for file_id in used_file_ids:
-                    if "--" in file_id:
-                        file_id_filename = file_id.split("--", 1)[1]
-                        if source_file_name == file_id_filename:
+                for uid in used_file_ids:
+                    if "--" in uid:
+                        file_id_filename = uid.split("--", 1)[1]
+                        if (
+                            source_file_name == file_id_filename
+                            or source_rag_logical == file_id_filename
+                        ):
                             matches = True
                             break
                     # Also check direct file_name match
-                    if source_file_name == file_id:
+                    if source_file_name == uid:
                         matches = True
                         break
                 

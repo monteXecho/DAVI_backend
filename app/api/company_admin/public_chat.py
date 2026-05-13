@@ -14,7 +14,9 @@ Handles all public chat-related endpoints:
 
 import logging
 import os
+import re
 import asyncio
+import hashlib
 import httpx
 import aiofiles
 from datetime import datetime, timedelta, timezone
@@ -28,6 +30,7 @@ from app.api.company_admin.shared import (
     check_teamlid_permission
 )
 from app.api.rag import rag_index_files
+from app.utils.html_clean_for_rag import clean_html_for_rag_indexing
 from app.services.multi_index_answer_merge import answer_matches_documents_no_information_disclaimer
 from app.models.company_admin_schema import (
     PublicChatCreate,
@@ -37,6 +40,8 @@ from app.models.company_admin_schema import (
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 logger = logging.getLogger(__name__)
+# Docker/uvicorn often attach handlers only to "uvicorn"; use this for ops-visible INFO lines.
+_uvicorn_log = logging.getLogger("uvicorn")
 router = APIRouter()
 
 UPLOAD_ROOT = "/app/uploads"
@@ -193,13 +198,84 @@ async def extract_html_from_url(url: str) -> str:
     raise HTTPException(status_code=500, detail="Failed to fetch URL after all retry attempts")
 
 
+def _file_name_for_public_chat_url(url: str) -> str:
+    """
+    Stable filename unique per URL for storage and RAG file_id.
+
+    Using only `{domain}.html` makes every page on the same host share one file_id
+    (e.g. multiple wetten.overheid.nl laws). Re-indexing then hits OpenSearch
+    version_conflict_engine_exception because chunk document ids collide with existing rows.
+    """
+    from urllib.parse import urlparse
+
+    u = (url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        u = f"https://{u}"
+
+    parsed = urlparse(u)
+    host = (parsed.netloc or "source").replace("www.", "")
+    path = (parsed.path or "").strip("/").replace("/", "_")
+    qs = parsed.query.replace("&", "_").replace("=", "_").replace("?", "_")
+    parts = [p for p in (host, path, qs) if p]
+    base = "_".join(parts) if parts else host
+    url_safe = base
+    max_len = 220
+    if len(url_safe) > max_len:
+        digest = hashlib.sha256(u.encode("utf-8")).hexdigest()[:16]
+        url_safe = f"{digest}_{url_safe[: max_len - len(digest) - 1]}"
+    # Windows-safe-ish; Mongo paths are POSIX in containers
+    for c in ':\\*?"<>|\n\r':
+        url_safe = url_safe.replace(c, "_")
+    return f"{url_safe}.html"
+
+
+_OPENSEARCH_INDEX_NAME_CHARS = "\\/*?\"<>|, "
+_PUBLIC_CHAT_INDEX_CHAT_TRANS = str.maketrans(_OPENSEARCH_INDEX_NAME_CHARS, "-" * len(_OPENSEARCH_INDEX_NAME_CHARS))
+
+
+def _sanitize_chat_name_for_index_id(chat_name: str) -> str:
+    """OpenSearch rejects index names containing spaces, commas, quotes, slashes, etc."""
+    raw = (chat_name or "").strip().lower()
+    if not raw:
+        return "chat"
+    cleaned = raw.translate(_PUBLIC_CHAT_INDEX_CHAT_TRANS)
+    cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+    return cleaned or "chat"
+
+
 def get_public_chat_index_id(company_id: str, admin_id: str, chat_name: str) -> str:
     """Generate index_id for public chat RAG indexing.
-    
-    Uses hyphens instead of slashes to comply with Elasticsearch index name restrictions.
-    Format: publicchat-{company_id}-{admin_id}-{chat_name}
+
+    OpenSearch/Elasticsearch: index names must be lowercase and must not contain
+    ``\", /, *, ?, <, >, |, comma, space`` (and related). Display names like
+    ``test public`` or ``Wetboek`` are normalized for the index segment only.
+    Format: publicchat-{company_id}-{admin_id}-{sanitized_chat_name}
     """
-    return f"publicchat-{company_id}-{admin_id}-{chat_name}"
+    safe_chat = _sanitize_chat_name_for_index_id(chat_name)
+    return f"publicchat-{company_id}-{admin_id}-{safe_chat}".lower()
+
+
+def _public_chat_rag_version_stamp_utc() -> str:
+    """
+    UTC stamp appended to the RAG logical filename so each re-index avoids OpenSearch
+    ``version_conflict_engine_exception`` without a delete endpoint.
+    Format: YYYYMMDDHHMMSS (example: 20260513143732).
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+def _versioned_rag_logical_file_name(disk_basename: str, stamp: str) -> str:
+    """
+    Logical tail for ``file_id`` … ``--{this}`` while the file on disk stays ``disk_basename``.
+    Example: ``report.html`` + stamp ``20260513143732`` → ``report_20260513143732.html``.
+    """
+    base = (disk_basename or "").strip() or "source"
+    st = (stamp or "").strip()
+    root, ext = os.path.splitext(base)
+    if not root:
+        root = base
+        ext = ""
+    return f"{root}_{st}{ext}" if st else base
 
 
 @router.get("/public-chats")
@@ -610,22 +686,27 @@ async def add_url_source_to_chat(
         
         chat_name = chat.get("chat_name")
         
-        # Extract HTML from URL
+        # Extract HTML from URL and strip noisy markup so RAG chunks resemble PDF-ish text density
         html_content = await extract_html_from_url(url)
+        html_content = clean_html_for_rag_indexing(html_content, page_url=url, plain_text_only=True)
         
         # Save HTML file
         save_dir = os.path.join(SOURCES_DIR, company_id, admin_id, "public_chat", chat_id)
         os.makedirs(save_dir, exist_ok=True)
         
-        # Generate filename from URL
-        from urllib.parse import urlparse
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc.replace("www.", "")
-        file_name = f"{domain}.html"
+        # Unique per full URL (same host, different paths must not share one file_id)
+        file_name = _file_name_for_public_chat_url(url)
         file_path = os.path.join(save_dir, file_name)
         
         async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
             await f.write(html_content)
+
+        _uvicorn_log.info(
+            "Saved cleaned plain HTML for URL source (%s chars): %s -> %s",
+            len(html_content),
+            url,
+            file_path,
+        )
         
         # Create source record
         now_utc = datetime.utcnow()
@@ -645,11 +726,14 @@ async def add_url_source_to_chat(
         }
         
         result = await db.public_chat_sources.insert_one(source_doc)
-        source_id = str(result.inserted_id)
+        source_oid = result.inserted_id
+        source_id = str(source_oid)
         
         # Index to RAG with publicchat index and metadata
-        # For publicchat, file_id format should be: {index_id}--{filename}
+        # For publicchat, file_id format should be: {index_id}--{logical_name}
         index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
+        stamp = _public_chat_rag_version_stamp_utc()
+        rag_logical = _versioned_rag_logical_file_name(file_name, stamp)
         file_metadata = [{
             "url": url,
             "title": source_doc.get("title", url)  # Use title if available, otherwise use URL
@@ -661,7 +745,17 @@ async def add_url_source_to_chat(
                 company_id=company_id,
                 is_role_based=False,
                 index_id=index_id,
-                file_metadata=file_metadata
+                file_metadata=file_metadata,
+                rag_file_logical_names=[rag_logical],
+            )
+            await db.public_chat_sources.update_one(
+                {"_id": source_oid},
+                {
+                    "$set": {
+                        "rag_logical_file_name": rag_logical,
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
             )
             logger.info(f"Successfully indexed URL source for public chat: {url}")
         except Exception as e:
@@ -671,7 +765,7 @@ async def add_url_source_to_chat(
         return {
             "success": True,
             "source_id": source_id,
-            "message": "URL source added and indexed successfully"
+            "message": "URL source added and indexed successfully",
         }
     except HTTPException:
         raise
@@ -741,10 +835,13 @@ async def add_html_source_to_chat(
         }
         
         result = await db.public_chat_sources.insert_one(source_doc)
-        source_id = str(result.inserted_id)
+        source_oid = result.inserted_id
+        source_id = str(source_oid)
         
         # Index to RAG with publicchat index and metadata
         index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
+        stamp = _public_chat_rag_version_stamp_utc()
+        rag_logical = _versioned_rag_logical_file_name(file_name, stamp)
         file_metadata = [{
             "url": source_doc.get("url"),  # May be None for HTML files
             "title": source_doc.get("title", file_name)  # Use title if available, otherwise use file_name
@@ -756,7 +853,12 @@ async def add_html_source_to_chat(
                 company_id=company_id,
                 is_role_based=False,
                 index_id=index_id,
-                file_metadata=file_metadata
+                file_metadata=file_metadata,
+                rag_file_logical_names=[rag_logical],
+            )
+            await db.public_chat_sources.update_one(
+                {"_id": source_oid},
+                {"$set": {"rag_logical_file_name": rag_logical, "updated_at": datetime.utcnow()}},
             )
             logger.info(f"Successfully indexed HTML source for public chat: {file_name}")
         except Exception as e:
@@ -832,11 +934,13 @@ async def add_file_source_to_chat(
         }
         
         result = await db.public_chat_sources.insert_one(source_doc)
-        source_id = str(result.inserted_id)
+        source_oid = result.inserted_id
+        source_id = str(source_oid)
         
         # Index to RAG with publicchat index
-        # For file sources, metadata is optional (usually None for PDFs/documents)
         index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
+        stamp = _public_chat_rag_version_stamp_utc()
+        rag_logical = _versioned_rag_logical_file_name(file_name, stamp)
         file_metadata = [{
             "url": None,  # File sources don't have URLs
             "title": source_doc.get("title", file_name)  # Use title if available, otherwise use file_name
@@ -848,7 +952,12 @@ async def add_file_source_to_chat(
                 company_id=company_id,
                 is_role_based=False,
                 index_id=index_id,
-                file_metadata=file_metadata
+                file_metadata=file_metadata,
+                rag_file_logical_names=[rag_logical],
+            )
+            await db.public_chat_sources.update_one(
+                {"_id": source_oid},
+                {"$set": {"rag_logical_file_name": rag_logical, "updated_at": datetime.utcnow()}},
             )
             logger.info(f"Successfully indexed file source for public chat: {file_name}")
         except Exception as e:
@@ -1000,17 +1109,27 @@ async def sync_all_chat_url_sources(
 
             for source in url_sources:
                 try:
+                    rag_logical = None
                     url = source.get("url")
                     if not url:
                         continue
 
                     html_content = await extract_html_from_url(url)
+                    html_content = clean_html_for_rag_indexing(html_content, page_url=url, plain_text_only=True)
                     file_path = source.get("file_path")
                     if file_path:
                         async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                             await f.write(html_content)
+                        _uvicorn_log.info(
+                            "Saved cleaned plain HTML for URL sync (%s chars): %s -> %s",
+                            len(html_content),
+                            url,
+                            file_path,
+                        )
 
                     if file_path and os.path.exists(file_path):
+                        stamp = _public_chat_rag_version_stamp_utc()
+                        rag_logical = _versioned_rag_logical_file_name(os.path.basename(file_path), stamp)
                         await rag_index_files(
                             user_id=admin_id,
                             file_paths=[file_path],
@@ -1018,6 +1137,7 @@ async def sync_all_chat_url_sources(
                             is_role_based=False,
                             index_id=index_id,
                             file_metadata=[{"url": url, "title": source.get("title", url)}],
+                            rag_file_logical_names=[rag_logical],
                         )
 
                     now_utc = datetime.utcnow()
@@ -1027,6 +1147,7 @@ async def sync_all_chat_url_sources(
                             "$set": {
                                 "last_updated": now_utc,
                                 "updated_at": now_utc,
+                                **({"rag_logical_file_name": rag_logical} if rag_logical is not None else {}),
                             }
                         },
                     )
@@ -1098,17 +1219,27 @@ async def sync_chat_url_sources(
 
         for source in url_sources:
             try:
+                rag_logical = None
                 url = source.get("url")
                 if not url:
                     continue
 
                 html_content = await extract_html_from_url(url)
+                html_content = clean_html_for_rag_indexing(html_content, page_url=url, plain_text_only=True)
                 file_path = source.get("file_path")
                 if file_path:
                     async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                         await f.write(html_content)
+                    _uvicorn_log.info(
+                        "Saved cleaned plain HTML for URL sync (%s chars): %s -> %s",
+                        len(html_content),
+                        url,
+                        file_path,
+                    )
 
                 if file_path and os.path.exists(file_path):
+                    stamp = _public_chat_rag_version_stamp_utc()
+                    rag_logical = _versioned_rag_logical_file_name(os.path.basename(file_path), stamp)
                     await rag_index_files(
                         user_id=admin_id,
                         file_paths=[file_path],
@@ -1116,6 +1247,7 @@ async def sync_chat_url_sources(
                         is_role_based=False,
                         index_id=index_id,
                         file_metadata=[{"url": url, "title": source.get("title", url)}],
+                        rag_file_logical_names=[rag_logical],
                     )
 
                 now_utc = datetime.utcnow()
@@ -1125,6 +1257,7 @@ async def sync_chat_url_sources(
                         "$set": {
                             "last_updated": now_utc,
                             "updated_at": now_utc,
+                            **({"rag_logical_file_name": rag_logical} if rag_logical is not None else {}),
                         }
                     },
                 )

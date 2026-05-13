@@ -3,7 +3,7 @@ import httpx
 import asyncio
 import logging
 import json
-from typing import List
+from typing import List, Optional
 
 # RAG_INDEX_URL = "http://host.docker.internal:1416/davi_indexing/run"
 # RAG_QUERY_URL = "http://host.docker.internal:1416/davi_query/run"
@@ -14,10 +14,94 @@ RAG_QUERY_URL = "https://demo.daviapp.nl/rag/davi_query/run"
 logger = logging.getLogger("uvicorn")
 
 
+def _is_custom_chat_index(actual_index_id: str) -> bool:
+    return bool(
+        actual_index_id
+        and (
+            actual_index_id.startswith("publicchat-")
+            or actual_index_id.startswith("documentchat-")
+            or actual_index_id.startswith("webchat-")
+        )
+    )
+
+
+def build_rag_file_ids(
+    *,
+    actual_index_id: str,
+    file_paths: List[str],
+    user_id: str,
+    company_id: str,
+    is_role_based: bool,
+    rag_file_logical_names: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Build per-file ``file_ids`` passed to the RAG indexer.
+
+    For ``publicchat-`` / ``documentchat-`` / ``webchat-`` indexes, optional
+    ``rag_file_logical_names`` overrides the basename (e.g. add a UTC stamp) so each
+    re-index uses new OpenSearch document ids without a delete API on the RAG side.
+    """
+    if rag_file_logical_names is not None:
+        if len(rag_file_logical_names) != len(file_paths):
+            raise ValueError(
+                f"rag_file_logical_names ({len(rag_file_logical_names)}) must match "
+                f"file_paths ({len(file_paths)})"
+            )
+        for ln in rag_file_logical_names:
+            if not ln or not str(ln).strip():
+                raise ValueError("rag_file_logical_names entries must be non-empty strings")
+            ln_s = str(ln).strip()
+            if os.path.sep in ln_s:
+                raise ValueError("rag_file_logical_names must not contain path separators")
+            if os.altsep and os.altsep in ln_s:
+                raise ValueError("rag_file_logical_names must not contain alt path separators")
+    use_custom = _is_custom_chat_index(actual_index_id)
+    if use_custom:
+        if rag_file_logical_names is not None:
+            return [f"{actual_index_id}--{str(ln).strip()}" for ln in rag_file_logical_names]
+        return [f"{actual_index_id}--{os.path.basename(fp)}" for fp in file_paths]
+
+    if rag_file_logical_names is not None:
+        raise ValueError(
+            "rag_file_logical_names is only supported when index_id is "
+            "publicchat-*, documentchat-*, or webchat-*"
+        )
+    if is_role_based:
+        return [f"{company_id}-{user_id}--{os.path.basename(fp)}" for fp in file_paths]
+    return [f"{user_id}--{os.path.basename(fp)}" for fp in file_paths]
+
+
+def _check_rag_index_response_payload(result) -> None:
+    """RAG sometimes returns HTTP 200 with an error string inside ``result.message``."""
+    if not isinstance(result, dict):
+        return
+    result_data = result.get("result", {})
+    if not isinstance(result_data, dict):
+        return
+    message = result_data.get("message", "")
+    if message and (
+        "Error" in message
+        or "error" in message.lower()
+        or "failed" in message.lower()
+        or "Failed" in message
+    ):
+        error_detail = result_data.get("error", message)
+        logger.error(f"RAG indexing error detected: {error_detail}")
+        raise RuntimeError(f"RAG indexing failed: {error_detail}")
+
+
 # ------------------------------------------------------------
 #  INTERNAL ASYNC HELPER
 # ------------------------------------------------------------
-async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id: str, is_role_based: bool = False, index_id: str = None, file_metadata: List[dict] = None):
+async def _async_rag_index_files(
+    user_id: str,
+    file_paths: List[str],
+    company_id: str,
+    is_role_based: bool = False,
+    index_id: str = None,
+    file_metadata: List[dict] = None,
+    rag_file_logical_names: Optional[List[str]] = None,
+):
     """
     Internal async implementation for RAG indexing.
     Uses httpx.AsyncClient for non-blocking uploads.
@@ -30,27 +114,22 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
                       If False, file_id format will be {user_id}--{filename}
         index_id: Optional custom index_id (e.g., for webchat). If None, uses company_id
         file_metadata: Optional list of metadata dicts for each file (e.g., [{"url": "...", "title": "..."}])
+        rag_file_logical_names: Optional per-file logical names for publicchat/documentchat/webchat
+                                (suffix after ``--`` in file_id), aligned with ``file_paths``.
     """
     files = []
     
     # Use custom index_id if provided, otherwise use company_id
     actual_index_id = index_id if index_id else company_id
     
-    # Generate file_ids based on document type
-    # Private documents: {user_id}--{filename}
-    # Role-based documents: {company_id}-{admin_id}--{filename}
-    # Publicchat: {index_id}--{filename} (when index_id starts with "publicchat-")
-    # Documentchat: {index_id}--{filename} (when index_id starts with "documentchat-")
-    # Webchat: {index_id}--{filename} (when index_id starts with "webchat-")
-    if actual_index_id and (actual_index_id.startswith("publicchat-") or 
-                            actual_index_id.startswith("documentchat-") or 
-                            actual_index_id.startswith("webchat-")):
-        # For publicchat, documentchat, and webchat, use index_id as the file_id prefix
-        file_ids = [f"{actual_index_id}--{os.path.basename(fp)}" for fp in file_paths]
-    elif is_role_based:
-        file_ids = [f"{company_id}-{user_id}--{os.path.basename(fp)}" for fp in file_paths]
-    else:
-        file_ids = [f"{user_id}--{os.path.basename(fp)}" for fp in file_paths]
+    file_ids = build_rag_file_ids(
+        actual_index_id=actual_index_id,
+        file_paths=file_paths,
+        user_id=user_id,
+        company_id=company_id,
+        is_role_based=is_role_based,
+        rag_file_logical_names=rag_file_logical_names,
+    )
     
     data = {
         "index_id": actual_index_id,
@@ -90,18 +169,8 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
 
             response.raise_for_status()
             result = response.json()
-            
-            # Check if RAG service returned an error in the result (even with 200 status)
-            if isinstance(result, dict):
-                result_data = result.get("result", {})
-                if isinstance(result_data, dict):
-                    message = result_data.get("message", "")
-                    # Check for error indicators in the message
-                    if message and ("Error" in message or "error" in message.lower() or "failed" in message.lower() or "Failed" in message):
-                        error_detail = result_data.get("error", message)
-                        logger.error(f"RAG indexing error detected: {error_detail}")
-                        raise RuntimeError(f"RAG indexing failed: {error_detail}")
-            
+            _check_rag_index_response_payload(result)
+
             return result
 
     finally:
@@ -115,7 +184,15 @@ async def _async_rag_index_files(user_id: str, file_paths: List[str], company_id
 # ------------------------------------------------------------
 #  INTERNAL SYNC HELPER (NO EVENT LOOP)
 # ------------------------------------------------------------
-def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, is_role_based: bool = False, index_id: str = None, file_metadata: List[dict] = None):
+def _sync_rag_index_files(
+    user_id: str,
+    file_paths: List[str],
+    company_id: str,
+    is_role_based: bool = False,
+    index_id: str = None,
+    file_metadata: List[dict] = None,
+    rag_file_logical_names: Optional[List[str]] = None,
+):
     """
     Sync-safe RAG call.
     Runs in its own threadpool or standalone sync context.
@@ -128,28 +205,21 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, 
                       If False, file_id format will be {user_id}--{filename}
         index_id: Optional custom index_id (e.g., for webchat). If None, uses company_id
         file_metadata: Optional list of metadata dicts for each file (e.g., [{"url": "...", "title": "..."}])
+        rag_file_logical_names: See async helper.
     """
     files = []
     
-    # Use custom index_id if provided, otherwise use company_id
     actual_index_id = index_id if index_id else company_id
-    
-    # Generate file_ids based on document type
-    # Private documents: {user_id}--{filename}
-    # Role-based documents: {company_id}-{admin_id}--{filename}
-    # Publicchat: {index_id}--{filename} (when index_id starts with "publicchat-")
-    # Documentchat: {index_id}--{filename} (when index_id starts with "documentchat-")
-    # Webchat: {index_id}--{filename} (when index_id starts with "webchat-")
-    if actual_index_id and (actual_index_id.startswith("publicchat-") or 
-                            actual_index_id.startswith("documentchat-") or 
-                            actual_index_id.startswith("webchat-")):
-        # For publicchat, documentchat, and webchat, use index_id as the file_id prefix
-        file_ids = [f"{actual_index_id}--{os.path.basename(fp)}" for fp in file_paths]
-    elif is_role_based:
-        file_ids = [f"{company_id}-{user_id}--{os.path.basename(fp)}" for fp in file_paths]
-    else:
-        file_ids = [f"{user_id}--{os.path.basename(fp)}" for fp in file_paths]
-    
+
+    file_ids = build_rag_file_ids(
+        actual_index_id=actual_index_id,
+        file_paths=file_paths,
+        user_id=user_id,
+        company_id=company_id,
+        is_role_based=is_role_based,
+        rag_file_logical_names=rag_file_logical_names,
+    )
+
     data = {
         "index_id": actual_index_id,
         "file_ids": file_ids,
@@ -176,7 +246,9 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, 
         with httpx.Client(timeout=httpx.Timeout(180.0)) as client:
             response = client.post(RAG_INDEX_URL, files=files, data=data)
             response.raise_for_status()
-            return response.json()
+            payload = response.json()
+            _check_rag_index_response_payload(payload)
+            return payload
 
     except Exception as e:
         raise RuntimeError(f"Sync RAG indexing failed: {e}") from e
@@ -192,27 +264,45 @@ def _sync_rag_index_files(user_id: str, file_paths: List[str], company_id: str, 
 # ------------------------------------------------------------
 #  PUBLIC ENTRY POINT
 # ------------------------------------------------------------
-async def rag_index_files(user_id: str, file_paths: List[str], company_id: str, is_role_based: bool = False, index_id: str = None, file_metadata: List[dict] = None):
+async def rag_index_files(
+    user_id: str,
+    file_paths: List[str],
+    company_id: str,
+    is_role_based: bool = False,
+    index_id: str = None,
+    file_metadata: List[dict] = None,
+    rag_file_logical_names: Optional[List[str]] = None,
+):
     """
     Public entry point — automatically detects async/sync context.
     Ensures no event loop conflict.
-    
-    Args:
-        user_id: User ID (for private docs) or admin_id (for role-based docs)
-        file_paths: List of file paths to index
-        company_id: Company identifier
-        is_role_based: If True, file_id format will be {company_id}-{user_id}--{filename}
-                      If False, file_id format will be {user_id}--{filename}
-        index_id: Optional custom index_id (e.g., for webchat). If None, uses company_id
-        file_metadata: Optional list of metadata dicts for each file (e.g., [{"url": "...", "title": "..."}])
+
+    Note: ``_async_rag_index_files`` raises ``RuntimeError`` on RAG failures; that must not
+    trigger the sync fallback (only "no running loop" should), or we double-post to the
+    indexer and see OpenSearch ``version_conflict_engine_exception`` (409).
     """
     try:
-        loop = asyncio.get_running_loop()
-        # If we're already inside an event loop, stay async
-        return await _async_rag_index_files(user_id, file_paths, company_id, is_role_based, index_id, file_metadata)
+        asyncio.get_running_loop()
     except RuntimeError:
-        # If called from sync context, use the sync fallback
-        return _sync_rag_index_files(user_id, file_paths, company_id, is_role_based, index_id, file_metadata)
+        # Called from a synchronous context with no running loop
+        return _sync_rag_index_files(
+            user_id,
+            file_paths,
+            company_id,
+            is_role_based,
+            index_id,
+            file_metadata,
+            rag_file_logical_names,
+        )
+    return await _async_rag_index_files(
+        user_id,
+        file_paths,
+        company_id,
+        is_role_based,
+        index_id,
+        file_metadata,
+        rag_file_logical_names,
+    )
 
 
 # ------------------------------------------------------------

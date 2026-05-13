@@ -27,6 +27,7 @@ from app.api.company_admin.shared import (
     check_teamlid_permission
 )
 from app.api.rag import rag_index_files
+from app.utils.html_clean_for_rag import clean_html_for_rag_indexing
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 logger = logging.getLogger(__name__)
@@ -268,7 +269,8 @@ async def add_url_source(
         # Extract HTML from URL
         logger.info(f"Extracting HTML from URL: {url}")
         html_content = await extract_html_from_url(url)
-        
+        html_content = clean_html_for_rag_indexing(html_content, page_url=url, plain_text_only=True)
+
         # Save HTML to file
         url_safe = url.replace("https://", "").replace("http://", "").replace("/", "_").replace("?", "_").replace("=", "_")
         file_name = f"{url_safe}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.html"
@@ -607,7 +609,8 @@ async def sync_sources(
                 
                 # Re-extract HTML
                 html_content = await extract_html_from_url(url)
-                
+                html_content = clean_html_for_rag_indexing(html_content, page_url=url, plain_text_only=True)
+
                 # Update file
                 file_path = source.get("file_path")
                 if file_path:
