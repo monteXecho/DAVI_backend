@@ -171,9 +171,9 @@ class CompanyRepository(BaseRepository):
         """Find a user by email."""
         return await self._user_repo.find_user_by_email(email)
     
-    async def get_user_with_documents(self, email: str):
+    async def get_user_with_documents(self, email: str, company_id=None):
         """Get user with all their documents."""
-        return await self._user_repo.get_user_with_documents(email)
+        return await self._user_repo.get_user_with_documents(email, company_id=company_id)
     
     async def get_all_user_documents(self, email: str):
         """Get all documents for a user."""

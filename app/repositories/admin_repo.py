@@ -447,5 +447,5 @@ class AdminRepository(BaseRepository):
         email = admin["email"]
         from app.repositories.user_repo import UserRepository
         user_repo = UserRepository(self.db)
-        return await user_repo.get_user_with_documents(email)
+        return await user_repo.get_user_with_documents(email, company_id=company_id)
 

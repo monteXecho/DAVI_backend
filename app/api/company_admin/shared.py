@@ -6,6 +6,8 @@ all company admin domain routers.
 """
 
 import logging
+from typing import Literal, Optional, Tuple
+
 from fastapi import Depends, Request, HTTPException
 from app.deps.auth import get_current_user, get_keycloak_admin, require_role
 from app.deps.db import get_db
@@ -73,6 +75,88 @@ def _get_guest_permission(guest_entry: dict, new_field: str, old_field: str = No
     return False
 
 
+def company_id_header_query_filter(selected_company_header: Optional[str]):
+    """
+    HTTP sends company ids as strings; Mongo may store str or bson.ObjectId.
+    Use as ``{"company_id": <this>}`` when looking up rows via X-Selected-Company-Id.
+    """
+    selected = (selected_company_header or "").strip()
+    if not selected:
+        return None
+    variants = [selected]
+    try:
+        from bson import ObjectId
+
+        if len(selected) == 24 and ObjectId.is_valid(selected):
+            variants.append(ObjectId(selected))
+    except Exception:
+        pass
+    uniq = []
+    seen = set()
+    for v in variants:
+        key = (type(v).__name__, str(v))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(v)
+    if len(uniq) == 1:
+        return uniq[0]
+    return {"$in": uniq}
+
+
+async def resolve_email_membership_documents(
+    db,
+    *,
+    email: str,
+    realm_roles: list,
+    selected_company_header: Optional[str],
+) -> Tuple[dict, Literal["company_admin", "company_user"]]:
+    """
+    Resolve the Mongo document when the same email exists in multiple companies.
+
+    ``X-Selected-Company-Id`` selects the ``company_users`` / ``company_admins`` row.
+    If omitted and multiple rows exist, raises 400 so the client can prompt company selection.
+    """
+    if not email or not isinstance(email, str):
+        raise HTTPException(status_code=400, detail="Missing email in authentication token")
+
+    selected = (selected_company_header or "").strip()
+
+    if "company_admin" in realm_roles:
+        user_type: Literal["company_admin", "company_user"] = "company_admin"
+        coll = db.company_admins
+    elif "company_user" in realm_roles:
+        user_type = "company_user"
+        coll = db.company_users
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="User must be company_admin or company_user",
+        )
+
+    if selected:
+        cid_expr = company_id_header_query_filter(selected)
+        doc = await coll.find_one({"email": email, "company_id": cid_expr})
+        if not doc:
+            raise HTTPException(
+                status_code=403,
+                detail="Geen account voor dit e-mailadres in de gekozen organisatie.",
+            )
+        return doc, user_type
+
+    matches = await coll.find({"email": email}).to_list(length=None)
+    if not matches:
+        raise HTTPException(status_code=403, detail="User not found in company database")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Dit account bestaat bij meerdere organisaties. "
+                'Kies een organisatie (kop X-Selected-Company-Id / "Bedrijf wisselen").'
+            ),
+        )
+    return matches[0], user_type
+
+
 async def get_repository(db=Depends(get_db)) -> CompanyRepository:
     """Dependency to get CompanyRepository instance."""
     return CompanyRepository(db)
@@ -129,11 +213,11 @@ async def check_nextcloud_permission(
             detail="Nextcloud module is niet ingeschakeld voor dit bedrijf. Neem contact op met de super admin."
         )
     
-    # Check user/admin-level Nextcloud permission
+    # Check user/admin-level Nextcloud permission (scoped to the active company)
     if user_type == "company_admin":
-        user_record = await repo.find_admin_by_email(user_email)
+        user_record = await db.company_admins.find_one({"email": user_email, "company_id": company_id})
     else:
-        user_record = await db.company_users.find_one({"email": user_email})
+        user_record = await db.company_users.find_one({"email": user_email, "company_id": company_id})
     
     if not user_record:
         logger.error(f"User not found: {user_email} (type: {user_type})")
@@ -208,9 +292,9 @@ async def check_teamlid_permission(
             return True
     
     if user_type == "company_admin":
-        user_record = await repo.find_admin_by_email(user_email)
+        user_record = await db.company_admins.find_one({"email": user_email, "company_id": company_id})
     else:
-        user_record = await db.company_users.find_one({"email": user_email})
+        user_record = await db.company_users.find_one({"email": user_email, "company_id": company_id})
     
     if not user_record:
         return True 
@@ -331,52 +415,29 @@ async def get_admin_or_user_company_id(
         )
 
     roles = user.get("realm_access", {}).get("roles", [])
-    
-    if "company_admin" in roles:
-        base_user = await db.company_admins.find_one({"email": user_email})
-        user_type = "company_admin"
-    elif "company_user" in roles:
-        base_user = await db.company_users.find_one({"email": user_email})
-        user_type = "company_user"
-    else:
-        raise HTTPException(
-            status_code=403,
-            detail="User must be company_admin or company_user",
-        )
+    selected_company_header = request.headers.get("X-Selected-Company-Id")
 
-    if not base_user:
-        raise HTTPException(
-            status_code=403,
-            detail="User not found in company database",
-        )
+    base_user, user_type = await resolve_email_membership_documents(
+        db,
+        email=user_email,
+        realm_roles=roles,
+        selected_company_header=selected_company_header,
+    )
 
     company_id = base_user["company_id"]
     real_user_id = base_user["user_id"]
     
     # Track user activity for online user detection
-    # Update last_activity timestamp (non-blocking, don't fail if it errors)
     try:
         from datetime import datetime
         now = datetime.utcnow()
+        doc_filter = {"email": user_email, "company_id": company_id}
         if user_type == "company_admin":
-            result = await db.company_admins.update_one(
-                {"email": user_email},
-                {"$set": {"last_activity": now}},
-                upsert=False
-            )
-            if result.modified_count > 0:
-                logger.debug(f"✅ Updated last_activity for admin: {user_email}")
+            await db.company_admins.update_one(doc_filter, {"$set": {"last_activity": now}}, upsert=False)
         else:
-            result = await db.company_users.update_one(
-                {"email": user_email},
-                {"$set": {"last_activity": now}},
-                upsert=False
-            )
-            if result.modified_count > 0:
-                logger.debug(f"✅ Updated last_activity for user: {user_email}")
+            await db.company_users.update_one(doc_filter, {"$set": {"last_activity": now}}, upsert=False)
     except Exception as e:
-        # Don't fail the request if activity tracking fails
-        logger.warning(f"⚠️  Failed to update activity for {user_email}: {e}")
+        logger.warning(f"⚠️  Failed to update activity for {user_email}@{company_id}: {e}")
     
     # Get Keycloak access token for Nextcloud authentication
     access_token = user.get("_raw_token")
@@ -493,29 +554,29 @@ async def get_admin_company_id(
             detail="Missing email in authentication token",
         )
 
-    admin_record = await repo.find_admin_by_email(admin_email)
-    if not admin_record:
-        raise HTTPException(
-            status_code=403,
-            detail="Admin not found in backend database",
-        )
+    roles = user.get("realm_access", {}).get("roles", []) or []
+    selected_company_header = request.headers.get("X-Selected-Company-Id")
 
-    full_admin = await db.company_admins.find_one({"email": admin_email})
-    if not full_admin:
+    full_admin, resolved_type = await resolve_email_membership_documents(
+        db,
+        email=admin_email,
+        realm_roles=roles,
+        selected_company_header=selected_company_header,
+    )
+    if resolved_type != "company_admin":
         raise HTTPException(
             status_code=403,
-            detail="Admin not registered in company database",
+            detail="Admin record required",
         )
 
     company_id = full_admin["company_id"]
     real_user_id = full_admin["user_id"]
     
-    # Track user activity for online user detection
     try:
         from datetime import datetime
         now = datetime.utcnow()
         await db.company_admins.update_one(
-            {"email": admin_email},
+            {"email": admin_email, "company_id": company_id},
             {"$set": {"last_activity": now}},
             upsert=False
         )

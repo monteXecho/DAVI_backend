@@ -12,11 +12,120 @@ from app.deps.auth import get_current_user
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.repositories.constants import serialize_modules
-from app.models.company_admin_schema import GuestAccessPayload, GuestWorkspaceOut
+from app.models.company_admin_schema import GuestAccessPayload
 from app.api.company_admin.shared import get_admin_company_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+async def _company_display_name(db, company_id: str) -> str:
+    doc = await db.companies.find_one({"company_id": company_id}, {"name": 1})
+    if doc and doc.get("name"):
+        return str(doc["name"])
+    return str(company_id)
+
+
+async def _build_workspace_block_for_membership(
+    db,
+    repo: CompanyRepository,
+    *,
+    company_id: str,
+    mem: dict,
+    user_type: str,
+    email: str,
+) -> dict:
+    """Self + guest workspaces for one (email, company_id) membership row."""
+    user_id = mem.get("user_id")
+    if not user_id:
+        return {
+            "company_id": company_id,
+            "company_name": await _company_display_name(db, company_id),
+            "self": None,
+            "guestOf": [],
+        }
+
+    guest_entries = await repo.list_guest_workspaces_for_user(
+        company_id=company_id,
+        guest_user_id=user_id,
+    )
+
+    if user_type == "company_admin":
+        self_owner_id = user_id
+        self_label = "MIJN ADMIN WERKRUIMTE"
+    else:
+        self_owner_id = mem.get("added_by_admin_id")
+        self_label = "MIJN WERKRUIMTE"
+
+    self_workspace = None
+    if self_owner_id:
+        self_workspace = {
+            "ownerId": self_owner_id,
+            "owner": {
+                "name": mem.get("name", ""),
+                "email": email,
+            },
+            "label": self_label,
+            "permissions": None,
+        }
+
+    guest_workspaces = []
+    for entry in guest_entries:
+        owner_id = entry.get("owner_admin_id")
+        if not owner_id:
+            logger.warning("[guest-workspaces] Guest entry missing owner_admin_id: %s", entry)
+            continue
+
+        owner_admin = await db.company_admins.find_one(
+            {"company_id": company_id, "user_id": owner_id}
+        )
+
+        if owner_admin:
+            owner_mods_raw = owner_admin.get("modules") or {}
+            if isinstance(owner_mods_raw, dict):
+                owner_modules_out = serialize_modules(owner_mods_raw)
+            elif isinstance(owner_mods_raw, list):
+                owner_modules_out = owner_mods_raw
+            else:
+                owner_modules_out = []
+
+            guest_ws = {
+                "ownerId": owner_id,
+                "owner": {
+                    "name": owner_admin.get("name", ""),
+                    "email": owner_admin.get("email", ""),
+                },
+                "label": f"WERKRUIMTE VAN {owner_admin.get('name', '').upper()}",
+                "owner_modules": owner_modules_out,
+                "permissions": {
+                    "role_write": entry.get("can_role_write", False),
+                    "user_write": entry.get("can_user_write", False),
+                    "document_write": entry.get("can_document_write", False),
+                    "folder_write": entry.get("can_folder_write", False),
+                    "publicchat_write": entry.get("can_publicchat_write", False),
+                    "webchat_write": entry.get("can_webchat_write", False),
+                },
+            }
+            guest_workspaces.append(guest_ws)
+        else:
+            logger.warning(
+                "[guest-workspaces] Owner admin not found: owner_id=%s company_id=%s guest_user_id=%s",
+                owner_id,
+                company_id,
+                user_id,
+            )
+
+    company_name = await _company_display_name(db, company_id)
+    return {
+        "company_id": company_id,
+        "company_name": company_name,
+        # Identifies logged-in person's row in THIS company (for client storage headers)
+        "member_user_id": mem.get("user_id"),
+        "member_is_teamlid": bool(mem.get("is_teamlid")),
+        "membership_kind": user_type,
+        "self": self_workspace,
+        "guestOf": guest_workspaces,
+    }
 
 
 @router.post("/guest-access", status_code=201)
@@ -64,8 +173,11 @@ async def get_guest_workspaces(
     db=Depends(get_db),
 ):
     """
-    Return workspaces (self + guest-of-others) available for current user.
-    Works for company_admin and company_user.
+    Workspaces for each company this email is registered in (same Keycloak user).
+
+    Response includes ``companies``: one block per ``company_users`` / ``company_admins`` row.
+    For a single-company account, ``self`` / ``guestOf`` duplicate the first block for
+    backward-compatible clients.
     """
     email = user.get("email")
     roles = user.get("realm_access", {}).get("roles", [])
@@ -73,121 +185,42 @@ async def get_guest_workspaces(
     if not email:
         raise HTTPException(status_code=400, detail="Missing email in token")
 
-    base_user = None
-    user_type = None
-
     if "company_admin" in roles:
-        base_user = await db.company_admins.find_one({"email": email})
+        memberships = await db.company_admins.find({"email": email}).to_list(length=None)
         user_type = "company_admin"
     elif "company_user" in roles:
-        base_user = await db.company_users.find_one({"email": email})
+        memberships = await db.company_users.find({"email": email}).to_list(length=None)
         user_type = "company_user"
     else:
         raise HTTPException(status_code=403, detail="Unsupported role")
 
-    if not base_user:
+    if not memberships:
         raise HTTPException(status_code=404, detail="User not found")
 
-    company_id = base_user["company_id"]
-    user_id = base_user["user_id"]
-
     repo = CompanyRepository(db)
-    guest_entries = await repo.list_guest_workspaces_for_user(
-        company_id=company_id,
-        guest_user_id=user_id,
-    )
-    
-    logger.info(
-        f"[guest-workspaces] User: {email} (user_type={user_type}, user_id={user_id}, company_id={company_id})"
-    )
-    logger.info(
-        f"[guest-workspaces] Found {len(guest_entries)} guest workspace entries"
-    )
-    if guest_entries:
-        for idx, entry in enumerate(guest_entries):
-            logger.info(
-                f"[guest-workspaces] Entry {idx+1}: owner_admin_id={entry.get('owner_admin_id')}, "
-                f"is_active={entry.get('is_active', 'missing')}"
-            )
-
-    if user_type == "company_admin":
-        self_owner_id = base_user["user_id"]
-        self_label = "MIJN ADMIN WERKRUIMTE"
-    else:
-        self_owner_id = base_user.get("added_by_admin_id")
-        self_label = "MIJN WERKRUIMTE"
-
-    # Build self workspace
-    self_workspace = None
-    if self_owner_id:
-        self_workspace = {
-            "ownerId": self_owner_id,
-            "owner": {
-                "name": base_user.get("name", ""),
-                "email": email,
-            },
-            "label": self_label,
-            "permissions": None
-        }
-
-    # Build guest workspaces
-    guest_workspaces = []
-    for entry in guest_entries:
-        owner_id = entry.get("owner_admin_id")
-        if not owner_id:
-            logger.warning(f"[guest-workspaces] Guest entry missing owner_admin_id: {entry}")
+    company_blocks = []
+    for mem in memberships:
+        cid = mem.get("company_id")
+        if not cid:
             continue
-            
-        owner_admin = await db.company_admins.find_one({
-            "company_id": company_id,
-            "user_id": owner_id
-        })
+        block = await _build_workspace_block_for_membership(
+            db,
+            repo,
+            company_id=str(cid),
+            mem=mem,
+            user_type=user_type,
+            email=email,
+        )
+        company_blocks.append(block)
 
-        if owner_admin:
-            # Modules enabled for the workspace owner (by super admin). Teamlid sidebar must
-            # intersect with this list — not show every BEHEER item.
-            owner_mods_raw = owner_admin.get("modules") or {}
-            if isinstance(owner_mods_raw, dict):
-                owner_modules_out = serialize_modules(owner_mods_raw)
-            elif isinstance(owner_mods_raw, list):
-                owner_modules_out = owner_mods_raw
-            else:
-                owner_modules_out = []
-            guest_ws = {
-                "ownerId": owner_id,
-                "owner": {
-                    "name": owner_admin.get("name", ""),
-                    "email": owner_admin.get("email", ""),
-                },
-                "label": f"WERKRUIMTE VAN {owner_admin.get('name', '').upper()}",
-                "owner_modules": owner_modules_out,
-                "permissions": {
-                    "role_write": entry.get("can_role_write", False),
-                    "user_write": entry.get("can_user_write", False),
-                    "document_write": entry.get("can_document_write", False),
-                    "folder_write": entry.get("can_folder_write", False),
-                    "publicchat_write": entry.get("can_publicchat_write", False),
-                    "webchat_write": entry.get("can_webchat_write", False),
-                }
-            }
-            guest_workspaces.append(guest_ws)
-            logger.info(
-                f"[guest-workspaces] Added guest workspace: ownerId={owner_id}, "
-                f"owner_name={owner_admin.get('name', '')}"
-            )
-        else:
-            logger.warning(
-                f"[guest-workspaces] Owner admin not found for guest entry: owner_id={owner_id}, "
-                f"company_id={company_id}, guest_user_id={user_id}"
-            )
-    
-    logger.info(
-        f"[guest-workspaces] Returning {len(guest_workspaces)} guest workspaces for user {email}"
-    )
+    logger.info("[guest-workspaces] email=%s type=%s company_count=%s", email, user_type, len(company_blocks))
 
-    # Return in the format expected by frontend
+    if not company_blocks:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    single = len(company_blocks) == 1
     return {
-        "self": self_workspace,
-        "guestOf": guest_workspaces
+        "companies": company_blocks,
+        "self": company_blocks[0]["self"] if single else None,
+        "guestOf": company_blocks[0]["guestOf"] if single else [],
     }
-

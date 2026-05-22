@@ -81,7 +81,8 @@ async def get_current_user_info(
         raise HTTPException(status_code=400, detail="Missing email in token")
     
     try:
-        user_data = await repo.get_user_with_documents(email)
+        ctx_company_id = admin_context["company_id"]
+        user_data = await repo.get_user_with_documents(email, company_id=ctx_company_id)
         
         if not user_data:
             raise HTTPException(status_code=404, detail="User not found")

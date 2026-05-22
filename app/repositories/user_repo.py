@@ -463,7 +463,7 @@ class UserRepository(BaseRepository):
             return None
         return {"email": user["email"], "role": "company_user"}
     
-    async def get_user_with_documents(self, email: str) -> Optional[dict]:
+    async def get_user_with_documents(self, email: str, company_id=None) -> Optional[dict]:
         """
         Get user with all their documents (works for both admins and users).
         
@@ -477,15 +477,24 @@ class UserRepository(BaseRepository):
         
         Args:
             email: User email
-            
+            company_id: When the same email has multiple memberships, pass the resolver's
+                        ``company_id`` (BSON/string as stored together with that admin/user row).
+
         Returns:
             Dictionary with user details and documents, or None if not found
         """
-        user = await self.admins.find_one({"email": email})
-        user_type = "admin"
-        if not user:
-            user = await self.users.find_one({"email": email})
-            user_type = "company_user"
+        if company_id is not None:
+            user = await self.admins.find_one({"email": email, "company_id": company_id})
+            user_type = "admin"
+            if not user:
+                user = await self.users.find_one({"email": email, "company_id": company_id})
+                user_type = "company_user"
+        else:
+            user = await self.admins.find_one({"email": email})
+            user_type = "admin"
+            if not user:
+                user = await self.users.find_one({"email": email})
+                user_type = "company_user"
 
         if not user:
             return None

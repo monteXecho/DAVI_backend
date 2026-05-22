@@ -278,6 +278,84 @@ def _versioned_rag_logical_file_name(disk_basename: str, stamp: str) -> str:
     return f"{root}_{st}{ext}" if st else base
 
 
+async def _reindex_public_chat_sources_after_chat_rename(
+    db: AsyncIOMotorDatabase,
+    *,
+    company_id: str,
+    admin_id: str,
+    chat_id: str,
+    new_chat_name: str,
+) -> None:
+    """
+    After ``chat_name`` changes, public query uses a new OpenSearch ``index_id``.
+    Re-index every disk-backed source under the new id so Q&A keeps working.
+    """
+    index_id_new = get_public_chat_index_id(company_id, admin_id, new_chat_name)
+    sources = await db.public_chat_sources.find(
+        {
+            "company_id": company_id,
+            "admin_id": admin_id,
+            "chat_id": chat_id,
+            "status": "active",
+        }
+    ).to_list(length=None)
+
+    for source in sources or []:
+        fp = source.get("file_path")
+        if not fp or not os.path.exists(fp):
+            _uvicorn_log.warning(
+                "Skip re-index after chat rename — missing file: chat_id=%s source=%s path=%s",
+                chat_id,
+                source.get("_id"),
+                fp,
+            )
+            continue
+
+        stamp = _public_chat_rag_version_stamp_utc()
+        disk_bn = os.path.basename(fp) or (source.get("file_name") or "source").strip() or "source"
+        rag_logical = _versioned_rag_logical_file_name(disk_bn, stamp)
+
+        url = source.get("url")
+        title = (
+            source.get("title")
+            or source.get("file_name")
+            or (url if url else disk_bn)
+        )
+        file_metadata = [{"url": url, "title": title}]
+
+        try:
+            await rag_index_files(
+                user_id=admin_id,
+                file_paths=[fp],
+                company_id=company_id,
+                is_role_based=False,
+                index_id=index_id_new,
+                file_metadata=file_metadata,
+                rag_file_logical_names=[rag_logical],
+            )
+            await db.public_chat_sources.update_one(
+                {"_id": source["_id"]},
+                {
+                    "$set": {
+                        "chat_name": new_chat_name,
+                        "rag_logical_file_name": rag_logical,
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+            )
+            logger.info(
+                "Re-indexed source %s for public chat rename → %s",
+                source.get("_id"),
+                new_chat_name,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed re-index after rename for source %s: %s",
+                source.get("_id"),
+                e,
+            )
+
+
 @router.get("/public-chats")
 async def list_public_chats(
     admin_context=Depends(get_admin_or_user_company_id),
@@ -528,8 +606,11 @@ async def update_public_chat(
         
         if not chat:
             raise HTTPException(status_code=404, detail="Public chat not found")
+
+        old_chat_name = chat.get("chat_name") or ""
         
         update_data = {"updated_at": datetime.utcnow()}
+        renamed_for_rag = False
         
         if payload.chat_name is not None:
             # Check if new name conflicts with existing chat
@@ -545,6 +626,7 @@ async def update_public_chat(
                         status_code=409,
                         detail=f"Public chat with name '{payload.chat_name}' already exists"
                     )
+                renamed_for_rag = True
             update_data["chat_name"] = payload.chat_name
         
         # Handle is_private update
@@ -593,6 +675,41 @@ async def update_public_chat(
             {"_id": ObjectId(chat_id)},
             {"$set": update_data}
         )
+
+        if renamed_for_rag:
+            await _reindex_public_chat_sources_after_chat_rename(
+                db,
+                company_id=company_id,
+                admin_id=admin_id,
+                chat_id=chat_id,
+                new_chat_name=update_data["chat_name"],
+            )
+            await db.public_chat_sources.update_many(
+                {
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "chat_id": chat_id,
+                },
+                {
+                    "$set": {
+                        "chat_name": update_data["chat_name"],
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+            )
+            await db.public_chat_sources.update_many(
+                {
+                    "company_id": company_id,
+                    "admin_id": admin_id,
+                    "chat_id": chat_id,
+                },
+                {
+                    "$set": {
+                        "chat_name": update_data["chat_name"],
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+            )
         
         logger.info(f"Updated public chat: {chat_id}")
         
