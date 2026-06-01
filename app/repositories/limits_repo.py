@@ -10,6 +10,16 @@ from app.repositories.base_repo import BaseRepository
 
 logger = logging.getLogger(__name__)
 
+# Default QR-Chats (public chats) per company admin when company limit is unset (-1).
+DEFAULT_MAX_PUBLIC_CHATS_PER_ADMIN = 2
+
+
+def effective_max_public_chats_per_admin(max_public_chats: int) -> int:
+    """Resolve per-admin public chat cap from company ``max_public_chats`` (-1 → product default)."""
+    if max_public_chats is None or max_public_chats == -1:
+        return DEFAULT_MAX_PUBLIC_CHATS_PER_ADMIN
+    return max(0, int(max_public_chats))
+
 
 class LimitsRepository(BaseRepository):
     """Repository for managing company resource limits."""
@@ -146,6 +156,28 @@ class LimitsRepository(BaseRepository):
         if current_count >= max_roles:
             return False, f"Maximum aantal rollen ({max_roles}) bereikt. Neem contact op met de super admin om de limiet te verhogen."
         
+        return True, ""
+
+    async def get_effective_public_chats_limit(self, company_id: str) -> int:
+        """Per-admin QR-Chat cap for this company (see ``effective_max_public_chats_per_admin``)."""
+        limits = await self.get_company_limits(company_id)
+        return effective_max_public_chats_per_admin(limits.get("max_public_chats", -1))
+
+    async def check_public_chats_limit(self, company_id: str, admin_id: str) -> tuple[bool, str]:
+        """
+        Check if this admin may create another public chat (QR-Chat).
+
+        Counts ``public_chats`` rows for ``(company_id, admin_id)``.
+        """
+        max_chats = await self.get_effective_public_chats_limit(company_id)
+        current_count = await self.db.public_chats.count_documents({
+            "company_id": company_id,
+            "admin_id": admin_id,
+        })
+        if current_count >= max_chats:
+            return False, (
+                "Je hebt momenteel het maximale aantal beschikbare QR-Chats binnen jouw omgeving bereikt."
+            )
         return True, ""
 
     async def update_company_limits(

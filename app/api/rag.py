@@ -38,8 +38,8 @@ def build_rag_file_ids(
     Build per-file ``file_ids`` passed to the RAG indexer.
 
     For ``publicchat-`` / ``documentchat-`` / ``webchat-`` indexes, optional
-    ``rag_file_logical_names`` overrides the basename (e.g. add a UTC stamp) so each
-    re-index uses new OpenSearch document ids without a delete API on the RAG side.
+    ``rag_file_logical_names`` overrides the basename of each ``file_path`` in the RAG ``file_id``
+    suffix (defaults to ``os.path.basename(path)`` when omitted).
     """
     if rag_file_logical_names is not None:
         if len(rag_file_logical_names) != len(file_paths):

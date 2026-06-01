@@ -25,9 +25,13 @@ from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form
 from bson import ObjectId
 from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
+from app.repositories.limits_repo import LimitsRepository
 from app.api.company_admin.shared import (
     get_admin_or_user_company_id,
-    check_teamlid_permission
+    check_teamlid_permission,
+    resolve_restricted_public_chat_ids,
+    require_public_chat_access_for_teamlid,
+    assert_workspace_owner_for_public_chat_mutation,
 )
 from app.api.rag import rag_index_files
 from app.utils.html_clean_for_rag import clean_html_for_rag_indexing
@@ -200,11 +204,9 @@ async def extract_html_from_url(url: str) -> str:
 
 def _file_name_for_public_chat_url(url: str) -> str:
     """
-    Stable filename unique per URL for storage and RAG file_id.
+    Stable filename unique per URL for storage and RAG ``file_id`` (basename of the saved file).
 
-    Using only `{domain}.html` makes every page on the same host share one file_id
-    (e.g. multiple wetten.overheid.nl laws). Re-indexing then hits OpenSearch
-    version_conflict_engine_exception because chunk document ids collide with existing rows.
+    Includes host, path and query-derived segments so distinct pages on one host map to distinct files.
     """
     from urllib.parse import urlparse
 
@@ -255,29 +257,6 @@ def get_public_chat_index_id(company_id: str, admin_id: str, chat_name: str) -> 
     return f"publicchat-{company_id}-{admin_id}-{safe_chat}".lower()
 
 
-def _public_chat_rag_version_stamp_utc() -> str:
-    """
-    UTC stamp appended to the RAG logical filename so each re-index avoids OpenSearch
-    ``version_conflict_engine_exception`` without a delete endpoint.
-    Format: YYYYMMDDHHMMSS (example: 20260513143732).
-    """
-    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-
-
-def _versioned_rag_logical_file_name(disk_basename: str, stamp: str) -> str:
-    """
-    Logical tail for ``file_id`` … ``--{this}`` while the file on disk stays ``disk_basename``.
-    Example: ``report.html`` + stamp ``20260513143732`` → ``report_20260513143732.html``.
-    """
-    base = (disk_basename or "").strip() or "source"
-    st = (stamp or "").strip()
-    root, ext = os.path.splitext(base)
-    if not root:
-        root = base
-        ext = ""
-    return f"{root}_{st}{ext}" if st else base
-
-
 async def _reindex_public_chat_sources_after_chat_rename(
     db: AsyncIOMotorDatabase,
     *,
@@ -311,9 +290,7 @@ async def _reindex_public_chat_sources_after_chat_rename(
             )
             continue
 
-        stamp = _public_chat_rag_version_stamp_utc()
         disk_bn = os.path.basename(fp) or (source.get("file_name") or "source").strip() or "source"
-        rag_logical = _versioned_rag_logical_file_name(disk_bn, stamp)
 
         url = source.get("url")
         title = (
@@ -331,14 +308,13 @@ async def _reindex_public_chat_sources_after_chat_rename(
                 is_role_based=False,
                 index_id=index_id_new,
                 file_metadata=file_metadata,
-                rag_file_logical_names=[rag_logical],
             )
             await db.public_chat_sources.update_one(
                 {"_id": source["_id"]},
                 {
                     "$set": {
                         "chat_name": new_chat_name,
-                        "rag_logical_file_name": rag_logical,
+                        "rag_logical_file_name": disk_bn,
                         "updated_at": datetime.utcnow(),
                     }
                 },
@@ -362,16 +338,26 @@ async def list_public_chats(
     db=Depends(get_db)
 ):
     """List all public chats for the company admin."""
-    await check_teamlid_permission(admin_context, db, "publicchat")
+    await check_teamlid_permission(admin_context, db, "publicchat", require_write=False)
     
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
     
     try:
-        chats = await db.public_chats.find({
-            "company_id": company_id,
-            "admin_id": admin_id
-        }).sort("created_at", -1).to_list(length=None)
+        chat_filter = {"company_id": company_id, "admin_id": admin_id}
+        scope = await resolve_restricted_public_chat_ids(db, admin_context)
+        if scope is not None:
+            if not scope:
+                return {"success": True, "chats": []}
+            oids = [ObjectId(cid) for cid in scope if ObjectId.is_valid(cid)]
+            if not oids:
+                return {"success": True, "chats": []}
+            chat_filter["_id"] = {"$in": oids}
+
+        chats = await db.public_chats.find(chat_filter).sort("created_at", -1).to_list(length=None)
+
+        limits_repo = LimitsRepository(db)
+        max_public_chats = await limits_repo.get_effective_public_chats_limit(company_id)
         
         result = []
         for chat in chats:
@@ -384,7 +370,12 @@ async def list_public_chats(
                 "updated_at": chat.get("updated_at", datetime.utcnow()).isoformat(),
             })
         
-        return {"success": True, "chats": result}
+        return {
+            "success": True,
+            "chats": result,
+            "max_public_chats": max_public_chats,
+            "can_create_more": len(result) < max_public_chats,
+        }
     except Exception as e:
         logger.exception("Failed to list public chats")
         raise HTTPException(status_code=500, detail=f"Failed to list public chats: {str(e)}")
@@ -398,9 +389,19 @@ async def create_public_chat(
 ):
     """Create a new public chat."""
     await check_teamlid_permission(admin_context, db, "publicchat")
-    
+    assert_workspace_owner_for_public_chat_mutation(admin_context)
+
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
+
+    limits_repo = LimitsRepository(db)
+    allowed, limit_msg = await limits_repo.check_public_chats_limit(company_id, admin_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=limit_msg,
+            headers={"X-Public-Chat-Limit": "reached"},
+        )
     
     # Validate: if password is set, is_private must be True
     if payload.password and not payload.is_private:
@@ -464,8 +465,9 @@ async def get_public_chat(
     db=Depends(get_db)
 ):
     """Get a specific public chat."""
-    await check_teamlid_permission(admin_context, db, "publicchat")
-    
+    await check_teamlid_permission(admin_context, db, "publicchat", require_write=False)
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
+
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
     
@@ -508,6 +510,7 @@ async def get_public_chat_query_history(
     Read access is enough (same module visibility as viewing chats).
     """
     await check_teamlid_permission(admin_context, db, "publicchat", require_write=False)
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
 
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -593,7 +596,8 @@ async def update_public_chat(
 ):
     """Update a public chat."""
     await check_teamlid_permission(admin_context, db, "publicchat")
-    
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
+
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
     
@@ -732,7 +736,8 @@ async def delete_public_chat(
 ):
     """Delete a public chat and all its sources."""
     await check_teamlid_permission(admin_context, db, "publicchat")
-    
+    assert_workspace_owner_for_public_chat_mutation(admin_context)
+
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
     
@@ -786,7 +791,8 @@ async def add_url_source_to_chat(
 ):
     """Add a URL source to a public chat and index it."""
     await check_teamlid_permission(admin_context, db, "publicchat")
-    
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
+
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
     
@@ -847,10 +853,8 @@ async def add_url_source_to_chat(
         source_id = str(source_oid)
         
         # Index to RAG with publicchat index and metadata
-        # For publicchat, file_id format should be: {index_id}--{logical_name}
+        # file_id: {index_id}--{basename(file_path)} (see app.api.rag.build_rag_file_ids)
         index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
-        stamp = _public_chat_rag_version_stamp_utc()
-        rag_logical = _versioned_rag_logical_file_name(file_name, stamp)
         file_metadata = [{
             "url": url,
             "title": source_doc.get("title", url)  # Use title if available, otherwise use URL
@@ -863,13 +867,12 @@ async def add_url_source_to_chat(
                 is_role_based=False,
                 index_id=index_id,
                 file_metadata=file_metadata,
-                rag_file_logical_names=[rag_logical],
             )
             await db.public_chat_sources.update_one(
                 {"_id": source_oid},
                 {
                     "$set": {
-                        "rag_logical_file_name": rag_logical,
+                        "rag_logical_file_name": file_name,
                         "updated_at": datetime.utcnow(),
                     }
                 },
@@ -900,6 +903,7 @@ async def add_html_source_to_chat(
 ):
     """Add an HTML file source to a public chat and index it."""
     await check_teamlid_permission(admin_context, db, "publicchat")
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
     
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -957,8 +961,6 @@ async def add_html_source_to_chat(
         
         # Index to RAG with publicchat index and metadata
         index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
-        stamp = _public_chat_rag_version_stamp_utc()
-        rag_logical = _versioned_rag_logical_file_name(file_name, stamp)
         file_metadata = [{
             "url": source_doc.get("url"),  # May be None for HTML files
             "title": source_doc.get("title", file_name)  # Use title if available, otherwise use file_name
@@ -971,11 +973,10 @@ async def add_html_source_to_chat(
                 is_role_based=False,
                 index_id=index_id,
                 file_metadata=file_metadata,
-                rag_file_logical_names=[rag_logical],
             )
             await db.public_chat_sources.update_one(
                 {"_id": source_oid},
-                {"$set": {"rag_logical_file_name": rag_logical, "updated_at": datetime.utcnow()}},
+                {"$set": {"rag_logical_file_name": file_name, "updated_at": datetime.utcnow()}},
             )
             logger.info(f"Successfully indexed HTML source for public chat: {file_name}")
         except Exception as e:
@@ -1003,6 +1004,7 @@ async def add_file_source_to_chat(
 ):
     """Add a document file source to a public chat and index it."""
     await check_teamlid_permission(admin_context, db, "publicchat")
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
     
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -1056,8 +1058,6 @@ async def add_file_source_to_chat(
         
         # Index to RAG with publicchat index
         index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
-        stamp = _public_chat_rag_version_stamp_utc()
-        rag_logical = _versioned_rag_logical_file_name(file_name, stamp)
         file_metadata = [{
             "url": None,  # File sources don't have URLs
             "title": source_doc.get("title", file_name)  # Use title if available, otherwise use file_name
@@ -1070,11 +1070,10 @@ async def add_file_source_to_chat(
                 is_role_based=False,
                 index_id=index_id,
                 file_metadata=file_metadata,
-                rag_file_logical_names=[rag_logical],
             )
             await db.public_chat_sources.update_one(
                 {"_id": source_oid},
-                {"$set": {"rag_logical_file_name": rag_logical, "updated_at": datetime.utcnow()}},
+                {"$set": {"rag_logical_file_name": file_name, "updated_at": datetime.utcnow()}},
             )
             logger.info(f"Successfully indexed file source for public chat: {file_name}")
         except Exception as e:
@@ -1100,7 +1099,8 @@ async def list_chat_sources(
     db=Depends(get_db)
 ):
     """List all sources for a public chat."""
-    await check_teamlid_permission(admin_context, db, "publicchat")
+    await check_teamlid_permission(admin_context, db, "publicchat", require_write=False)
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
     
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -1180,7 +1180,7 @@ async def get_public_chat_sync_schedule(
     db=Depends(get_db),
 ):
     """Get Public Chat URL auto-sync schedule (next sync time and interval)."""
-    await check_teamlid_permission(admin_context, db, "publicchat")
+    await check_teamlid_permission(admin_context, db, "publicchat", require_write=False)
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
     schedule = await _get_public_chat_sync_schedule(db, company_id, admin_id)
@@ -1208,11 +1208,15 @@ async def sync_all_chat_url_sources(
             "admin_id": admin_id,
         }).to_list(length=None)
 
+        scope_ids = await resolve_restricted_public_chat_ids(db, admin_context)
+
         total_synced = 0
         total_failed = 0
 
         for chat in chats:
             chat_id = str(chat["_id"])
+            if scope_ids is not None and chat_id not in scope_ids:
+                continue
             chat_name = chat.get("chat_name", "")
             index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
 
@@ -1245,8 +1249,7 @@ async def sync_all_chat_url_sources(
                         )
 
                     if file_path and os.path.exists(file_path):
-                        stamp = _public_chat_rag_version_stamp_utc()
-                        rag_logical = _versioned_rag_logical_file_name(os.path.basename(file_path), stamp)
+                        rag_logical = os.path.basename(file_path)
                         await rag_index_files(
                             user_id=admin_id,
                             file_paths=[file_path],
@@ -1254,7 +1257,6 @@ async def sync_all_chat_url_sources(
                             is_role_based=False,
                             index_id=index_id,
                             file_metadata=[{"url": url, "title": source.get("title", url)}],
-                            rag_file_logical_names=[rag_logical],
                         )
 
                     now_utc = datetime.utcnow()
@@ -1307,6 +1309,7 @@ async def sync_chat_url_sources(
 ):
     """Re-fetch URL sources for this chat, update HTML files, and re-index to RAG."""
     await check_teamlid_permission(admin_context, db, "publicchat")
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
 
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
@@ -1355,8 +1358,7 @@ async def sync_chat_url_sources(
                     )
 
                 if file_path and os.path.exists(file_path):
-                    stamp = _public_chat_rag_version_stamp_utc()
-                    rag_logical = _versioned_rag_logical_file_name(os.path.basename(file_path), stamp)
+                    rag_logical = os.path.basename(file_path)
                     await rag_index_files(
                         user_id=admin_id,
                         file_paths=[file_path],
@@ -1364,7 +1366,6 @@ async def sync_chat_url_sources(
                         is_role_based=False,
                         index_id=index_id,
                         file_metadata=[{"url": url, "title": source.get("title", url)}],
-                        rag_file_logical_names=[rag_logical],
                     )
 
                 now_utc = datetime.utcnow()
@@ -1418,6 +1419,7 @@ async def delete_chat_source(
 ):
     """Delete a source from a public chat."""
     await check_teamlid_permission(admin_context, db, "publicchat")
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
     
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]

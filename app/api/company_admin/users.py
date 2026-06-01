@@ -166,20 +166,25 @@ async def assign_teamlid_permission(
     company_id = admin_context["company_id"]
     admin_id = admin_context["admin_id"]
 
-    await repo.assign_teamlid_permissions(
-        company_id=company_id,
-        admin_id=admin_id,
-        email=payload.email,
-        permissions=payload.team_permissions
-    )
+    try:
+        ok = await repo.assign_teamlid_permissions(
+            company_id=company_id,
+            admin_id=admin_id,
+            email=payload.email,
+            permissions=payload.team_permissions or {},
+            assigned_public_chat_ids=payload.assigned_public_chat_ids,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     return {
-        "success": True,
+        "success": ok,
         "message": "Teamlid permissions assigned successfully",
         "data": {
             "email": payload.email,
             "assigned_by": admin_id,
-            "permissions": payload.team_permissions
+            "permissions": payload.team_permissions or {},
+            "assigned_public_chat_ids": payload.assigned_public_chat_ids,
         }
     }
 
@@ -755,7 +760,7 @@ async def add_role_to_users(
         return {
             "status": "success",
             "addedRole": roleName,
-            "affectedUsers": payload.user_ids,
+            "affectedUsers": payload.user_ids, 
             "modifiedCount": result.modified_count
         }
 

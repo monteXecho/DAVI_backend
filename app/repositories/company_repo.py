@@ -206,11 +206,13 @@ class CompanyRepository(BaseRepository):
         company_id: str,
         admin_id: str,
         email: str,
-        permissions: dict
+        permissions: dict,
+        assigned_public_chat_ids: Optional[List[str]] = None,
     ) -> bool:
         """Assign teamlid permissions to a user."""
         return await self._user_repo.assign_teamlid_permissions(
-            company_id, admin_id, email, permissions
+            company_id, admin_id, email, permissions,
+            assigned_public_chat_ids=assigned_public_chat_ids,
         )
     
     async def remove_teamlid_role(self, company_id: str, admin_id: str, user_id: str) -> bool:

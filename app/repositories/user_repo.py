@@ -15,6 +15,8 @@ import os
 import re
 from datetime import datetime
 from typing import List, Optional
+
+from bson import ObjectId
 from fastapi import HTTPException
 import pandas as pd
 
@@ -352,6 +354,8 @@ class UserRepository(BaseRepository):
             }
             if is_teamlid and usr.get("teamlid_permissions"):
                 user_entry["teamlid_permissions"] = usr.get("teamlid_permissions")
+            if is_teamlid and usr.get("teamlid_public_chat_ids") is not None:
+                user_entry["teamlid_public_chat_ids"] = usr.get("teamlid_public_chat_ids")
             users.append(user_entry)
         
         # 2. Get admins added by this admin
@@ -386,6 +390,8 @@ class UserRepository(BaseRepository):
             }
             if is_teamlid and adm.get("teamlid_permissions"):
                 admin_entry["teamlid_permissions"] = adm.get("teamlid_permissions")
+            if is_teamlid and adm.get("teamlid_public_chat_ids") is not None:
+                admin_entry["teamlid_public_chat_ids"] = adm.get("teamlid_public_chat_ids")
             users.append(admin_entry)
         
         # 3. Get admins who have teamlid role assigned by this admin
@@ -404,6 +410,10 @@ class UserRepository(BaseRepository):
                     if user.get("id") == teamlid_user_id:
                         user["is_teamlid"] = True
                         user["teamlid_assigned_by"] = admin_id
+                        if "assigned_public_chat_ids" in assignment:
+                            user["teamlid_public_chat_ids"] = assignment.get(
+                                "assigned_public_chat_ids"
+                            )
                         break
                 continue
             
@@ -435,8 +445,37 @@ class UserRepository(BaseRepository):
                 }
                 if teamlid_admin.get("teamlid_permissions"):
                     admin_entry["teamlid_permissions"] = teamlid_admin.get("teamlid_permissions")
+                if teamlid_admin.get("teamlid_public_chat_ids") is not None:
+                    admin_entry["teamlid_public_chat_ids"] = teamlid_admin.get(
+                        "teamlid_public_chat_ids"
+                    )
+                if "assigned_public_chat_ids" in assignment:
+                    admin_entry["teamlid_public_chat_ids"] = assignment.get("assigned_public_chat_ids")
                 users.append(admin_entry)
-        
+
+        # Prefer guest_access copy of public-chat assignments (canonical for workspace switcher users)
+        teamlid_uid_list = [u["id"] for u in users if u.get("is_teamlid")]
+        if teamlid_uid_list:
+            chat_from_guest: dict = {}
+            async for gdoc in self.guest_access.find(
+                {
+                    "company_id": company_id,
+                    "owner_admin_id": admin_id,
+                    "guest_user_id": {"$in": teamlid_uid_list},
+                    "is_active": True,
+                },
+                projection={"guest_user_id": 1, "assigned_public_chat_ids": 1},
+            ):
+                if "assigned_public_chat_ids" not in gdoc:
+                    continue
+                chat_from_guest[gdoc["guest_user_id"]] = gdoc["assigned_public_chat_ids"]
+            for entry in users:
+                if not entry.get("is_teamlid"):
+                    continue
+                gid = entry.get("id")
+                if gid in chat_from_guest:
+                    entry["teamlid_public_chat_ids"] = chat_from_guest[gid]
+
         # Sort users: admins first, then by name/email
         def get_sort_key(user):
             type_weight = 0 if user.get("type") == "admin" else 1
@@ -834,24 +873,46 @@ class UserRepository(BaseRepository):
         
         return updated_user
     
+    async def _normalize_assigned_public_chat_ids(
+        self,
+        company_id: str,
+        owner_admin_id: str,
+        chat_ids: List[str],
+    ) -> List[str]:
+        """Ensure every id exists under this owner's ``public_chats``. De-duplicates, preserves order."""
+        seen = set()
+        out: List[str] = []
+        for raw in chat_ids or []:
+            cid = str(raw).strip()
+            if not cid or cid in seen:
+                continue
+            if not ObjectId.is_valid(cid):
+                raise ValueError(f"Ongeldige public chat id: {raw}")
+            doc = await self.db.public_chats.find_one({
+                "_id": ObjectId(cid),
+                "company_id": company_id,
+                "admin_id": owner_admin_id,
+            })
+            if not doc:
+                raise ValueError(f"Public chat niet gevonden: {cid}")
+            seen.add(cid)
+            out.append(cid)
+        return out
+
     async def assign_teamlid_permissions(
         self,
         company_id: str,
         admin_id: str,
         email: str,
-        permissions: dict
+        permissions: dict,
+        assigned_public_chat_ids: Optional[List[str]] = None,
     ) -> bool:
         """
         Assign teamlid permissions to a user or admin.
-        
-        Args:
-            company_id: Company identifier
-            admin_id: Admin identifier
-            email: User/Admin email
-            permissions: Dictionary of permissions
-            
-        Returns:
-            True if permissions were assigned, False otherwise
+
+        ``assigned_public_chat_ids`` when provided updates which public chats a teamlid may see under
+        this workspace owner. When omitted, existing assignments are unchanged. When PublicChat
+        permission is false, assignments are cleared.
         """
         from app.repositories.modules_repo import ModulesRepository
 
@@ -861,112 +922,98 @@ class UserRepository(BaseRepository):
         assigner_modules = (assigner or {}).get("modules") or {}
         permissions = _clamp_teamlid_permissions(permissions or {}, assigner_modules, company_modules)
 
-        # Try to find user first
-        user = await self.users.find_one({
-            "company_id": company_id,
-            "email": email
-        })
-        
+        can_publicchat = _to_bool(permissions.get("publicchat_modify_permission", False))
+        validated_chats: Optional[List[str]] = None
+        if assigned_public_chat_ids is not None:
+            validated_chats = await self._normalize_assigned_public_chat_ids(
+                company_id, admin_id, assigned_public_chat_ids
+            )
+
+        async def persist_guest_updates(guest_user_id: str) -> None:
+            can_role = _to_bool(permissions.get("role_folder_modify_permission", False))
+            can_user = _to_bool(permissions.get("user_create_modify_permission", False))
+            can_doc = _to_bool(permissions.get("document_modify_permission", False))
+            can_webchat = _to_bool(permissions.get("webchat_modify_permission", False))
+            set_payload = {
+                "can_role_write": can_role,
+                "can_user_write": can_user,
+                "can_document_write": can_doc,
+                "can_folder_write": can_role,
+                "can_publicchat_write": can_publicchat,
+                "can_webchat_write": can_webchat,
+                "is_active": True,
+                "updated_at": datetime.utcnow(),
+                "created_by": admin_id,
+            }
+            unset_payload = {}
+            if not can_publicchat:
+                unset_payload["assigned_public_chat_ids"] = ""
+            elif validated_chats is not None:
+                set_payload["assigned_public_chat_ids"] = validated_chats
+
+            upd_doc = {"$set": set_payload, "$setOnInsert": {"created_at": datetime.utcnow()}}
+            if unset_payload:
+                upd_doc["$unset"] = unset_payload
+
+            await self.guest_access.update_one(
+                {
+                    "company_id": company_id,
+                    "owner_admin_id": admin_id,
+                    "guest_user_id": guest_user_id,
+                },
+                upd_doc,
+                upsert=True,
+            )
+
+        user = await self.users.find_one({"company_id": company_id, "email": email})
         if user:
-            # Update user with teamlid permissions and add "Teamlid" to assigned_roles
             update_data = {
                 "is_teamlid": True,
                 "assigned_teamlid_by_id": admin_id,
                 "teamlid_permissions": permissions,
-                "updated_at": datetime.utcnow()
+                "updated_at": datetime.utcnow(),
             }
-            
+            if can_publicchat and validated_chats is not None:
+                update_data["teamlid_public_chat_ids"] = validated_chats
+
+            mongo_user_upd = {
+                "$set": update_data,
+                "$addToSet": {"assigned_roles": "Teamlid"},
+            }
+            if not can_publicchat:
+                mongo_user_upd["$unset"] = {"teamlid_public_chat_ids": ""}
+
             result = await self.users.update_one(
                 {"company_id": company_id, "email": email},
-                {
-                    "$set": update_data,
-                    "$addToSet": {"assigned_roles": "Teamlid"}  # Add Teamlid to assigned_roles if not present
-                }
+                mongo_user_upd,
             )
-            if result.modified_count > 0 or result.matched_count > 0:
-                # Create/update guest_access so workspace switcher shows teamlid workspace for this user
-                guest_user_id = user["user_id"]
-                can_role = _to_bool(permissions.get("role_folder_modify_permission", False))
-                can_user = _to_bool(permissions.get("user_create_modify_permission", False))
-                can_doc = _to_bool(permissions.get("document_modify_permission", False))
-                can_publicchat = _to_bool(permissions.get("publicchat_modify_permission", False))
-                can_webchat = _to_bool(permissions.get("webchat_modify_permission", False))
-                await self.guest_access.update_one(
-                    {
-                        "company_id": company_id,
-                        "owner_admin_id": admin_id,
-                        "guest_user_id": guest_user_id,
-                    },
-                    {
-                        "$set": {
-                            "can_role_write": can_role,
-                            "can_user_write": can_user,
-                            "can_document_write": can_doc,
-                            "can_folder_write": can_role,
-                            "can_publicchat_write": can_publicchat,
-                            "can_webchat_write": can_webchat,
-                            "is_active": True,
-                            "updated_at": datetime.utcnow(),
-                            "created_by": admin_id,
-                        },
-                        "$setOnInsert": {"created_at": datetime.utcnow()},
-                    },
-                    upsert=True,
-                )
-            return result.modified_count > 0
-        
-        # If not found in users, try admins
-        admin = await self.admins.find_one({
-            "company_id": company_id,
-            "email": email
-        })
-        
+            if result.matched_count > 0:
+                await persist_guest_updates(user["user_id"])
+            return bool(result.matched_count)
+
+        admin = await self.admins.find_one({"company_id": company_id, "email": email})
         if admin:
-            # Update admin with teamlid permissions
-            # Note: Admins don't have assigned_roles array, they have "Beheerder" role by default
             update_data = {
                 "is_teamlid": True,
                 "assigned_teamlid_by_id": admin_id,
                 "teamlid_permissions": permissions,
-                "updated_at": datetime.utcnow()
+                "updated_at": datetime.utcnow(),
             }
-            
+            if can_publicchat and validated_chats is not None:
+                update_data["teamlid_public_chat_ids"] = validated_chats
+
+            mongo_admin_upd: dict = {"$set": update_data}
+            if not can_publicchat:
+                mongo_admin_upd["$unset"] = {"teamlid_public_chat_ids": ""}
+
             result = await self.admins.update_one(
                 {"company_id": company_id, "email": email},
-                {"$set": update_data}
+                mongo_admin_upd,
             )
-            if result.modified_count > 0 or result.matched_count > 0:
-                # Create/update guest_access so workspace switcher shows teamlid workspace for this admin
-                guest_user_id = admin["user_id"]
-                can_role = _to_bool(permissions.get("role_folder_modify_permission", False))
-                can_user = _to_bool(permissions.get("user_create_modify_permission", False))
-                can_doc = _to_bool(permissions.get("document_modify_permission", False))
-                can_publicchat = _to_bool(permissions.get("publicchat_modify_permission", False))
-                can_webchat = _to_bool(permissions.get("webchat_modify_permission", False))
-                await self.guest_access.update_one(
-                    {
-                        "company_id": company_id,
-                        "owner_admin_id": admin_id,
-                        "guest_user_id": guest_user_id,
-                    },
-                    {
-                        "$set": {
-                            "can_role_write": can_role,
-                            "can_user_write": can_user,
-                            "can_document_write": can_doc,
-                            "can_folder_write": can_role,
-                            "can_publicchat_write": can_publicchat,
-                            "can_webchat_write": can_webchat,
-                            "is_active": True,
-                            "updated_at": datetime.utcnow(),
-                            "created_by": admin_id,
-                        },
-                        "$setOnInsert": {"created_at": datetime.utcnow()},
-                    },
-                    upsert=True,
-                )
-            return result.modified_count > 0
-        
+            if result.matched_count > 0:
+                await persist_guest_updates(admin["user_id"])
+            return bool(result.matched_count)
+
         return False
     
     async def remove_teamlid_role(
@@ -1001,7 +1048,8 @@ class UserRepository(BaseRepository):
                 "$pull": {"assigned_roles": "Teamlid"},  # Remove Teamlid from assigned_roles
                 "$unset": {
                     "assigned_teamlid_by_id": "",
-                    "teamlid_permissions": ""
+                    "teamlid_permissions": "",
+                    "teamlid_public_chat_ids": "",
                 }
             }
         )
@@ -1023,7 +1071,8 @@ class UserRepository(BaseRepository):
                 },
                 "$unset": {
                     "assigned_teamlid_by_id": "",
-                    "teamlid_permissions": ""
+                    "teamlid_permissions": "",
+                    "teamlid_public_chat_ids": "",
                 }
             }
         )

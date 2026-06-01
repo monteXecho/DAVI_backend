@@ -17,6 +17,10 @@ class CompanyUserCreate(BaseModel):
 class TeamlidPermissionAssign(BaseModel):
     email: EmailStr
     team_permissions: Optional[Dict[str, bool]] = None
+    # When PublicChat permission is granted: restrict visibility to these public chat IDs.
+    # Omitted/null = unchanged on update; omit on first assign = all chats for that workspace owner.
+    # Empty list = no public chats visible.
+    assigned_public_chat_ids: Optional[List[str]] = None
 
 class CompanyUserUpdate(BaseModel):
     id: Optional[str] = None  

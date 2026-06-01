@@ -24,7 +24,8 @@ from app.deps.db import get_db
 from app.repositories.company_repo import CompanyRepository
 from app.api.company_admin.shared import (
     get_admin_or_user_company_id,
-    check_teamlid_permission
+    check_teamlid_permission,
+    require_public_chat_access_for_teamlid,
 )
 from app.api.rag import rag_index_files
 from app.utils.html_clean_for_rag import clean_html_for_rag_indexing
@@ -273,7 +274,7 @@ async def add_url_source(
 
         # Save HTML to file
         url_safe = url.replace("https://", "").replace("http://", "").replace("/", "_").replace("?", "_").replace("=", "_")
-        file_name = f"{url_safe}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.html"
+        file_name = f"{url_safe}.html"
         file_path = os.path.join(SOURCES_DIR, company_id, admin_id, file_name)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         
@@ -556,7 +557,10 @@ async def download_source_file(
         
         if not source:
             raise HTTPException(status_code=403, detail="You don't have access to this source")
-        
+
+        if source.get("chat_id"):
+            await require_public_chat_access_for_teamlid(admin_context, db, str(source["chat_id"]))
+
         # Check if file exists
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="File not found")

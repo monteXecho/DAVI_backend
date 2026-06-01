@@ -41,7 +41,7 @@ class CompanyCoreRepository(BaseRepository):
             "max_admins": -1,  # Default: infinite
             "max_documents": -1,  # Default: infinite
             "max_roles": -1,  # Default: infinite
-            "max_public_chats": -1,  # Default: infinite
+            "max_public_chats": 2,  # Default: 2 QR-Chats per company admin
             "modules": company_modules,  # Company-level module permissions
             "created_at": now,
             "updated_at": now,
@@ -54,7 +54,7 @@ class CompanyCoreRepository(BaseRepository):
             "max_admins": -1,
             "max_documents": -1,
             "max_roles": -1,
-            "max_public_chats": -1,
+            "max_public_chats": 2,
             "modules": serialize_modules(company_modules),
             "created_at": now.isoformat(),
             "updated_at": now.isoformat(),

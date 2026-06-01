@@ -6,7 +6,9 @@ all company admin domain routers.
 """
 
 import logging
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Set, Tuple
+
+from bson import ObjectId
 
 from fastapi import Depends, Request, HTTPException
 from app.deps.auth import get_current_user, get_keycloak_admin, require_role
@@ -620,4 +622,84 @@ async def get_admin_company_id(
         "guest_permissions": guest_permissions,
         "_access_token": access_token,
     }
+
+
+async def resolve_restricted_public_chat_ids(
+    db,
+    admin_context: dict,
+) -> Optional[Set[str]]:
+    """
+    Workspace owner sees all chats (None).
+
+    Teamlid / guest workspace viewing another owner's data: optionally restricted to explicit
+    public chat Mongo ids stored on ``company_guest_access.assigned_public_chat_ids`` or
+    ``teamlid_public_chat_ids`` on the user's admin/user row.
+
+    Returns:
+        ``None`` – no restriction (all chats under this workspace ``admin_id``).
+        Empty ``set()`` – restriction active but no chats allowed.
+        Non-empty ``set`` – only these chat id strings are visible.
+    """
+    real_uid = admin_context.get("real_admin_id")
+    owner_uid = admin_context.get("admin_id")
+    company_id = admin_context.get("company_id")
+    if not real_uid or not owner_uid or not company_id:
+        return None
+    if real_uid == owner_uid:
+        return None
+
+    repo = CompanyRepository(db)
+    guest_entry = await repo.get_guest_access(
+        company_id=company_id,
+        guest_user_id=real_uid,
+        owner_admin_id=owner_uid,
+    )
+
+    assigned = None
+    if guest_entry is not None:
+        assigned = guest_entry.get("assigned_public_chat_ids")
+
+    if assigned is None:
+        email = admin_context.get("admin_email") or admin_context.get("user_email")
+        user_type = admin_context.get("user_type", "company_admin")
+        if email:
+            if user_type == "company_admin":
+                rec = await db.company_admins.find_one({"email": email, "company_id": company_id})
+            else:
+                rec = await db.company_users.find_one({"email": email, "company_id": company_id})
+            if rec is not None:
+                assigned = rec.get("teamlid_public_chat_ids")
+
+    if assigned is None:
+        return None
+    return {str(x).strip() for x in assigned if str(x).strip()}
+
+
+async def require_public_chat_access_for_teamlid(
+    admin_context: dict,
+    db,
+    chat_id: str,
+) -> None:
+    """
+    For teamlid users with an explicit assignment list: deny access unless ``chat_id`` is allowed.
+    Uses HTTP 404 to avoid leaking existence of chats outside the assignment.
+    """
+    scope = await resolve_restricted_public_chat_ids(db, admin_context)
+    if scope is not None:
+        cid = (chat_id or "").strip()
+        if cid not in scope:
+            raise HTTPException(status_code=404, detail="Public chat not found")
+        if not ObjectId.is_valid(cid):
+            raise HTTPException(status_code=404, detail="Public chat not found")
+
+
+def assert_workspace_owner_for_public_chat_mutation(admin_context: dict) -> None:
+    """Creating or deleting a public chat is owner-only."""
+    real_uid = admin_context.get("real_admin_id")
+    owner_uid = admin_context.get("admin_id")
+    if real_uid != owner_uid:
+        raise HTTPException(
+            status_code=403,
+            detail="Alleen de hoofdbeheerder kan public chats aanmaken of verwijderen.",
+        )
 
