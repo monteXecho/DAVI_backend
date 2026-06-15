@@ -27,7 +27,7 @@ from app.api.company_admin.shared import (
     check_teamlid_permission,
     require_public_chat_access_for_teamlid,
 )
-from app.api.rag import rag_index_files
+from app.api.rag import rag_index_files, rag_remove_indexed_files, build_rag_file_id
 from app.utils.html_clean_for_rag import clean_html_for_rag_indexing
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -494,7 +494,16 @@ async def delete_source(
         
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        
+
+        # Remove indexed chunks before deleting DB record / disk file
+        index_id = f"webchat-{company_id}-{admin_id}"
+        file_name = source.get("file_name")
+        if file_name:
+            try:
+                await rag_remove_indexed_files(index_id, [build_rag_file_id(index_id, file_name)])
+            except Exception as e:
+                logger.warning(f"RAG remove failed for webchat source {source_id}: {e}")
+
         # Delete file if it exists
         file_path = source.get("file_path")
         if file_path and os.path.exists(file_path):

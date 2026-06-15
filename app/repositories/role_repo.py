@@ -246,6 +246,14 @@ class RoleRepository(BaseRepository):
             if not role:
                 continue
 
+            role_documents = await self.documents.find({
+                "company_id": company_id,
+                "user_id": admin_id,
+                "upload_type": role_name,
+            }).to_list(length=None)
+            from app.services.rag_lifecycle import remove_documentchat_for_mongo_docs
+            await remove_documentchat_for_mongo_docs(company_id, admin_id, role_documents)
+
             # Delete all documents uploaded by admin for this role
             delete_docs_result = await self.documents.delete_many({
                 "company_id": company_id,
@@ -511,6 +519,9 @@ class RoleRepository(BaseRepository):
             if not role_documents:
                 return 0
 
+            from app.services.rag_lifecycle import remove_documentchat_for_mongo_docs
+            await remove_documentchat_for_mongo_docs(company_id, admin_id, role_documents)
+
             files_deleted = 0
             for doc in role_documents:
                 file_path = doc.get("path")
@@ -570,6 +581,9 @@ class RoleRepository(BaseRepository):
             
             if not role_documents:
                 return 0
+
+            from app.services.rag_lifecycle import remove_documentchat_for_mongo_docs_by_owner
+            await remove_documentchat_for_mongo_docs_by_owner(company_id, role_documents)
 
             files_deleted = 0
             for doc in role_documents:

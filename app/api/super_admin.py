@@ -391,6 +391,17 @@ async def delete_company(
     files_deleted = []
     docs_deleted_total = 0
 
+    # 1b) Purge all RAG indexes + chat/source DB rows for this company
+    from app.services.rag_lifecycle import purge_company_rag_indexes, purge_company_chat_db_and_disk
+    try:
+        await purge_company_rag_indexes(db, company_id)
+    except Exception:
+        logger.exception("Failed to purge RAG indexes for company %s", company_id)
+    try:
+        await purge_company_chat_db_and_disk(db, company_id)
+    except Exception:
+        logger.exception("Failed to purge chat DB/disk for company %s", company_id)
+
     # 2) Delete ALL roles for this company (simple delete by company_id)
     roles_delete_result = await db.roles.delete_many({"company_id": company_id})
     roles_deleted = roles_delete_result.deleted_count
@@ -491,6 +502,16 @@ async def delete_company_admin(
         kc_deleted = await run_in_threadpool(_delete_keycloak_user_by_email_sync, kc_admin, email)
     except Exception:
         logger.exception("Keycloak delete failed for admin %s", email)
+
+    from app.services.rag_lifecycle import purge_admin_rag_indexes, purge_admin_chat_db_and_disk
+    try:
+        await purge_admin_rag_indexes(db, company_id, admin_id)
+    except Exception:
+        logger.exception("Failed to purge RAG indexes for admin %s", admin_id)
+    try:
+        await purge_admin_chat_db_and_disk(db, company_id, admin_id)
+    except Exception:
+        logger.exception("Failed to purge chat DB/disk for admin %s", admin_id)
 
     # 1) Delete role documents uploaded by this admin
     role_docs_deleted = await repo.delete_role_documents_by_admin(company_id, admin_id)

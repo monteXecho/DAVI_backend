@@ -30,7 +30,17 @@ _module_logger = logging.getLogger(__name__)
 
 class FolderRepository(BaseRepository):
     """Repository for folder management operations."""
-    
+
+    async def _remove_rag_for_folder_documents(
+        self,
+        company_id: str,
+        admin_id: str,
+        documents: list,
+    ) -> None:
+        from app.services.rag_lifecycle import remove_documentchat_for_mongo_docs
+
+        await remove_documentchat_for_mongo_docs(company_id, admin_id, documents)
+
     async def get_folders(
         self,
         company_id: str,
@@ -499,6 +509,11 @@ class FolderRepository(BaseRepository):
                         logger.warning(log_msg)
                         print(log_msg, file=sys.stderr, flush=True)
                     
+                    # STEP 4b: Remove indexed RAG chunks before MongoDB delete
+                    await self._remove_rag_for_folder_documents(
+                        company_id, admin_id, folder_documents
+                    )
+
                     # STEP 5: Delete documents from MongoDB
                     delete_docs_result = await self.documents.delete_many({
                         "company_id": company_id,
@@ -609,6 +624,15 @@ class FolderRepository(BaseRepository):
                     
                     # Now proceed with folder deletion
                     # Note: Use folder_name for document query, not role_name
+                    folder_documents = await self.documents.find({
+                        "company_id": company_id,
+                        "user_id": admin_id,
+                        "upload_type": folder_name,
+                    }).to_list(length=None)
+                    await self._remove_rag_for_folder_documents(
+                        company_id, admin_id, folder_documents
+                    )
+
                     delete_docs_result = await self.documents.delete_many({
                         "company_id": company_id,
                         "user_id": admin_id,
@@ -958,6 +982,9 @@ class FolderRepository(BaseRepository):
                 document = await self.documents.find_one(query)
                 if not document:
                     continue
+
+                from app.services.rag_lifecycle import remove_documentchat_index
+                await remove_documentchat_index(company_id, admin_id, [file_name])
                 
                 file_path = document.get("path")
                 storage_path = document.get("storage_path")

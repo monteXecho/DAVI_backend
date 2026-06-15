@@ -77,10 +77,29 @@ class DocumentRepository:
         return await self.collection.find({"company_id": company_id}).to_list(length=None)
 
     async def delete_documents_by_user(self, user_id: str) -> int:
+        docs = await self.collection.find({"user_id": user_id}).to_list(length=None)
+        if docs:
+            from collections import defaultdict
+            from app.services.rag_lifecycle import remove_documentchat_index
+
+            by_company: dict[str, list[str]] = defaultdict(list)
+            for doc in docs:
+                company_id = doc.get("company_id")
+                file_name = doc.get("file_name")
+                if company_id and file_name:
+                    by_company[str(company_id)].append(file_name)
+            for company_id, file_names in by_company.items():
+                await remove_documentchat_index(company_id, user_id, file_names)
+
         result = await self.collection.delete_many({"user_id": user_id})
         return result.deleted_count
 
     async def delete_documents_by_company(self, company_id: str) -> int:
+        docs = await self.collection.find({"company_id": company_id}).to_list(length=None)
+        if docs:
+            from app.services.rag_lifecycle import remove_documentchat_for_mongo_docs_by_owner
+            await remove_documentchat_for_mongo_docs_by_owner(company_id, docs)
+
         result = await self.collection.delete_many({"company_id": company_id})
         return result.deleted_count
 

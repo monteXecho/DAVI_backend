@@ -124,6 +124,11 @@ class NextcloudSyncRepository(BaseRepository):
                                     "user_id": admin_id,
                                     "upload_type": folder_name
                                 }).to_list(length=None)
+
+                                from app.services.rag_lifecycle import remove_documentchat_for_mongo_docs
+                                await remove_documentchat_for_mongo_docs(
+                                    company_id, admin_id, docs_to_delete
+                                )
                                 
                                 for doc in docs_to_delete:
                                     file_path = doc.get("path")
@@ -269,6 +274,9 @@ class NextcloudSyncRepository(BaseRepository):
                         continue
                     
                     try:
+                        from app.services.rag_lifecycle import remove_documentchat_index
+                        await remove_documentchat_index(company_id, admin_id, [file_name])
+
                         file_path = doc_to_delete.get("path")
                         
                         if file_path and os.path.exists(file_path):

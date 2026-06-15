@@ -204,6 +204,14 @@ class UserRepository(BaseRepository):
                 return 0
 
             user_ids_to_delete = [u["user_id"] for u in users_to_delete]
+
+            from app.services.rag_lifecycle import purge_user_rag_indexes
+            for uid in user_ids_to_delete:
+                try:
+                    await purge_user_rag_indexes(company_id, uid)
+                except Exception as e:
+                    logger.warning("RAG purge failed for user %s: %s", uid, e)
+
             result = await self.users.delete_many({
                 "company_id": company_id,
                 "user_id": {"$in": user_ids_to_delete}
@@ -268,8 +276,14 @@ class UserRepository(BaseRepository):
                         except Exception as e:
                             logger.warning(f"Failed to delete Keycloak user {email}: {e}")
 
-            # Delete user documents
+            # Delete user documents (RAG purged per user below)
             if user_ids:
+                from app.services.rag_lifecycle import purge_user_rag_indexes
+                for uid in user_ids:
+                    try:
+                        await purge_user_rag_indexes(company_id, uid)
+                    except Exception as e:
+                        logger.warning("RAG purge failed for user %s: %s", uid, e)
                 await self.documents.delete_many({"user_id": {"$in": user_ids}})
 
             # Delete users from MongoDB
@@ -1337,6 +1351,11 @@ class UserRepository(BaseRepository):
                 document = await self.documents.find_one(query)
                 if not document:
                     continue
+
+                cid = user.get("company_id")
+                if cid:
+                    from app.services.rag_lifecycle import remove_documentchat_index
+                    await remove_documentchat_index(cid, user_id, [file_name])
 
                 file_path = document.get("path")
 

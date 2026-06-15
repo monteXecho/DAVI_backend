@@ -15,6 +15,7 @@ Handles all public chat-related endpoints:
 import logging
 import os
 import re
+import shutil
 import asyncio
 import hashlib
 import httpx
@@ -33,7 +34,8 @@ from app.api.company_admin.shared import (
     require_public_chat_access_for_teamlid,
     assert_workspace_owner_for_public_chat_mutation,
 )
-from app.api.rag import rag_index_files
+from app.api.rag import rag_index_files, rag_remove_indexed_files, build_rag_file_id
+from app.services.rag_lifecycle import migrate_publicchat_index_on_rename, purge_publicchat_index
 from app.utils.html_clean_for_rag import clean_html_for_rag_indexing
 from app.services.multi_index_answer_merge import answer_matches_documents_no_information_disclaimer
 from app.models.company_admin_schema import (
@@ -681,25 +683,13 @@ async def update_public_chat(
         )
 
         if renamed_for_rag:
-            await _reindex_public_chat_sources_after_chat_rename(
+            await migrate_publicchat_index_on_rename(
                 db,
                 company_id=company_id,
                 admin_id=admin_id,
                 chat_id=chat_id,
+                old_chat_name=old_chat_name,
                 new_chat_name=update_data["chat_name"],
-            )
-            await db.public_chat_sources.update_many(
-                {
-                    "company_id": company_id,
-                    "admin_id": admin_id,
-                    "chat_id": chat_id,
-                },
-                {
-                    "$set": {
-                        "chat_name": update_data["chat_name"],
-                        "updated_at": datetime.utcnow(),
-                    }
-                },
             )
             await db.public_chat_sources.update_many(
                 {
@@ -752,6 +742,32 @@ async def delete_public_chat(
             raise HTTPException(status_code=404, detail="Public chat not found")
         
         chat_name = chat.get("chat_name")
+
+        if chat_name:
+            try:
+                await purge_publicchat_index(company_id, admin_id, chat_name)
+            except Exception as e:
+                logger.warning(f"RAG purge failed for public chat {chat_id}: {e}")
+
+        sources = await db.public_chat_sources.find({
+            "company_id": company_id,
+            "admin_id": admin_id,
+            "chat_id": chat_id,
+        }).to_list(length=None)
+        for source in sources:
+            file_path = source.get("file_path")
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    logger.warning(f"Failed to delete file {file_path}: {e}")
+
+        chat_sources_dir = os.path.join(SOURCES_DIR, company_id, admin_id, "public_chat", chat_id)
+        if os.path.isdir(chat_sources_dir):
+            try:
+                shutil.rmtree(chat_sources_dir)
+            except Exception as e:
+                logger.warning(f"Failed to delete public chat sources dir {chat_sources_dir}: {e}")
 
         await db.public_chat_query_history.delete_many({
             "company_id": company_id,
@@ -1445,7 +1461,17 @@ async def delete_chat_source(
         
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        
+
+        # Remove indexed chunks before deleting DB record / disk file
+        chat_name = chat.get("chat_name")
+        index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
+        logical = source.get("rag_logical_file_name") or source.get("file_name")
+        if logical:
+            try:
+                await rag_remove_indexed_files(index_id, [build_rag_file_id(index_id, logical)])
+            except Exception as e:
+                logger.warning(f"RAG remove failed for public chat source {source_id}: {e}")
+
         # Delete file if exists
         file_path = source.get("file_path")
         if file_path and os.path.exists(file_path):

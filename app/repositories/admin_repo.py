@@ -277,6 +277,15 @@ class AdminRepository(BaseRepository):
         
         result = await self.admins.delete_one({"company_id": company_id, "user_id": user_id})
         if result.deleted_count > 0:
+            from app.services.rag_lifecycle import purge_admin_rag_indexes, purge_admin_chat_db_and_disk
+            try:
+                await purge_admin_rag_indexes(self.db, company_id, user_id)
+            except Exception as e:
+                logger.warning("RAG purge failed for admin %s: %s", user_id, e)
+            try:
+                await purge_admin_chat_db_and_disk(self.db, company_id, user_id)
+            except Exception as e:
+                logger.warning("Chat DB/disk purge failed for admin %s: %s", user_id, e)
             # Clean up related data
             await self.documents.delete_many({"user_id": admin["user_id"]})
             await self.guest_access.delete_many({

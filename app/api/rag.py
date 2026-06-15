@@ -6,9 +6,11 @@ import json
 from typing import List, Optional
 
 # RAG_INDEX_URL = "http://host.docker.internal:1416/davi_indexing/run"
+# RAG_REMOVE_URL = "http://host.docker.internal:1416/davi_indexing_remove/run"
 # RAG_QUERY_URL = "http://host.docker.internal:1416/davi_query/run"
 
 RAG_INDEX_URL = "https://demo.daviapp.nl/rag/davi_indexing/run"
+RAG_REMOVE_URL = "https://demo.daviapp.nl/rag/davi_indexing_remove/run"
 RAG_QUERY_URL = "https://demo.daviapp.nl/rag/davi_query/run"
 
 logger = logging.getLogger("uvicorn")
@@ -23,6 +25,11 @@ def _is_custom_chat_index(actual_index_id: str) -> bool:
             or actual_index_id.startswith("webchat-")
         )
     )
+
+
+def build_rag_file_id(index_id: str, logical_name: str) -> str:
+    """Single file_id suffix used in OpenSearch ``meta.file_id``."""
+    return f"{index_id}--{str(logical_name).strip()}"
 
 
 def build_rag_file_ids(
@@ -69,6 +76,22 @@ def build_rag_file_ids(
     if is_role_based:
         return [f"{company_id}-{user_id}--{os.path.basename(fp)}" for fp in file_paths]
     return [f"{user_id}--{os.path.basename(fp)}" for fp in file_paths]
+
+
+def _check_rag_remove_response_payload(result) -> None:
+    """RAG remove may return HTTP 200 with an error string inside ``result.message``."""
+    if not isinstance(result, dict):
+        return
+    result_data = result.get("result", result)
+    if not isinstance(result_data, dict):
+        return
+    message = result_data.get("message", "")
+    if message and (
+        message.startswith("Error")
+        or "error" in message.lower()
+        or "failed" in message.lower()
+    ):
+        raise RuntimeError(f"RAG remove failed: {message}")
 
 
 def _check_rag_index_response_payload(result) -> None:
@@ -303,6 +326,82 @@ async def rag_index_files(
         file_metadata,
         rag_file_logical_names,
     )
+
+
+# ------------------------------------------------------------
+#  REMOVE INDEXED FILES
+# ------------------------------------------------------------
+async def _async_rag_remove_indexed_files(
+    index_id: str,
+    file_ids: Optional[List[str]] = None,
+    delete_entire_index: bool = False,
+):
+    if delete_entire_index:
+        payload = {"index_id": index_id, "delete_entire_index": True}
+    elif file_ids:
+        payload = {"index_id": index_id, "file_ids": file_ids}
+    else:
+        return {"message": "No file_ids to remove"}
+
+    logger.info(f"Sending RAG remove request to {RAG_REMOVE_URL}: {payload}")
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(RAG_REMOVE_URL, json=payload)
+        logger.info(f"RAG remove response: {response.status_code}, body={response.text[:500]}")
+        response.raise_for_status()
+        result = response.json()
+        _check_rag_remove_response_payload(result)
+        return result
+
+
+def _sync_rag_remove_indexed_files(
+    index_id: str,
+    file_ids: Optional[List[str]] = None,
+    delete_entire_index: bool = False,
+):
+    if delete_entire_index:
+        payload = {"index_id": index_id, "delete_entire_index": True}
+    elif file_ids:
+        payload = {"index_id": index_id, "file_ids": file_ids}
+    else:
+        return {"message": "No file_ids to remove"}
+
+    logger.info(f"(SYNC) Sending RAG remove request to {RAG_REMOVE_URL}: {payload}")
+
+    with httpx.Client(timeout=httpx.Timeout(120.0)) as client:
+        response = client.post(RAG_REMOVE_URL, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        _check_rag_remove_response_payload(result)
+        return result
+
+
+async def rag_remove_indexed_files(index_id: str, file_ids: List[str]):
+    """
+    Remove indexed chunks from OpenSearch for the given ``file_ids``.
+
+    Call this when DAVI deletes a document/source from the DB so re-upload does not duplicate chunks.
+    """
+    if not file_ids:
+        return None
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return _sync_rag_remove_indexed_files(index_id, file_ids)
+    return await _async_rag_remove_indexed_files(index_id, file_ids)
+
+
+async def rag_delete_entire_index(index_id: str):
+    """Remove all chunks in an OpenSearch index (chat rename, admin/company purge)."""
+    if not index_id:
+        return None
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return _sync_rag_remove_indexed_files(index_id, delete_entire_index=True)
+    return await _async_rag_remove_indexed_files(index_id, delete_entire_index=True)
 
 
 # ------------------------------------------------------------
