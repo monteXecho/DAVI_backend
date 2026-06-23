@@ -11,7 +11,7 @@ import os
 import shutil
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import unquote
 from fastapi import APIRouter, HTTPException, Depends, Body
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -22,7 +22,15 @@ from bson import ObjectId
 from app.deps.db import get_db
 from app.api.rag import rag_query
 from app.api.company_admin.public_chat import get_public_chat_index_id
-from app.services.multi_index_answer_merge import answer_matches_documents_no_information_disclaimer
+from app.services.public_chat_query_rag import (
+    build_linked_sources_from_rag,
+    classify_answer,
+    file_names_from_pass_ids,
+    find_admin_corrected_pass_ids_for_question,
+    normalize_public_chat_question,
+    normalize_rag_documents,
+    parse_rag_payload,
+)
 from app.core.highlight_snippet_in_pdf import find_and_highlight
 from motor.motor_asyncio import AsyncIOMotorDatabase
 import hashlib
@@ -31,18 +39,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/public-chat", tags=["Public Chat"])
 
 security = HTTPBasic()
-
-
-def _answer_is_meaningful(answer_text: Optional[str]) -> bool:
-    """True if RAG returned a non-empty answer (vs placeholder)."""
-    if answer_text is None:
-        return False
-    s = str(answer_text).strip()
-    if not s:
-        return False
-    if s.lower() == "no answer generated":
-        return False
-    return True
 
 
 async def insert_public_chat_query_history(
@@ -57,6 +53,10 @@ async def insert_public_chat_query_history(
     answer: Optional[str] = None,
     error_detail: Optional[str] = None,
     linked_source_count: int = 0,
+    rag_pass_ids: Optional[List[str]] = None,
+    rag_sources: Optional[List[dict]] = None,
+    used_admin_correction: bool = False,
+    correction_from_history_id: Optional[str] = None,
 ) -> None:
     """Persist a public-chat question for company-admin history."""
     try:
@@ -77,6 +77,14 @@ async def insert_public_chat_query_history(
             "linked_source_count": int(linked_source_count),
             "created_at": datetime.now(timezone.utc),
         }
+        if rag_pass_ids is not None:
+            doc["rag_pass_ids"] = list(rag_pass_ids)
+        if rag_sources is not None:
+            doc["rag_sources"] = rag_sources
+        if used_admin_correction:
+            doc["used_admin_correction"] = True
+        if correction_from_history_id:
+            doc["correction_from_history_id"] = correction_from_history_id
         await db.public_chat_query_history.insert_one(doc)
     except Exception as e:
         logger.warning("insert_public_chat_query_history failed: %s", e, exc_info=True)
@@ -359,7 +367,7 @@ async def query_public_chat(
 
         chat_id_str = str(chat["_id"])
         stored_chat_name = chat.get("chat_name", chat_name)
-        qtext = (request.question or "").strip()
+        qtext = normalize_public_chat_question(request.question or "")
 
         # Note: Password verification is handled by /verify-password endpoint
         # Once verified, users can query without sending password again
@@ -423,7 +431,40 @@ async def query_public_chat(
                 status_code=400,
                 detail="No valid sources found for querying"
             )
-        
+
+        using_admin_correction = False
+        correction_from_history_id: Optional[str] = None
+        admin_correction = await find_admin_corrected_pass_ids_for_question(
+            db,
+            company_id=company_id,
+            admin_id=admin_id,
+            chat_id=chat_id_str,
+            question=qtext,
+        )
+        if admin_correction:
+            valid_ids = set(file_ids)
+            narrowed = [
+                fid for fid in admin_correction["corrected_pass_ids"] if fid in valid_ids
+            ]
+            if narrowed:
+                file_ids = narrowed
+                file_names = file_names_from_pass_ids(narrowed)
+                using_admin_correction = True
+                correction_from_history_id = admin_correction.get("history_id")
+                logger.info(
+                    "Public chat exact-question match: using admin-corrected pass_ids "
+                    "(chat_id=%s history_id=%s count=%s)",
+                    chat_id_str,
+                    correction_from_history_id,
+                    len(file_ids),
+                )
+            else:
+                logger.warning(
+                    "Admin correction found for question but no corrected file_ids are "
+                    "still active in chat %s; using full source set",
+                    chat_id_str,
+                )
+
         # Query RAG with retry logic for index not found errors
         max_retries = 3
         retry_delay = 1  # seconds
@@ -433,7 +474,7 @@ async def query_public_chat(
             try:
                 rag_result = await rag_query(
                     pass_ids=",".join(file_ids),
-                    question=request.question,
+                    question=qtext,
                     file_names=file_names,
                     company_id=company_id,
                     index_id=index_id
@@ -489,139 +530,29 @@ async def query_public_chat(
             )
         
         try:
-            
-            # Parse RAG result
-            answer_data = (
-                rag_result.get("result", [{}])[1]
-                if isinstance(rag_result.get("result"), list)
-                else rag_result.get("result", {})
+            answer_text, raw_docs = parse_rag_payload(rag_result)
+            normalized_docs, used_file_ids = normalize_rag_documents(raw_docs, sources)
+            rag_sources = build_linked_sources_from_rag(
+                sources, used_file_ids, normalized_docs, index_id
             )
-            
-            answer_text = answer_data.get("data", "No answer generated")
-            
-            # Get documents from RAG result (same format as ask endpoint)
-            raw_docs = answer_data.get("documents", []) or rag_result.get("documents", [])
-            
-            # Keep full raw_docs - frontend filterDocumentsByCitations maps [3] -> documents[2]
-            # Normalize documents to match Document Chat format
-            normalized_docs = []
-            used_file_ids = set()  # Track used file_ids for better matching
-            for doc in raw_docs:
-                meta = doc.get("meta", {})
-                file_id = meta.get("file_id", "")
-                file_path = meta.get("file_path", "")
-                
-                # Find corresponding source to get type and url
-                # Try matching by file_id first (most reliable), then by file_name
-                file_name = meta.get("file_name", "")
-                source_info = None
-                
-                # Extract filename from file_id if it follows the pattern: {index_id}--{filename}
-                file_id_filename = None
-                if file_id and "--" in file_id:
-                    file_id_filename = file_id.split("--", 1)[1]
-                
-                # Try to match source by file_id filename or file_name
-                for s in sources:
-                    source_file_name = s.get("file_name", "")
-                    source_rag_logical = (s.get("rag_logical_file_name") or "").strip()
-                    # Match by exact file_name or by filename extracted from file_id
-                    if source_file_name == file_name or (
-                        file_id_filename
-                        and (
-                            source_file_name == file_id_filename
-                            or source_rag_logical == file_id_filename
-                        )
-                    ):
-                        source_info = s
-                        break
-                
-                if not source_info:
-                    source_info = {}
-                
-                used_file_ids.add(file_id)
-                
-                # Prefer source_url and source_title from RAG metadata, fallback to database
-                source_url_val = meta.get("source_url") or source_info.get("url", "")
-                source_title_val = meta.get("source_title") or source_info.get("title", "")
-                # Use full URL as title when no title (same as WebChat)
-                if source_url_val and not source_title_val:
-                    source_title_val = source_url_val
 
-                original_path = meta.get("original_file_path") or (source_info.get("file_path") if source_info else "")
-
-                normalized_docs.append({
-                    "content": doc.get("content", ""),
-                    "meta": {
-                        "file_id": file_id,
-                        "file_path": source_info.get("file_path", "") if source_info else file_path,
-                        "original_file_path": original_path,
-                        "page_number": meta.get("page_number", 1),
-                        "file_name": file_name,
-                        "type": source_info.get("type", ""),
-                        "url": source_url_val,
-                        "score": meta.get("score", None),
-                        "source_url": source_url_val,
-                        "source_title": source_title_val or source_info.get("file_name", ""),
-                    }
-                })
-            
-            # Filter sources to only include those that were actually used in the RAG response
-            # Match by file_name or by extracting filename from file_id
-            filtered_sources = []
-            for s in sources:
-                source_file_name = s.get("file_name", "")
-                source_rag_logical = (s.get("rag_logical_file_name") or "").strip()
-                # Check if this source matches any used file_id
-                matches = False
-                for uid in used_file_ids:
-                    if "--" in uid:
-                        file_id_filename = uid.split("--", 1)[1]
-                        if (
-                            source_file_name == file_id_filename
-                            or source_rag_logical == file_id_filename
-                        ):
-                            matches = True
-                            break
-                    # Also check direct file_name match
-                    if source_file_name == uid:
-                        matches = True
-                        break
-                
-                # Also check if file_name matches any normalized doc file_name
-                if not matches:
-                    for doc in normalized_docs:
-                        if doc["meta"].get("file_name") == source_file_name:
-                            matches = True
-                            break
-                
-                if matches:
-                    filtered_sources.append({
-                        "type": s.get("type", ""),
-                        "file_name": source_file_name,
-                        "url": s.get("url")
-                    })
-            
             # Highlight documents (similar to DocumentChat)
             output_dir = os.path.join("output", "highlighted")
             await run_in_threadpool(prepare_highlighted_dir, output_dir)
             await run_in_threadpool(highlight_public_chat_documents, normalized_docs, output_dir, sources)
 
-            linked_source_count = len(filtered_sources)
-            shown_sources = linked_source_count > 0
-            has_meaningful = _answer_is_meaningful(answer_text)
-            no_info_reply = answer_matches_documents_no_information_disclaimer(answer_text)
-            has_ans = has_meaningful and shown_sources and not no_info_reply
-            if has_ans:
-                err_detail = None
-            elif no_info_reply:
-                err_detail = "Geen relevante informatie in de aangeleverde documenten"
-            elif not shown_sources:
-                err_detail = "Geen gekoppelde bron voor dit antwoord"
-            elif not has_meaningful:
-                err_detail = "Geen inhoudelijk antwoord gegenereerd"
-            else:
-                err_detail = "Geen inhoudelijk antwoord gegenereerd"
+            linked_source_count = len(rag_sources)
+            has_ans, err_detail = classify_answer(answer_text, linked_source_count)
+
+            # Legacy shape for API response consumers
+            filtered_sources = [
+                {
+                    "type": s.get("type", ""),
+                    "file_name": s.get("file_name", ""),
+                    "url": s.get("url"),
+                }
+                for s in rag_sources
+            ]
 
             await insert_public_chat_query_history(
                 db,
@@ -634,13 +565,17 @@ async def query_public_chat(
                 answer=answer_text,
                 error_detail=err_detail,
                 linked_source_count=linked_source_count,
+                rag_pass_ids=file_ids,
+                rag_sources=rag_sources,
+                used_admin_correction=using_admin_correction,
+                correction_from_history_id=correction_from_history_id,
             )
 
             return {
                 "success": True,
-                "answer": answer_text,  # Use parsed answer_text
+                "answer": answer_text,
                 "documents": normalized_docs,
-                "sources": filtered_sources
+                "sources": filtered_sources,
             }
         except Exception as rag_error:
             logger.error(f"RAG query failed: {rag_error}")

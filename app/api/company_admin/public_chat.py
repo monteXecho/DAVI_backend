@@ -37,11 +37,17 @@ from app.api.company_admin.shared import (
 from app.api.rag import rag_index_files, rag_remove_indexed_files, build_rag_file_id
 from app.services.rag_lifecycle import migrate_publicchat_index_on_rename, purge_publicchat_index
 from app.utils.html_clean_for_rag import clean_html_for_rag_indexing
-from app.services.multi_index_answer_merge import answer_matches_documents_no_information_disclaimer
+from app.services.public_chat_query_rag import (
+    history_bucket_item,
+    resolve_active_chat_sources_by_ids,
+    run_public_chat_rag,
+    serialize_history_row,
+)
 from app.models.company_admin_schema import (
     PublicChatCreate,
     PublicChatUpdate,
-    PublicChatOut
+    PublicChatOut,
+    PublicChatCorrectSourcesRequest,
 )
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -535,38 +541,12 @@ async def get_public_chat_query_history(
         )
         docs = await cursor.to_list(length=500)
 
-        def serialize(doc):
-            dt = doc.get("created_at")
-            return {
-                "id": str(doc["_id"]),
-                "question": doc.get("question", ""),
-                "answer": doc.get("answer"),
-                "has_answer": doc.get("has_answer", False),
-                "error_detail": doc.get("error_detail"),
-                "linked_source_count": doc.get("linked_source_count"),
-                "created_at": dt.isoformat() if hasattr(dt, "isoformat") else None,
-            }
-
         with_answer = []
         without_answer = []
         for doc in docs:
-            item = serialize(doc)
-            lc = doc.get("linked_source_count")
-            downgrade_disclaimer = (
-                bool(doc.get("has_answer"))
-                and answer_matches_documents_no_information_disclaimer(doc.get("answer"))
-            )
-            downgrade_no_linked = bool(doc.get("has_answer")) and lc is not None and int(lc) == 0
-            if downgrade_disclaimer or downgrade_no_linked:
-                item["has_answer"] = False
-                if not item.get("error_detail"):
-                    item["error_detail"] = (
-                        "Geen relevante informatie in de aangeleverde documenten"
-                        if downgrade_disclaimer
-                        else "Geen gekoppelde bron voor dit antwoord"
-                    )
-                without_answer.append(item)
-            elif doc.get("has_answer"):
+            item = serialize_history_row(doc)
+            history_bucket_item(item, doc)
+            if item["has_answer"]:
                 with_answer.append(item)
             else:
                 without_answer.append(item)
@@ -586,6 +566,119 @@ async def get_public_chat_query_history(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to load query history: {str(e)}",
+        )
+
+
+@router.post("/public-chats/{chat_id}/query-history/{history_id}/correct-sources")
+async def correct_public_chat_query_sources(
+    chat_id: str,
+    history_id: str,
+    payload: PublicChatCorrectSourcesRequest,
+    admin_context=Depends(get_admin_or_user_company_id),
+    db=Depends(get_db),
+):
+    """
+  Admin human-in-the-loop: pick existing indexed chat sources for one history question,
+  re-run RAG with only those file_ids, and store the corrected answer + source scope.
+    """
+    await check_teamlid_permission(admin_context, db, "publicchat")
+    await require_public_chat_access_for_teamlid(admin_context, db, chat_id)
+
+    company_id = admin_context["company_id"]
+    admin_id = admin_context["admin_id"]
+    corrector = (
+        admin_context.get("admin_email")
+        or admin_context.get("user_email")
+        or admin_context.get("real_admin_id")
+        or admin_id
+    )
+
+    try:
+        ObjectId(history_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Ongeldige geschiedenis-id")
+
+    try:
+        chat = await db.public_chats.find_one({
+            "_id": ObjectId(chat_id),
+            "company_id": company_id,
+            "admin_id": admin_id,
+        })
+        if not chat:
+            raise HTTPException(status_code=404, detail="Public chat not found")
+
+        history = await db.public_chat_query_history.find_one({
+            "_id": ObjectId(history_id),
+            "company_id": company_id,
+            "admin_id": admin_id,
+            "chat_id": chat_id,
+        })
+        if not history:
+            raise HTTPException(status_code=404, detail="Vraag niet gevonden in geschiedenis")
+
+        question = (history.get("question") or "").strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="Vraagtekst ontbreekt in geschiedenis")
+
+        chat_name = chat.get("chat_name", history.get("chat_name", ""))
+
+        _ordered_sources, pass_ids, corrected_sources = await resolve_active_chat_sources_by_ids(
+            db,
+            company_id=company_id,
+            admin_id=admin_id,
+            chat_id=chat_id,
+            source_ids=payload.source_ids,
+        )
+
+        all_sources = await db.public_chat_sources.find({
+            "company_id": company_id,
+            "admin_id": admin_id,
+            "chat_id": chat_id,
+            "status": "active",
+        }).to_list(length=None)
+
+        rag_out = await run_public_chat_rag(
+            question=question,
+            company_id=company_id,
+            admin_id=admin_id,
+            chat_name=chat_name,
+            pass_file_ids=pass_ids,
+            sources=all_sources,
+        )
+
+        now = datetime.now(timezone.utc)
+        update_fields = {
+            "corrected_pass_ids": pass_ids,
+            "corrected_sources": corrected_sources,
+            "sources_corrected_at": now,
+            "sources_corrected_by": str(corrector),
+            "answer_from_correction": True,
+            "answer": rag_out["answer"],
+            "has_answer": rag_out["has_answer"],
+            "error_detail": rag_out["error_detail"],
+            "linked_source_count": len(corrected_sources),
+        }
+
+        await db.public_chat_query_history.update_one(
+            {"_id": ObjectId(history_id)},
+            {"$set": update_fields},
+        )
+
+        updated = await db.public_chat_query_history.find_one({"_id": ObjectId(history_id)})
+        item = serialize_history_row(updated)
+        history_bucket_item(item, updated)
+
+        return {
+            "success": True,
+            "history": item,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to correct public chat query sources")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Broncorrectie mislukt: {str(e)}",
         )
 
 

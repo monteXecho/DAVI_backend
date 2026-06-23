@@ -104,6 +104,12 @@ class PublicChatUpdate(BaseModel):
     is_private: Optional[bool] = None
 
 
+class PublicChatCorrectSourcesRequest(BaseModel):
+    """Admin correction: re-run RAG for one history question with selected chat sources only."""
+    source_ids: List[str]
+    regenerate_answer: bool = True
+
+
 class PublicChatOut(BaseModel):
     """Public chat response model."""
     id: str
