@@ -43,6 +43,10 @@ def _assigner_has_module(module_name: str, assigner_modules: dict, company_modul
     return assigner_modules.get(module_name, {}).get("enabled", False) is True
 
 
+# Pseudo-roles stored on assigned_roles but not folder/document roles in ``roles`` collection.
+_NON_DOCUMENT_ASSIGNED_ROLES = frozenset({"Teamlid", "Beheerder"})
+
+
 def _clamp_teamlid_permissions(
     permissions: dict,
     assigner_modules: dict,
@@ -370,6 +374,8 @@ class UserRepository(BaseRepository):
                 user_entry["teamlid_permissions"] = usr.get("teamlid_permissions")
             if is_teamlid and usr.get("teamlid_public_chat_ids") is not None:
                 user_entry["teamlid_public_chat_ids"] = usr.get("teamlid_public_chat_ids")
+            if usr.get("teamlid_only"):
+                user_entry["teamlid_only"] = True
             users.append(user_entry)
         
         # 2. Get admins added by this admin
@@ -656,7 +662,10 @@ class UserRepository(BaseRepository):
         
         # Then, aggregate modules from assigned roles (for company users)
         if user_type == "company_user":
-            assigned_roles = user.get("assigned_roles", [])
+            assigned_roles = [
+                r for r in (user.get("assigned_roles") or [])
+                if r not in _NON_DOCUMENT_ASSIGNED_ROLES
+            ]
             added_by_admin_id = user.get("added_by_admin_id")
             
             if assigned_roles and added_by_admin_id:
@@ -682,6 +691,7 @@ class UserRepository(BaseRepository):
         
         # Get is_teamlid flag and teamlid_permissions (for frontend permission helpers when guest_permissions not in response)
         is_teamlid = user.get("is_teamlid", False)
+        teamlid_only = bool(user.get("teamlid_only"))
         teamlid_permissions = user.get("teamlid_permissions") if is_teamlid else None
         
         # Get company-level modules for role assignment (what modules are enabled at company level)
@@ -705,10 +715,13 @@ class UserRepository(BaseRepository):
             "name": user.get("name", ""),
             "email": user.get("email", ""),
             "is_teamlid": is_teamlid,  # Required for workspace switcher
+            "teamlid_only": teamlid_only,
             "assigned_roles": user.get("assigned_roles", []),  # Include assigned roles
         }
         if teamlid_permissions is not None:
             result["teamlid_permissions"] = teamlid_permissions
+        if is_teamlid and user.get("assigned_teamlid_by_id"):
+            result["assigned_teamlid_by_id"] = user.get("assigned_teamlid_by_id")
         return result
     
     async def get_all_user_documents(self, email: str) -> dict:
@@ -1028,7 +1041,36 @@ class UserRepository(BaseRepository):
                 await persist_guest_updates(admin["user_id"])
             return bool(result.matched_count)
 
-        return False
+        # Create a teamlid-only invite stub (no document roles / no own workspace).
+        from app.repositories.limits_repo import LimitsRepository
+
+        limits_repo = LimitsRepository(self.db)
+        allowed, error_msg = await limits_repo.check_users_limit(company_id)
+        if not allowed:
+            raise ValueError(error_msg)
+
+        guest_user_id = str(uuid.uuid4())
+        user_doc = {
+            "user_id": guest_user_id,
+            "company_id": company_id,
+            "added_by_admin_id": admin_id,
+            "email": email.strip(),
+            "company_role": "company_user",
+            "assigned_roles": ["Teamlid"],
+            "is_teamlid": True,
+            "teamlid_only": True,
+            "assigned_teamlid_by_id": admin_id,
+            "teamlid_permissions": permissions,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+            "name": None,
+        }
+        if can_publicchat and validated_chats is not None:
+            user_doc["teamlid_public_chat_ids"] = validated_chats
+
+        await self.users.insert_one(user_doc)
+        await persist_guest_updates(guest_user_id)
+        return True
     
     async def remove_teamlid_role(
         self,
@@ -1047,6 +1089,24 @@ class UserRepository(BaseRepository):
         Returns:
             True if role was removed, False otherwise
         """
+        stub = await self.users.find_one({
+            "company_id": company_id,
+            "user_id": user_id,
+            "assigned_teamlid_by_id": admin_id,
+            "teamlid_only": True,
+        })
+        if stub:
+            await self.guest_access.delete_many({
+                "company_id": company_id,
+                "owner_admin_id": admin_id,
+                "guest_user_id": user_id,
+            })
+            result = await self.users.delete_one({
+                "company_id": company_id,
+                "user_id": user_id,
+            })
+            return result.deleted_count > 0
+
         # Try to remove from users first
         result = await self.users.update_one(
             {
@@ -1069,6 +1129,11 @@ class UserRepository(BaseRepository):
         )
         
         if result.modified_count > 0:
+            await self.guest_access.delete_many({
+                "company_id": company_id,
+                "owner_admin_id": admin_id,
+                "guest_user_id": user_id,
+            })
             return True
         
         # If not found in users, try admins

@@ -45,6 +45,8 @@ async def _build_workspace_block_for_membership(
             "guestOf": [],
         }
 
+    teamlid_only = bool(mem.get("teamlid_only"))
+
     guest_entries = await repo.list_guest_workspaces_for_user(
         company_id=company_id,
         guest_user_id=user_id,
@@ -58,7 +60,7 @@ async def _build_workspace_block_for_membership(
         self_label = "MIJN WERKRUIMTE"
 
     self_workspace = None
-    if self_owner_id:
+    if not teamlid_only and self_owner_id:
         self_workspace = {
             "ownerId": self_owner_id,
             "owner": {
@@ -122,6 +124,7 @@ async def _build_workspace_block_for_membership(
         # Identifies logged-in person's row in THIS company (for client storage headers)
         "member_user_id": mem.get("user_id"),
         "member_is_teamlid": bool(mem.get("is_teamlid")),
+        "member_teamlid_only": teamlid_only,
         "membership_kind": user_type,
         "self": self_workspace,
         "guestOf": guest_workspaces,

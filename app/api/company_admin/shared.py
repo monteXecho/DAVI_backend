@@ -474,9 +474,18 @@ async def get_admin_or_user_company_id(
 
     acting_owner_header = request.headers.get("X-Acting-Owner-Id")
     is_guest_mode = request.headers.get("X-Acting-Owner-Is-Guest", "false").lower() == "true"
+
+    teamlid_only = bool(base_user.get("teamlid_only"))
+    if teamlid_only and user_type == "company_user":
+        guest_owner = base_user.get("assigned_teamlid_by_id") or default_owner_id
+        if not acting_owner_header and guest_owner:
+            acting_owner_header = guest_owner
+        is_guest_mode = True
     
     needs_guest_check = False
-    if acting_owner_header:
+    if teamlid_only and user_type == "company_user":
+        needs_guest_check = True
+    elif acting_owner_header:
         if acting_owner_header != default_owner_id:
             needs_guest_check = True
         elif user_type == "company_user" and is_guest_mode:

@@ -177,8 +177,14 @@ async def assign_teamlid_permission(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail="Kon teamlid-rechten niet toewijzen voor dit e-mailadres.",
+        )
+
     return {
-        "success": ok,
+        "success": True,
         "message": "Teamlid permissions assigned successfully",
         "data": {
             "email": payload.email,
