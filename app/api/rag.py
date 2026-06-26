@@ -153,6 +153,12 @@ async def _async_rag_index_files(
         is_role_based=is_role_based,
         rag_file_logical_names=rag_file_logical_names,
     )
+
+    # Remove stale chunks before indexing (overwrite same logical source).
+    try:
+        await rag_remove_indexed_files(actual_index_id, file_ids)
+    except Exception as e:
+        logger.warning("Pre-index RAG remove failed for %s: %s", file_ids, e)
     
     data = {
         "index_id": actual_index_id,
@@ -242,6 +248,11 @@ def _sync_rag_index_files(
         is_role_based=is_role_based,
         rag_file_logical_names=rag_file_logical_names,
     )
+
+    try:
+        _sync_rag_remove_indexed_files(actual_index_id, file_ids)
+    except Exception as e:
+        logger.warning("Pre-index RAG remove failed for %s: %s", file_ids, e)
 
     data = {
         "index_id": actual_index_id,

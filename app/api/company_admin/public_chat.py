@@ -309,13 +309,13 @@ async def _reindex_public_chat_sources_after_chat_rename(
         file_metadata = [{"url": url, "title": title}]
 
         try:
-            await rag_index_files(
-                user_id=admin_id,
-                file_paths=[fp],
+            await _index_public_chat_source_file(
+                admin_id=admin_id,
                 company_id=company_id,
-                is_role_based=False,
                 index_id=index_id_new,
+                file_path=fp,
                 file_metadata=file_metadata,
+                logical_name=disk_bn,
             )
             await db.public_chat_sources.update_one(
                 {"_id": source["_id"]},
@@ -338,6 +338,28 @@ async def _reindex_public_chat_sources_after_chat_rename(
                 source.get("_id"),
                 e,
             )
+
+
+async def _index_public_chat_source_file(
+    *,
+    admin_id: str,
+    company_id: str,
+    index_id: str,
+    file_path: str,
+    file_metadata: list,
+    logical_name: str,
+) -> None:
+    """Overwrite OpenSearch chunks for one QR-Chat source, then index the file on disk."""
+    logical = (logical_name or os.path.basename(file_path) or "source").strip() or "source"
+    await rag_index_files(
+        user_id=admin_id,
+        file_paths=[file_path],
+        company_id=company_id,
+        is_role_based=False,
+        index_id=index_id,
+        file_metadata=file_metadata,
+        rag_file_logical_names=[logical],
+    )
 
 
 @router.get("/public-chats")
@@ -939,43 +961,75 @@ async def add_url_source_to_chat(
             url,
             file_path,
         )
-        
-        # Create source record
+
         now_utc = datetime.utcnow()
-        source_doc = {
+        existing = await db.public_chat_sources.find_one({
             "company_id": company_id,
             "admin_id": admin_id,
             "chat_id": chat_id,
-            "chat_name": chat_name,
             "type": "url",
             "url": url,
-            "file_path": file_path,
-            "file_name": file_name,
             "status": "active",
-            "created_at": now_utc,
-            "updated_at": now_utc,
-            "last_updated": now_utc,
-        }
-        
-        result = await db.public_chat_sources.insert_one(source_doc)
-        source_oid = result.inserted_id
-        source_id = str(source_oid)
-        
-        # Index to RAG with publicchat index and metadata
-        # file_id: {index_id}--{basename(file_path)} (see app.api.rag.build_rag_file_ids)
+        })
+
+        if existing:
+            source_oid = existing["_id"]
+            source_id = str(source_oid)
+            await db.public_chat_sources.update_one(
+                {"_id": source_oid},
+                {
+                    "$set": {
+                        "file_path": file_path,
+                        "file_name": file_name,
+                        "chat_name": chat_name,
+                        "updated_at": now_utc,
+                        "last_updated": now_utc,
+                    }
+                },
+            )
+            await db.public_chat_sources.delete_many({
+                "company_id": company_id,
+                "admin_id": admin_id,
+                "chat_id": chat_id,
+                "type": "url",
+                "url": url,
+                "status": "active",
+                "_id": {"$ne": source_oid},
+            })
+            message = "URL source bijgewerkt en opnieuw geïndexeerd"
+        else:
+            source_doc = {
+                "company_id": company_id,
+                "admin_id": admin_id,
+                "chat_id": chat_id,
+                "chat_name": chat_name,
+                "type": "url",
+                "url": url,
+                "file_path": file_path,
+                "file_name": file_name,
+                "status": "active",
+                "created_at": now_utc,
+                "updated_at": now_utc,
+                "last_updated": now_utc,
+            }
+            result = await db.public_chat_sources.insert_one(source_doc)
+            source_oid = result.inserted_id
+            source_id = str(source_oid)
+            message = "URL source added and indexed successfully"
+
         index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
         file_metadata = [{
             "url": url,
-            "title": source_doc.get("title", url)  # Use title if available, otherwise use URL
+            "title": (existing or {}).get("title") or url,
         }]
         try:
-            await rag_index_files(
-                user_id=admin_id,
-                file_paths=[file_path],
+            await _index_public_chat_source_file(
+                admin_id=admin_id,
                 company_id=company_id,
-                is_role_based=False,
                 index_id=index_id,
+                file_path=file_path,
                 file_metadata=file_metadata,
+                logical_name=file_name,
             )
             await db.public_chat_sources.update_one(
                 {"_id": source_oid},
@@ -986,15 +1040,16 @@ async def add_url_source_to_chat(
                     }
                 },
             )
-            logger.info(f"Successfully indexed URL source for public chat: {url}")
+            logger.info("Successfully indexed URL source for public chat: %s", url)
         except Exception as e:
             logger.error(f"Failed to index URL source to RAG: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to index source: {str(e)}")
-        
+
         return {
             "success": True,
             "source_id": source_id,
-            "message": "URL source added and indexed successfully",
+            "message": message,
+            "replaced": bool(existing),
         }
     except HTTPException:
         raise
@@ -1039,49 +1094,76 @@ async def add_html_source_to_chat(
         save_dir = os.path.join(SOURCES_DIR, company_id, admin_id, "public_chat", chat_id)
         os.makedirs(save_dir, exist_ok=True)
         file_path = os.path.join(save_dir, file_name)
-        
-        # Check if file already exists
-        if os.path.exists(file_path):
-            raise HTTPException(status_code=409, detail=f"File '{file_name}' already exists")
-        
-        # Read and save file content
+
         content = await file.read()
         async with aiofiles.open(file_path, "wb") as f:
             await f.write(content)
-        
-        # Create source record
-        source_doc = {
+
+        now_utc = datetime.utcnow()
+        existing = await db.public_chat_sources.find_one({
             "company_id": company_id,
             "admin_id": admin_id,
             "chat_id": chat_id,
-            "chat_name": chat_name,
             "type": "html",
-            "url": None,
-            "file_path": file_path,
             "file_name": file_name,
             "status": "active",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
-        }
-        
-        result = await db.public_chat_sources.insert_one(source_doc)
-        source_oid = result.inserted_id
-        source_id = str(source_oid)
-        
-        # Index to RAG with publicchat index and metadata
+        })
+
+        if existing:
+            source_oid = existing["_id"]
+            source_id = str(source_oid)
+            await db.public_chat_sources.update_one(
+                {"_id": source_oid},
+                {
+                    "$set": {
+                        "file_path": file_path,
+                        "chat_name": chat_name,
+                        "updated_at": now_utc,
+                    }
+                },
+            )
+            await db.public_chat_sources.delete_many({
+                "company_id": company_id,
+                "admin_id": admin_id,
+                "chat_id": chat_id,
+                "type": "html",
+                "file_name": file_name,
+                "status": "active",
+                "_id": {"$ne": source_oid},
+            })
+            message = "HTML source bijgewerkt en opnieuw geïndexeerd"
+        else:
+            source_doc = {
+                "company_id": company_id,
+                "admin_id": admin_id,
+                "chat_id": chat_id,
+                "chat_name": chat_name,
+                "type": "html",
+                "url": None,
+                "file_path": file_path,
+                "file_name": file_name,
+                "status": "active",
+                "created_at": now_utc,
+                "updated_at": now_utc,
+            }
+            result = await db.public_chat_sources.insert_one(source_doc)
+            source_oid = result.inserted_id
+            source_id = str(source_oid)
+            message = "HTML source added and indexed successfully"
+
         index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
         file_metadata = [{
-            "url": source_doc.get("url"),  # May be None for HTML files
-            "title": source_doc.get("title", file_name)  # Use title if available, otherwise use file_name
+            "url": None,
+            "title": (existing or {}).get("title") or file_name,
         }]
         try:
-            await rag_index_files(
-                user_id=admin_id,
-                file_paths=[file_path],
+            await _index_public_chat_source_file(
+                admin_id=admin_id,
                 company_id=company_id,
-                is_role_based=False,
                 index_id=index_id,
+                file_path=file_path,
                 file_metadata=file_metadata,
+                logical_name=file_name,
             )
             await db.public_chat_sources.update_one(
                 {"_id": source_oid},
@@ -1091,11 +1173,12 @@ async def add_html_source_to_chat(
         except Exception as e:
             logger.error(f"Failed to index HTML source to RAG: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to index source: {str(e)}")
-        
+
         return {
             "success": True,
             "source_id": source_id,
-            "message": "HTML source added and indexed successfully"
+            "message": message,
+            "replaced": bool(existing),
         }
     except HTTPException:
         raise
@@ -1136,49 +1219,76 @@ async def add_file_source_to_chat(
         save_dir = os.path.join(SOURCES_DIR, company_id, admin_id, "public_chat", chat_id, "files")
         os.makedirs(save_dir, exist_ok=True)
         file_path = os.path.join(save_dir, file_name)
-        
-        # Check if file already exists
-        if os.path.exists(file_path):
-            raise HTTPException(status_code=409, detail=f"File '{file_name}' already exists")
-        
-        # Read and save file content
+
         content = await file.read()
         async with aiofiles.open(file_path, "wb") as f:
             await f.write(content)
-        
-        # Create source record
-        source_doc = {
+
+        now_utc = datetime.utcnow()
+        existing = await db.public_chat_sources.find_one({
             "company_id": company_id,
             "admin_id": admin_id,
             "chat_id": chat_id,
-            "chat_name": chat_name,
             "type": "file",
-            "url": None,
-            "file_path": file_path,
             "file_name": file_name,
             "status": "active",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
-        }
-        
-        result = await db.public_chat_sources.insert_one(source_doc)
-        source_oid = result.inserted_id
-        source_id = str(source_oid)
-        
-        # Index to RAG with publicchat index
+        })
+
+        if existing:
+            source_oid = existing["_id"]
+            source_id = str(source_oid)
+            await db.public_chat_sources.update_one(
+                {"_id": source_oid},
+                {
+                    "$set": {
+                        "file_path": file_path,
+                        "chat_name": chat_name,
+                        "updated_at": now_utc,
+                    }
+                },
+            )
+            await db.public_chat_sources.delete_many({
+                "company_id": company_id,
+                "admin_id": admin_id,
+                "chat_id": chat_id,
+                "type": "file",
+                "file_name": file_name,
+                "status": "active",
+                "_id": {"$ne": source_oid},
+            })
+            message = "Bestand bijgewerkt en opnieuw geïndexeerd"
+        else:
+            source_doc = {
+                "company_id": company_id,
+                "admin_id": admin_id,
+                "chat_id": chat_id,
+                "chat_name": chat_name,
+                "type": "file",
+                "url": None,
+                "file_path": file_path,
+                "file_name": file_name,
+                "status": "active",
+                "created_at": now_utc,
+                "updated_at": now_utc,
+            }
+            result = await db.public_chat_sources.insert_one(source_doc)
+            source_oid = result.inserted_id
+            source_id = str(source_oid)
+            message = "File source added and indexed successfully"
+
         index_id = get_public_chat_index_id(company_id, admin_id, chat_name)
         file_metadata = [{
-            "url": None,  # File sources don't have URLs
-            "title": source_doc.get("title", file_name)  # Use title if available, otherwise use file_name
+            "url": None,
+            "title": (existing or {}).get("title") or file_name,
         }]
         try:
-            await rag_index_files(
-                user_id=admin_id,
-                file_paths=[file_path],
+            await _index_public_chat_source_file(
+                admin_id=admin_id,
                 company_id=company_id,
-                is_role_based=False,
                 index_id=index_id,
+                file_path=file_path,
                 file_metadata=file_metadata,
+                logical_name=file_name,
             )
             await db.public_chat_sources.update_one(
                 {"_id": source_oid},
@@ -1188,11 +1298,12 @@ async def add_file_source_to_chat(
         except Exception as e:
             logger.error(f"Failed to index file source to RAG: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to index source: {str(e)}")
-        
+
         return {
             "success": True,
             "source_id": source_id,
-            "message": "File source added and indexed successfully"
+            "message": message,
+            "replaced": bool(existing),
         }
     except HTTPException:
         raise
@@ -1359,13 +1470,13 @@ async def sync_all_chat_url_sources(
 
                     if file_path and os.path.exists(file_path):
                         rag_logical = os.path.basename(file_path)
-                        await rag_index_files(
-                            user_id=admin_id,
-                            file_paths=[file_path],
+                        await _index_public_chat_source_file(
+                            admin_id=admin_id,
                             company_id=company_id,
-                            is_role_based=False,
                             index_id=index_id,
+                            file_path=file_path,
                             file_metadata=[{"url": url, "title": source.get("title", url)}],
+                            logical_name=rag_logical,
                         )
 
                     now_utc = datetime.utcnow()
@@ -1468,13 +1579,13 @@ async def sync_chat_url_sources(
 
                 if file_path and os.path.exists(file_path):
                     rag_logical = os.path.basename(file_path)
-                    await rag_index_files(
-                        user_id=admin_id,
-                        file_paths=[file_path],
+                    await _index_public_chat_source_file(
+                        admin_id=admin_id,
                         company_id=company_id,
-                        is_role_based=False,
                         index_id=index_id,
+                        file_path=file_path,
                         file_metadata=[{"url": url, "title": source.get("title", url)}],
+                        logical_name=rag_logical,
                     )
 
                 now_utc = datetime.utcnow()
